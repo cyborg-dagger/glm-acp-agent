@@ -285,7 +285,11 @@ export interface StdioMcpClientOptions {
   spawn?: (
     command: string,
     args: string[],
-    options: { env: NodeJS.ProcessEnv; windowsHide?: boolean }
+    options: {
+      env: NodeJS.ProcessEnv;
+      windowsHide?: boolean;
+      windowsVerbatimArguments?: boolean;
+    }
   ) => ChildProcessWithoutNullStreams;
 }
 
@@ -374,7 +378,7 @@ export class StdioMcpClient implements ConnectedMcpClient {
   }
 
   private async startAndInitialize(): Promise<void> {
-    const { command, args } = this.resolveLaunch();
+    const { command, args, spawnOptions } = this.resolveLaunch();
     const spawnFn = this.opts.spawn ?? nodeSpawn;
     // Redact against the env the child actually gets — it inherits process.env, so a
     // credential the parent holds can surface in the child's stderr.
@@ -387,7 +391,7 @@ export class StdioMcpClient implements ConnectedMcpClient {
 
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = spawnFn(command, args, { env, windowsHide: true });
+      child = spawnFn(command, args, { env, windowsHide: true, ...spawnOptions });
     } catch (err) {
       throw this.launchError(err as NodeJS.ErrnoException);
     }
@@ -436,8 +440,18 @@ export class StdioMcpClient implements ConnectedMcpClient {
    * `npx.cmd` yields EINVAL), so those go through `cmd.exe /d /s /c`. Because the command and
    * args are client-supplied, every token routed through cmd.exe is validated first — we reject
    * rather than try to escape.
+   *
+   * cmd.exe strips the first and last quote after `/s /c`, so passing the command as its own
+   * argv entry breaks a spaced path Node quoted for it (e.g. `C:\Program Files\nodejs\npx.cmd`
+   * becomes `'C:\Program' is not recognized`). The whole line is therefore built here —
+   * whitespace tokens quoted, one outer quote pair for cmd.exe to strip — and passed verbatim
+   * so Node does not re-escape it. Tokens are metacharacter-free, so this stays safe.
    */
-  private resolveLaunch(): { command: string; args: string[] } {
+  private resolveLaunch(): {
+    command: string;
+    args: string[];
+    spawnOptions?: { windowsVerbatimArguments: boolean };
+  } {
     const platform = this.opts.platform ?? process.platform;
     const command = this.server.command;
     const args = [...this.server.args];
@@ -453,7 +467,16 @@ export class StdioMcpClient implements ConnectedMcpClient {
       }
     }
     const comSpec = this.opts.comSpec ?? process.env["ComSpec"] ?? "cmd.exe";
-    return { command: comSpec, args: ["/d", "/s", "/c", command, ...args] };
+    // Quote whitespace tokens (cmd.exe must keep them as one argv entry) and empty
+    // tokens (an unquoted "" would vanish in join, shifting the child's argv).
+    const line = [command, ...args]
+      .map((token) => (token.length === 0 || /\s/.test(token) ? `"${token}"` : token))
+      .join(" ");
+    return {
+      command: comSpec,
+      args: ["/d", "/s", "/c", `"${line}"`],
+      spawnOptions: { windowsVerbatimArguments: true },
+    };
   }
 
   private launchError(err: NodeJS.ErrnoException): Error {
