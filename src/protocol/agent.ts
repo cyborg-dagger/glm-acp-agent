@@ -190,7 +190,7 @@ export interface GlmAcpAgentOptions {
     ) => AsyncIterable<GlmStreamChunk>;
   };
   /**
-   * Maximum number of model/tool turns per single prompt. Default 20,
+   * Maximum number of model/tool turns per single prompt. Default 100,
    * overridable via `$ACP_GLM_MAX_TURNS`.
    */
   maxTurns?: number;
@@ -217,7 +217,10 @@ export interface GlmAcpAgentOptions {
  * GLM series models (via `GlmClient`), providing a full prompt loop with
  * tool-calling and streaming support.
  */
-export const DEFAULT_MAX_TURNS = 20;
+// 20 turns is a handful of tool calls; real editing sessions routinely need
+// more, and hitting the cap mid-task surfaces as Zed's "reached the turn
+// limit — send a message to continue". Still overridable via ACP_GLM_MAX_TURNS.
+export const DEFAULT_MAX_TURNS = 100;
 
 /**
  * Resolve the fallback maxTurns from `$ACP_GLM_MAX_TURNS` when the caller did
@@ -1358,7 +1361,7 @@ export class GlmAcpAgent implements Agent {
 
   /** Tool schemas we expose for agent-owned local tools plus session MCP tools. */
   private availableToolDefinitions(mcpTools: SessionMcpTools | null = null): ToolDefinition[] {
-    const names = ["read_file", "write_file", "list_files", "run_command", "web_search", "web_reader"];
+    const names = ["read_file", "write_file", "edit_file", "list_files", "run_command", "web_search", "web_reader"];
     if (this.visionClientExplicit ? this._visionClient !== null : true) {
       names.push("image_analysis");
     }

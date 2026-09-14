@@ -21,26 +21,37 @@ function createConnectionStub(opts: {
   readError?: boolean;
   writeError?: boolean;
   terminalOutput?: string;
+  /** When set, client readTextFile returns this instead of the on-disk content (simulates a dirty buffer). */
+  clientFileContent?: string;
+  /** Called when a permission request arrives — use it to mutate files mid-prompt. */
+  onPermission?: () => void;
 } = {}) {
   const updates: Array<Record<string, unknown>> = [];
   const permissionRequests: Array<unknown> = [];
   const terminalCalls: Array<{ command: string; args?: string[] }> = [];
+  const writeTextFileCalls: Array<{ sessionId: string; path: string; content: string }> = [];
+  const readTextFileCalls: Array<{ sessionId: string; path: string }> = [];
 
   return {
     updates,
     permissionRequests,
     terminalCalls,
+    writeTextFileCalls,
+    readTextFileCalls,
     async sessionUpdate(payload: Record<string, unknown>) {
       updates.push(payload);
     },
     async readTextFile(params: { sessionId: string; path: string }) {
-      void params;
       if (opts.readError) throw new Error("file not found");
-      return { content: "hello" };
+      readTextFileCalls.push(params);
+      if (opts.clientFileContent !== undefined) return { content: opts.clientFileContent };
+      // Mirror a real client: readTextFile serves the file's current on-disk contents.
+      return { content: readFileSync(params.path, "utf8") };
     },
     async writeTextFile(params: { sessionId: string; path: string; content: string }) {
-      void params;
+      writeTextFileCalls.push(params);
       if (opts.writeError) throw new Error("permission denied");
+      writeFileSync(params.path, params.content, "utf8");
     },
     async createTerminal(params: { command: string; args?: string[] }): Promise<StubTerminal> {
       terminalCalls.push(params);
@@ -59,6 +70,7 @@ function createConnectionStub(opts: {
     },
     async requestPermission(params: unknown) {
       permissionRequests.push(params);
+      if (opts.onPermission) opts.onPermission();
       switch (opts.permission ?? "allow") {
         case "allow":
           return { outcome: { outcome: "selected", optionId: "allow" } };
@@ -206,6 +218,29 @@ test("write_file writes from the agent process without fs.writeTextFile capabili
     );
     assert.match(result.content, /written successfully/);
     assert.equal(readFileSync(path, "utf8"), "hi");
+    assert.equal(conn.writeTextFileCalls.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_file routes through fs.writeTextFile when the client advertises it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-write-client-"));
+  const path = join(dir, "out.txt");
+  const conn = createConnectionStub({ permission: "allow" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "write_file",
+      JSON.stringify({ path, content: "via client" })
+    );
+    assert.match(result.content, /written successfully/);
+    assert.equal(readFileSync(path, "utf8"), "via client");
+    assert.deepEqual(
+      conn.writeTextFileCalls.map((c) => ({ path: c.path, content: c.content })),
+      [{ path, content: "via client" }]
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -334,6 +369,201 @@ test("write_file cancelled by user marks call failed", async () => {
   assert.match(result.content, /cancelled by user/i);
   const last = conn.updates.at(-1) as { update: { status?: string } };
   assert.equal(last.update.status, "failed");
+});
+
+// ---------------------------------------------------------------------------
+// edit_file
+// ---------------------------------------------------------------------------
+
+test("edit_file replaces a unique snippet and goes through the permission flow", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-success-"));
+  const path = join(dir, "code.txt");
+  writeFileSync(path, "const a = 1;\nconst b = 2;\n", "utf8");
+  const conn = createConnectionStub({ permission: "allow" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "edit_file",
+      JSON.stringify({ path, old_text: "const b = 2;", new_text: "const b = 3;" })
+    );
+    assert.match(result.content, /edited successfully/);
+    assert.equal(readFileSync(path, "utf8"), "const a = 1;\nconst b = 3;\n");
+    assert.deepEqual(
+      conn.writeTextFileCalls.map((c) => ({ path: c.path, content: c.content })),
+      [{ path, content: "const a = 1;\nconst b = 3;\n" }]
+    );
+
+    assert.equal(conn.permissionRequests.length, 1);
+    const sequence = conn.updates.map((u) => ({
+      type: (u.update as { sessionUpdate: string }).sessionUpdate,
+      status: (u.update as { status?: string }).status,
+    }));
+    assert.deepEqual(sequence, [
+      { type: "tool_call", status: "pending" },
+      { type: "tool_call_update", status: "in_progress" },
+      { type: "tool_call_update", status: "completed" },
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("edit_file fails fast when old_text is absent, without requesting permission", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-missing-"));
+  const path = join(dir, "code.txt");
+  writeFileSync(path, "hello", "utf8");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "edit_file",
+      JSON.stringify({ path, old_text: "nope", new_text: "x" })
+    );
+    assert.match(result.content, /was not found/);
+    assert.equal(readFileSync(path, "utf8"), "hello");
+    assert.equal(conn.permissionRequests.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("edit_file refuses ambiguous old_text matches", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-ambiguous-"));
+  const path = join(dir, "code.txt");
+  writeFileSync(path, "return 1;\nreturn 1;\n", "utf8");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "edit_file",
+      JSON.stringify({ path, old_text: "return 1;", new_text: "return 2;" })
+    );
+    assert.match(result.content, /occurs 2 times/);
+    assert.equal(readFileSync(path, "utf8"), "return 1;\nreturn 1;\n");
+    assert.equal(conn.permissionRequests.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("edit_file rejected by user leaves the file untouched", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-reject-"));
+  const path = join(dir, "code.txt");
+  writeFileSync(path, "before", "utf8");
+  const conn = createConnectionStub({ permission: "reject" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "edit_file",
+      JSON.stringify({ path, old_text: "before", new_text: "after" })
+    );
+    assert.match(result.content, /rejected by user/i);
+    assert.equal(readFileSync(path, "utf8"), "before");
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("edit_file computes the edit against the client's buffer, not stale disk", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-client-read-"));
+  const path = join(dir, "code.txt");
+  writeFileSync(path, "const a = 1;\n", "utf8"); // stale disk content
+  // The client's buffer has unsaved edits the agent must build on.
+  const conn = createConnectionStub({ permission: "allow", clientFileContent: "const a = 1;\nconst b = 2;\n" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "edit_file",
+      JSON.stringify({ path, old_text: "const b = 2;", new_text: "const b = 3;" })
+    );
+    assert.match(result.content, /edited successfully/);
+    // The write went back through the client with the merged content.
+    assert.deepEqual(
+      conn.writeTextFileCalls.map((c) => c.content),
+      ["const a = 1;\nconst b = 3;\n"]
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("edit_file falls back to agent-process disk I/O without the writeTextFile capability", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-disk-fallback-"));
+  const path = join(dir, "code.txt");
+  writeFileSync(path, "alpha beta\n", "utf8");
+  // readTextFile advertised but writeTextFile not: a client buffer we cannot
+  // write back must not be the edit source either, so this stays disk↔disk.
+  const conn = createConnectionStub({ permission: "allow" });
+  const exec = new ToolExecutor(conn as never, "s1", { fs: { readTextFile: true } });
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "edit_file",
+      JSON.stringify({ path, old_text: "beta", new_text: "gamma" })
+    );
+    assert.match(result.content, /edited successfully/);
+    assert.equal(readFileSync(path, "utf8"), "alpha gamma\n");
+    assert.equal(conn.writeTextFileCalls.length, 0);
+    assert.equal(conn.readTextFileCalls.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("edit_file re-validates after the permission prompt and refuses a file changed underfoot", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-stale-"));
+  const path = join(dir, "code.txt");
+  writeFileSync(path, "keep\nold snippet\n", "utf8");
+  const conn = createConnectionStub({
+    permission: "allow",
+    // The user edits the buffer while the permission prompt is up.
+    onPermission: () => writeFileSync(path, "keep\nuser rewrote this\n", "utf8"),
+  });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "edit_file",
+      JSON.stringify({ path, old_text: "old snippet", new_text: "new snippet" })
+    );
+    assert.match(result.content, /changed while waiting for permission/);
+    // The user's concurrent edit is intact and nothing was written back.
+    assert.equal(readFileSync(path, "utf8"), "keep\nuser rewrote this\n");
+    assert.equal(conn.writeTextFileCalls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_file surfaces client writeTextFile failures as a failed tool result", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-write-client-fail-"));
+  const path = join(dir, "y.txt");
+  const conn = createConnectionStub({ permission: "allow", writeError: true });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "write_file",
+      JSON.stringify({ path, content: "data" })
+    );
+    assert.match(result.content, /Error writing file: permission denied/);
+    assert.equal(existsSync(path), false);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

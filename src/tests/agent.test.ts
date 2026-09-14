@@ -2085,7 +2085,7 @@ test("invalid maxTurns falls back to the default", async () => {
 
   for (const bad of [0, -1, NaN, Number.POSITIVE_INFINITY, 0.5]) {
     const agent = new GlmAcpAgent(conn as never, { glm: { ...glm }, maxTurns: bad, sessionStore: null });
-    assert.equal((agent as unknown as { maxTurns: number }).maxTurns, 20);
+    assert.equal((agent as unknown as { maxTurns: number }).maxTurns, 100);
   }
 });
 
@@ -2106,15 +2106,31 @@ test("maxTurns falls back to $ACP_GLM_MAX_TURNS and the default", async () => {
     // Invalid env values are ignored (default applies).
     process.env["ACP_GLM_MAX_TURNS"] = "not-a-number";
     const invalid = new GlmAcpAgent(conn as never, { glm: { ...glm }, sessionStore: null });
-    assert.equal((invalid as unknown as { maxTurns: number }).maxTurns, 20);
+    assert.equal((invalid as unknown as { maxTurns: number }).maxTurns, 100);
 
     // Fractional values that floor below 1 are invalid, not silently floored.
     process.env["ACP_GLM_MAX_TURNS"] = "0.5";
     const fractional = new GlmAcpAgent(conn as never, { glm: { ...glm }, sessionStore: null });
-    assert.equal((fractional as unknown as { maxTurns: number }).maxTurns, 20);
+    assert.equal((fractional as unknown as { maxTurns: number }).maxTurns, 100);
   } finally {
     if (prev === undefined) delete process.env["ACP_GLM_MAX_TURNS"];
     else process.env["ACP_GLM_MAX_TURNS"] = prev;
+  }
+});
+
+test("advertised tool definitions include edit_file alongside the core tools", async () => {
+  const conn = createConnectionStub();
+  const glm = makeStreamingGlm([[{ text: "ok" }, { done: true, stopReason: "stop" }]]);
+  const agent = new GlmAcpAgent(conn as never, { glm: { ...glm }, sessionStore: null });
+  const names = (
+    agent as unknown as {
+      availableToolDefinitions: () => Array<{ function: { name: string } }>;
+    }
+  )
+    .availableToolDefinitions()
+    .map((tool) => tool.function.name);
+  for (const expected of ["read_file", "write_file", "edit_file", "list_files", "run_command"]) {
+    assert.ok(names.includes(expected), `expected advertised tool ${expected}`);
   }
 });
 

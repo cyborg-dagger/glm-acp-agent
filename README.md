@@ -26,14 +26,14 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 
 - **Full ACP compliance** – implements `initialize`, `authenticate`, `session/new`, `session/set_mode`, `session/prompt`, `session/cancel`, `session/close`, `session/list`, `session/load`, `session/fork`, `session/resume`, and `session/set_model`, and pushes `session_info_update`, `config_option_update`, `current_mode_update`, and `available_commands_update` notifications
 - **Streaming** – assistant text and reasoning tokens are forwarded as incremental ACP chunks
-- **Tool calling** – agentic loop with a configurable cap of GLM function-calling turns (default 20; see `ACP_GLM_MAX_TURNS` / `--max-turns`)
+- **Tool calling** – agentic loop with a configurable cap of GLM function-calling turns (default 100; see `ACP_GLM_MAX_TURNS` / `--max-turns`)
 - **Thinking mode** – GLM's `reasoning_content` tokens are surfaced as `agent_thought_chunk` blocks so the client can show the model's chain of thought
 - **Session permission modes** – supports `default`, `accept_edits`, and `bypass_permissions` via `session/set_mode`. Clients like DevFlow can use this to toggle between prompting for every edit, auto-approving edits while prompting for commands, or bypassing permissions entirely.
 - **Per-session model switching** – `session/set_model` lets clients change the active GLM model mid-conversation; `session/new` returns the curated `availableModels` list
 - **Slash commands** – commands and skills found under the session's `.claude/` directory are advertised to the client with `available_commands_update`, so `/` autocomplete is populated (see [Slash commands](#slash-commands))
 - **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; `glm-5.3-flash` sends supported pasted ACP image blocks directly as native `image_url` content parts, while the other advertised coding models (including default `glm-5.3`) route them through Z.AI Vision MCP (`@z_ai/mcp-server`). `glm-5v-turbo` keeps the same native-vision path when re-added via `ACP_GLM_AVAILABLE_MODELS` — it is no longer on the Coding Plan allowlist. Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
-- **Seven built-in tools** (see below)
+- **Eight built-in tools** (see below)
 - **Self-sufficient local tools** – file reads/writes, directory listings, and shell commands run in the agent process, so they do not depend on ACP client `fs` or `terminal` capabilities
 - **Configurable permissions** – `write_file` and `run_command` behavior depends on the active session mode (prompts by default)
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
@@ -53,7 +53,8 @@ ACP Client (IDE plugin, CLI, …)
         ├─ GlmClient   ← Z.AI / Zhipu AI Coding Plan Chat Completions  (src/llm/)
         │
         ├─ ToolExecutor ← executes tool calls  (src/tools/)
-        │    ├─ read_file / write_file       → Agent process (Node fs)
+        │    ├─ read_file / list_files        → Agent process (Node fs)
+        │    ├─ write_file / edit_file        → ACP client fs when advertised (editor-buffer diffs), else Agent process (Node fs)
         │    ├─ list_files / run_command     → Agent process (Node fs / child_process)
         │    ├─ web_search / web_reader      → Z.AI Coding Plan Web MCP (HTTP)
         │    └─ image_analysis               → Z.AI Coding Plan Vision MCP (stdio)
@@ -61,7 +62,7 @@ ACP Client (IDE plugin, CLI, …)
         └─ VisionMcpClient ← spawns `npx @z_ai/mcp-server` on demand
 ```
 
-The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations run inside the agent process with paths resolved against the ACP session working directory. Writes and arbitrary shell commands still go through ACP `session/request_permission`, so clients can render an approval prompt before the operation runs.
+The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations run inside the agent process with paths resolved against the ACP session working directory. When the client advertises `fs.writeTextFile` / `fs.readTextFile`, writes and edit-file reads are routed through the ACP client instead, so edits land in the editor buffer and render as native diffs; otherwise the agent process touches the filesystem directly. Writes and arbitrary shell commands still go through ACP `session/request_permission`, so clients can render an approval prompt before the operation runs.
 
 ---
 
@@ -70,7 +71,8 @@ The agent process needs network access to `api.z.ai` for chat completions and We
 | Tool | Runs on | Permission behavior | Description |
 |------|---------|---------------------|-------------|
 | `read_file` | Agent process | Always silent | Read the text content of a file |
-| `write_file` | Agent process | Mode-dependent | Write or overwrite a text file. Silent in `accept_edits` and `bypass_permissions`. |
+| `write_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Write or overwrite a text file. Silent in `accept_edits` and `bypass_permissions`. |
+| `edit_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Replace one exact, unique snippet in an existing file — a surgical edit instead of a full rewrite. Re-reads and re-validates after the permission prompt so concurrent edits are not overwritten. Silent in `accept_edits` and `bypass_permissions`. |
 | `list_files` | Agent process | Always silent | List a directory using Node filesystem APIs |
 | `run_command` | Agent process | Mode-dependent | Run an arbitrary shell command. Silent only in `bypass_permissions`. |
 | `web_search` | Agent (Z.AI Coding Plan MCP) | Always silent | Search the web — returns titles, URLs, and summaries |
@@ -173,8 +175,8 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_MODEL` | No | `glm-5.3` | Default GLM model for new sessions |
 | `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
-| `ACP_GLM_MAX_TOKENS` | No | `8192` | Cap on `max_tokens` for each completion |
-| `ACP_GLM_MAX_TURNS` | No | `20` | Max model/tool turns per prompt (also settable via `--max-turns`) |
+| `ACP_GLM_MAX_TOKENS` | No | `32768` | Cap on `max_tokens` for each completion |
+| `ACP_GLM_MAX_TURNS` | No | `100` | Max model/tool turns per prompt (also settable via `--max-turns`) |
 | `ACP_GLM_THINKING` | No | auto-detected | Force thinking mode `true` / `false` |
 | `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |
 | `ACP_GLM_DEBUG` | No | — | Set to `true` or `1` to enable verbose debug logging to stderr (shows model selection, API key resolution, tool calls, and usage stats) |

@@ -68,6 +68,8 @@ export class ToolExecutor {
         return this.readFile(toolCallId, args);
       case "write_file":
         return this.writeFile(toolCallId, args);
+      case "edit_file":
+        return this.editFile(toolCallId, args);
       case "list_files":
         return this.listFiles(toolCallId, args);
       case "run_command":
@@ -197,7 +199,7 @@ export class ToolExecutor {
     });
 
     try {
-      await writeFile(absolutePath, content, "utf8");
+      await this.performWrite(absolutePath, content);
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -214,6 +216,170 @@ export class ToolExecutor {
       const message = err instanceof Error ? err.message : String(err);
       await this.markFailed(toolCallId, message);
       return { content: `Error writing file: ${message}` };
+    }
+  }
+
+  /**
+   * Route the actual write through the ACP client when it advertises
+   * `fs.writeTextFile` (e.g. Zed), so edits land in the client's buffer and
+   * render as native editor diffs. Fall back to writing from the agent process
+   * when the client has no fs capability.
+   */
+  private async performWrite(path: string, content: string): Promise<void> {
+    if (this.clientCapabilities?.fs?.writeTextFile) {
+      await this.connection.writeTextFile({ sessionId: this.sessionId, path, content });
+      return;
+    }
+    await writeFile(path, content, "utf8");
+  }
+
+  /**
+   * Mirror of performWrite for reads, used by edit_file: when the client
+   * advertises BOTH `fs.readTextFile` and `fs.writeTextFile`, read through the
+   * client so the edit is computed against the same contents the user sees (a
+   * dirty editor buffer). Reading a client buffer we cannot write back would
+   * leave the editor showing stale content while disk diverges, so a
+   * read-without-write capability falls back to plain agent-process disk I/O.
+   */
+  private async performRead(path: string): Promise<string> {
+    if (
+      this.clientCapabilities?.fs?.readTextFile &&
+      this.clientCapabilities?.fs?.writeTextFile
+    ) {
+      const response = await this.connection.readTextFile({ sessionId: this.sessionId, path });
+      return response.content;
+    }
+    return readFile(path, "utf8");
+  }
+
+  private async editFile(
+    toolCallId: string,
+    args: Record<string, unknown>
+  ): Promise<ToolResult> {
+    const path = String(args["path"] ?? "").trim();
+    const oldText = String(args["old_text"] ?? "");
+    const newText = String(args["new_text"] ?? "");
+    if (!path) {
+      return this.failAndReturn(toolCallId, "edit_file", args, "Error: `path` is required.");
+    }
+    if (oldText.length === 0) {
+      return this.failAndReturn(
+        toolCallId,
+        "edit_file",
+        args,
+        "Error: `old_text` is required and must be a non-empty exact snippet from the file."
+      );
+    }
+    const absolutePath = this.resolvePath(path);
+
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: `Edit file: ${path}`,
+        kind: "edit",
+        status: "pending",
+        locations: [{ path }],
+        rawInput: args,
+      },
+    });
+
+    let current: string;
+    try {
+      current = await this.performRead(absolutePath);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.markFailed(toolCallId, message);
+      return { content: `Error editing file: cannot read ${path}: ${message}` };
+    }
+
+    const occurrences = current.split(oldText).length - 1;
+    if (occurrences === 0) {
+      await this.markFailed(toolCallId, "old_text not found in file");
+      return {
+        content: `Error editing file: \`old_text\` was not found in ${path}. Re-read the file and copy the snippet exactly, including whitespace.`,
+      };
+    }
+    if (occurrences > 1) {
+      await this.markFailed(toolCallId, `old_text matches ${occurrences} locations`);
+      return {
+        content: `Error editing file: \`old_text\` occurs ${occurrences} times in ${path}. Add surrounding lines to make it unique, then retry.`,
+      };
+    }
+
+    const permissionResult = await this.maybeRequestPermission({
+      toolCallId,
+      kind: "write",
+      rawInput: args,
+      title: `Edit file: ${path}`,
+      locations: [{ path }],
+    });
+
+    if (permissionResult.type === "error") {
+      const message = `Error requesting permission: ${permissionResult.message}`;
+      await this.markFailed(toolCallId, message);
+      return { content: message };
+    }
+    if (permissionResult.type === "cancelled") {
+      await this.markFailed(toolCallId, "Cancelled by user.");
+      return { content: "Edit cancelled by user." };
+    }
+    if (permissionResult.type === "reject") {
+      await this.markFailed(toolCallId, "Rejected by user.");
+      return { content: "Edit rejected by user." };
+    }
+
+    // The permission prompt can sit in front of the user for a while; re-read
+    // and re-validate so a buffer edited while deciding is not silently
+    // overwritten by this stale snapshot.
+    let latest: string;
+    try {
+      latest = await this.performRead(absolutePath);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.markFailed(toolCallId, message);
+      return { content: `Error editing file: cannot re-read ${path}: ${message}` };
+    }
+    const latestOccurrences = latest.split(oldText).length - 1;
+    if (latestOccurrences !== 1) {
+      const reason =
+        latestOccurrences === 0
+          ? "`old_text` is no longer present"
+          : `\`old_text\` now occurs ${latestOccurrences} times`;
+      await this.markFailed(toolCallId, `file changed while waiting for permission (${reason})`);
+      return {
+        content: `Error editing file: ${path} changed while waiting for permission (${reason}). Re-read the file and retry.`,
+      };
+    }
+
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "in_progress",
+      },
+    });
+
+    try {
+      await this.performWrite(absolutePath, latest.replace(oldText, newText));
+
+      await this.connection.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "completed",
+          rawOutput: { success: true },
+        },
+      });
+
+      return { content: `File edited successfully: ${path}` };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.markFailed(toolCallId, message);
+      return { content: `Error editing file: ${message}` };
     }
   }
 

@@ -37,6 +37,7 @@ const TOOLS_TEMPLATE = `<tools>
 Available tools: __TOOLS__
 - Use only tools listed above.
 - Prefer reading before writing: when modifying a file, read it first so your edit is grounded in the current contents.
+- To change an existing file, prefer edit_file with a minimal exact snippet over write_file with the whole file: it keeps diffs surgical and avoids output-token limits.
 - Issue independent lookups (multiple file reads, separate searches) in parallel rather than sequentially.
 - Briefly state what you are about to do before invoking any tool that touches the file system, terminal, or network.
 </tools>`;

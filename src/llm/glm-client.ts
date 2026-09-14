@@ -284,7 +284,11 @@ export class GlmClient {
     }
 
     const baseURL = process.env["ACP_GLM_BASE_URL"] ?? DEFAULT_BASE_URL;
-    this.maxTokens = parseIntEnv("ACP_GLM_MAX_TOKENS", 8192);
+    // 32768 leaves room for whole-file writes and GLM thinking tokens in the
+    // same turn; reasoning counts against this cap, so a small value starves
+    // the actual content and trips finish_reason=length ("output limit
+    // reached"). Override with ACP_GLM_MAX_TOKENS.
+    this.maxTokens = parseIntEnv("ACP_GLM_MAX_TOKENS", 32_768);
 
     this.client = new OpenAI({ apiKey, baseURL });
   }

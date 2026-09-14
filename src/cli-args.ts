@@ -3,7 +3,7 @@ import { DEFAULT_MAX_TURNS } from "./protocol/agent.js";
 /**
  * Parse `--max-turns <n>` (or `--max-turns=<n>`) from CLI args.
  * Returns `undefined` only when the flag is absent; invalid input selects the
- * default (20), never `$ACP_GLM_MAX_TURNS` — explicit-but-bad CLI input must
+ * default (100), never `$ACP_GLM_MAX_TURNS` — explicit-but-bad CLI input must
  * not silently fall through to the env var.
  */
 export function parseMaxTurnsFlag(argv: string[]): number | undefined {

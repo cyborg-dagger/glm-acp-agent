@@ -38,9 +38,35 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "edit_file",
+      description:
+        "Replace one exact snippet inside an existing text file — a surgical edit that does not rewrite the whole file. Prefer this over write_file when modifying existing files: it is smaller, faster, and avoids output-token limits. old_text must match the file exactly (including whitespace) and must occur exactly once; include surrounding lines to disambiguate.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Absolute or relative path to the file to edit.",
+          },
+          old_text: {
+            type: "string",
+            description: "The exact existing text to replace. Must appear exactly once in the file.",
+          },
+          new_text: {
+            type: "string",
+            description: "The replacement text. Use an empty string to delete the snippet.",
+          },
+        },
+        required: ["path", "old_text", "new_text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "write_file",
       description:
-        "Write or overwrite a text file from the agent process after asking the user for permission. Relative paths resolve against the ACP session working directory.",
+        "Write or overwrite a text file from the agent process after asking the user for permission. Relative paths resolve against the ACP session working directory. Use this for new files or full rewrites; prefer edit_file for small changes to existing files.",
       parameters: {
         type: "object",
         properties: {
