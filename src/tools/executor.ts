@@ -29,6 +29,49 @@ export interface ToolResult {
  * while read/list operations and approved writes/commands run locally with
  * paths resolved relative to the ACP session cwd.
  */
+export interface TodoItem {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm?: string;
+}
+
+/** Default page size for read_file results fed back to the model. */
+const DEFAULT_READ_LIMIT = 2000;
+/** Upper bound for an explicit limit — keeps one call from flooding the context. */
+const HARD_READ_LIMIT = 5000;
+/** Strings longer than this are elided in client-facing previews (UI cards), never in tool results. */
+const PREVIEW_STRING_LIMIT = 240;
+const PREVIEW_HEAD = 120;
+
+/**
+ * Elide a single long string for client-facing display (UI cards, read
+ * previews) — never for tool results or permission prompts.
+ */
+function elideStringForPreview(value: string): string {
+  if (value.length <= PREVIEW_STRING_LIMIT) return value;
+  return `${value.slice(0, PREVIEW_HEAD)}… [${value.length} chars]`;
+}
+
+/**
+ * Elide long strings in a rawInput/rawOutput payload so client UI cards stay
+ * compact (a whole-file write would otherwise render the entire file in chat).
+ * The full payload still reaches the model through the tool result channel.
+ */
+function elideForPreview(value: unknown): unknown {
+  if (typeof value === "string") {
+    return elideStringForPreview(value);
+  }
+  if (Array.isArray(value)) return value.map(elideForPreview);
+  if (typeof value === "object" && value !== null) {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = elideForPreview(item);
+    }
+    return out;
+  }
+  return value;
+}
+
 export class ToolExecutor {
   constructor(
     private connection: AgentSideConnection,
@@ -38,7 +81,8 @@ export class ToolExecutor {
     private visionClient: VisionMcpClient | null = null,
     private sessionMcpTools: SessionMcpTools | null = null,
     private sessionCwd: string = process.cwd(),
-    private getMode: () => SessionModeId = () => "default"
+    private getMode: () => SessionModeId = () => "default",
+    private setTodos: (todos: TodoItem[]) => void = () => undefined
   ) {}
 
   /**
@@ -80,6 +124,8 @@ export class ToolExecutor {
         return this.webReader(toolCallId, args);
       case "image_analysis":
         return this.imageAnalysis(toolCallId, args);
+      case "todowrite":
+        return this.todoWrite(toolCallId, args);
       default: {
         if (this.sessionMcpTools?.hasTool(toolName)) {
           return this.sessionMcpTool(toolCallId, toolName, args);
@@ -103,6 +149,12 @@ export class ToolExecutor {
     if (!path) {
       return this.failAndReturn(toolCallId, "read_file", args, "Error: `path` is required.");
     }
+    const offset = Math.max(1, Math.floor(Number(args["offset"] ?? 1)) || 1);
+    const limitArg = Number(args["limit"] ?? DEFAULT_READ_LIMIT);
+    const limit = Math.min(
+      HARD_READ_LIMIT,
+      Math.max(1, Math.floor(limitArg) || DEFAULT_READ_LIMIT)
+    );
     const absolutePath = this.resolvePath(path);
 
     await this.connection.sessionUpdate({
@@ -114,12 +166,45 @@ export class ToolExecutor {
         kind: "read",
         status: "in_progress",
         locations: [{ path }],
-        rawInput: args,
+        rawInput: elideForPreview(args),
       },
     });
 
     try {
-      const content = await readFile(absolutePath, "utf8");
+      const full = await readFile(absolutePath, "utf8");
+      const lines = full.split("\n");
+      // split() turns a trailing newline into a phantom empty last line; drop
+      // it so the reported line count matches what an editor shows.
+      if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+      const totalLines = lines.length;
+
+      // Past EOF: report it plainly instead of clamping back into the last
+      // line — clamping made the "next chunk" hint reappear forever.
+      if (offset > totalLines) {
+        const content = `[end of file: offset ${offset} is beyond the last line of ${path} (${totalLines} line${totalLines === 1 ? "" : "s"})]`;
+        await this.connection.sessionUpdate({
+          sessionId: this.sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            status: "completed",
+            content: [{ type: "content", content: { type: "text", text: content } }],
+            rawOutput: elideForPreview({ content }),
+          },
+        });
+        return { content };
+      }
+
+      const start = offset;
+      const end = Math.min(start + limit - 1, totalLines);
+      let content = lines.slice(start - 1, end).join("\n");
+      // Only advertise a next offset while lines remain — a hint on the final
+      // page would send the model back into the EOF branch above on a loop.
+      if (end < totalLines) {
+        content += `\n[showing lines ${start}-${end} of ${totalLines}; pass offset=${end + 1} to read the next chunk]`;
+      } else if (start > 1) {
+        content += `\n[showing lines ${start}-${end} of ${totalLines}; end of file]`;
+      }
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -127,8 +212,10 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text: content } }],
-          rawOutput: { content },
+          content: [
+            { type: "content", content: { type: "text", text: elideStringForPreview(content) } },
+          ],
+          rawOutput: elideForPreview({ content }),
         },
       });
 
@@ -138,6 +225,72 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, message);
       return { content: `Error reading file: ${message}` };
     }
+  }
+
+  private async todoWrite(
+    toolCallId: string,
+    args: Record<string, unknown>
+  ): Promise<ToolResult> {
+    const rawTodos = args["todos"];
+    if (!Array.isArray(rawTodos)) {
+      return this.failAndReturn(
+        toolCallId,
+        "todowrite",
+        args,
+        "Error: `todos` must be an array of { content, status, activeForm? }."
+      );
+    }
+    const todos: TodoItem[] = [];
+    for (const raw of rawTodos) {
+      if (typeof raw !== "object" || raw === null) {
+        return this.failAndReturn(toolCallId, "todowrite", args, "Error: each todo must be an object.");
+      }
+      const content = String((raw as Record<string, unknown>)["content"] ?? "").trim();
+      const status = String((raw as Record<string, unknown>)["status"] ?? "");
+      const activeFormRaw = (raw as Record<string, unknown>)["active_form"] ?? (raw as Record<string, unknown>)["activeForm"];
+      const activeForm = activeFormRaw === undefined ? undefined : String(activeFormRaw);
+      if (!content) {
+        return this.failAndReturn(toolCallId, "todowrite", args, "Error: each todo requires non-empty `content`.");
+      }
+      if (status !== "pending" && status !== "in_progress" && status !== "completed") {
+        return this.failAndReturn(
+          toolCallId,
+          "todowrite",
+          args,
+          "Error: `status` must be one of pending, in_progress, completed."
+        );
+      }
+      todos.push({ content, status, activeForm });
+    }
+    if (todos.length === 0) {
+      return this.failAndReturn(toolCallId, "todowrite", args, "Error: `todos` must not be empty.");
+    }
+    this.setTodos(todos);
+
+    const rendered = todos
+      .map((todo, index) => {
+        const marker =
+          todo.status === "completed" ? "[x]" : todo.status === "in_progress" ? "[>]" : "[ ]";
+        return `${index + 1}. ${marker} ${todo.content}${todo.activeForm ? ` (${todo.activeForm})` : ""}`;
+      })
+      .join("\n");
+
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: todos.some((t) => t.status === "in_progress")
+          ? `Task list: ${todos.find((t) => t.status === "in_progress")?.activeForm ?? todos.find((t) => t.status === "in_progress")?.content ?? ""}`
+          : `Task list: ${todos.length} item${todos.length === 1 ? "" : "s"}`,
+        kind: "other",
+        status: "completed",
+        rawInput: elideForPreview(args),
+        rawOutput: elideForPreview({ todos }),
+      },
+    });
+
+    return { content: `Todo list updated:\n${rendered}` };
   }
 
   private async writeFile(
@@ -161,11 +314,13 @@ export class ToolExecutor {
         kind: "edit",
         status: "pending",
         locations: [{ path }],
-        rawInput: args,
+        rawInput: elideForPreview(args),
       },
     });
 
-    // Step 2: request user permission based on the current session mode.
+    // Step 2: request user permission based on the current session mode. The
+    // prompt must show the full payload: an approval decides on exactly what
+    // will run, so elision is reserved for sessionUpdate UI cards (step 1).
     const permissionResult = await this.maybeRequestPermission({
       toolCallId,
       kind: "write",
@@ -281,7 +436,7 @@ export class ToolExecutor {
         kind: "edit",
         status: "pending",
         locations: [{ path }],
-        rawInput: args,
+        rawInput: elideForPreview(args),
       },
     });
 
@@ -308,6 +463,8 @@ export class ToolExecutor {
       };
     }
 
+    // Full payload in the prompt — the user approves the exact edit (see
+    // writeFile; elision is for sessionUpdate cards only).
     const permissionResult = await this.maybeRequestPermission({
       toolCallId,
       kind: "write",
@@ -408,7 +565,7 @@ export class ToolExecutor {
         kind: "read",
         status: "in_progress",
         locations: [{ path }],
-        rawInput: args,
+        rawInput: elideForPreview(args),
       },
     });
 
@@ -433,7 +590,7 @@ export class ToolExecutor {
           toolCallId,
           status: "completed",
           content: [{ type: "content", content: { type: "text", text: output } }],
-          rawOutput: { output },
+          rawOutput: elideForPreview({ output }),
         },
       });
 
@@ -469,11 +626,12 @@ export class ToolExecutor {
         kind: "execute",
         status: "pending",
         locations: [],
-        rawInput: args,
+        rawInput: elideForPreview(args),
       },
     });
 
-    // Step 2: request permission based on the current session mode.
+    // Step 2: request permission based on the current session mode. Full
+    // payload again: the approval must see the whole command line.
     const permissionResult = await this.maybeRequestPermission({
       toolCallId,
       kind: "execute",
@@ -527,7 +685,7 @@ export class ToolExecutor {
           toolCallId,
           status: "completed",
           content: [{ type: "content", content: { type: "text", text: output } }],
-          rawOutput: { stdout, stderr, exitCode, signal },
+          rawOutput: elideForPreview({ stdout, stderr, exitCode, signal }),
         },
       });
 
@@ -567,7 +725,7 @@ export class ToolExecutor {
         kind: "fetch",
         status: "in_progress",
         locations: [],
-        rawInput: args,
+        rawInput: elideForPreview(args),
       },
     });
 
@@ -593,7 +751,7 @@ export class ToolExecutor {
           toolCallId,
           status: "completed",
           content: [{ type: "content", content: { type: "text", text: output } }],
-          rawOutput: { resultCount },
+          rawOutput: elideForPreview({ resultCount }),
         },
       });
 
@@ -629,7 +787,7 @@ export class ToolExecutor {
         kind: "fetch",
         status: "in_progress",
         locations: [{ path: url }],
-        rawInput: args,
+        rawInput: elideForPreview(args),
       },
     });
 
@@ -653,7 +811,7 @@ export class ToolExecutor {
           toolCallId,
           status: "completed",
           content: [{ type: "content", content: { type: "text", text: output } }],
-          rawOutput: { title, url: resultUrl },
+          rawOutput: elideForPreview({ title, url: resultUrl }),
         },
       });
 
@@ -697,7 +855,7 @@ export class ToolExecutor {
         kind: "fetch",
         status: "in_progress",
         locations: [{ path: imageSource }],
-        rawInput: args,
+        rawInput: elideForPreview(args),
       },
     });
 
@@ -714,7 +872,7 @@ export class ToolExecutor {
           toolCallId,
           status: "completed",
           content: [{ type: "content", content: { type: "text", text } }],
-          rawOutput: { text },
+          rawOutput: elideForPreview({ text }),
         },
       });
       return { content: text };
@@ -739,7 +897,7 @@ export class ToolExecutor {
         kind: "other",
         status: "in_progress",
         locations: [],
-        rawInput: args,
+        rawInput: elideForPreview(args),
       },
     });
 
@@ -808,6 +966,9 @@ export class ToolExecutor {
           kind: args.kind === "write" ? "edit" : "execute",
           status: "pending",
           locations: args.locations ?? [],
+          // Passed through verbatim: callers hand us the full payload so the
+          // approval prompt shows exactly what will run. UI-card elision
+          // happens on the sessionUpdate channel, never here.
           rawInput: args.rawInput,
         },
         options: [

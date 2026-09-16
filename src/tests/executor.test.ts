@@ -266,6 +266,106 @@ test("list_files and run_command execute in the agent process without terminal c
 // read_file
 // ---------------------------------------------------------------------------
 
+test("read_file truncates large files with a range marker", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-truncate-"));
+  const path = join(dir, "big.txt");
+  writeFileSync(path, Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n"), "utf8");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const first = await exec.execute(
+      "tc1",
+      "read_file",
+      JSON.stringify({ path, limit: 4 })
+    );
+    assert.match(first.content, /line-1/);
+    assert.match(first.content, /showing lines 1-4 of (10|11)/);
+    assert.match(first.content, /pass offset=5/);
+
+    const second = await exec.execute(
+      "tc2",
+      "read_file",
+      JSON.stringify({ path, offset: 5, limit: 4 })
+    );
+    assert.match(second.content, /line-5/);
+    assert.doesNotMatch(second.content, /line-4\b/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file final page reports end of file without a next-offset hint", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-final-page-"));
+  const path = join(dir, "paged.txt");
+  writeFileSync(path, Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n"), "utf8");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const last = await exec.execute(
+      "tc1",
+      "read_file",
+      JSON.stringify({ path, offset: 7, limit: 4 })
+    );
+    assert.match(last.content, /line-10/);
+    assert.match(last.content, /showing lines 7-10 of 10/);
+    assert.match(last.content, /end of file/);
+    // The hint must disappear once the page reaches EOF — advertising a next
+    // offset there sent the model into an endless last-line loop.
+    assert.doesNotMatch(last.content, /pass offset=/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file offset beyond EOF returns an EOF result without clamping or a hint", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-past-eof-"));
+  const path = join(dir, "paged.txt");
+  writeFileSync(path, Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n"), "utf8");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "read_file",
+      JSON.stringify({ path, offset: 11, limit: 4 })
+    );
+    assert.match(result.content, /end of file/);
+    assert.match(result.content, /offset 11 is beyond the last line/);
+    // No clamp back into the final line, no next-page advertising.
+    assert.doesNotMatch(result.content, /line-10/);
+    assert.doesNotMatch(result.content, /pass offset=/);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "completed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file elides the client content channel while the tool result stays full", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-elide-content-"));
+  const path = join(dir, "long.txt");
+  writeFileSync(path, `${"a".repeat(400)}\nsecond line`, "utf8");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    // The model receives the full page through the tool result...
+    assert.ok(result.content.startsWith("a".repeat(400)));
+    assert.match(result.content, /second line/);
+    // ...but the client-facing content channel is elided.
+    const completed = conn.updates.find(
+      (u) =>
+        (u.update as { sessionUpdate?: string }).sessionUpdate === "tool_call_update" &&
+        Array.isArray((u.update as { content?: unknown[] }).content)
+    ) as { update: { content: Array<{ content: { text: string } }> } };
+    const text = completed.update.content[0]?.content.text ?? "";
+    assert.match(text, /chars\]$/);
+    assert.ok(text.length < 300);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("read_file success path emits in_progress and completed updates", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-success-"));
   const path = join(dir, "x.txt");
@@ -561,6 +661,118 @@ test("write_file surfaces client writeTextFile failures as a failed tool result"
     assert.equal(existsSync(path), false);
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("todowrite stores the task list and renders it back to the model", async () => {
+  const conn = createConnectionStub();
+  const stored: Array<Array<{ content: string; status: string }>> = [];
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    process.cwd(),
+    () => "default",
+    (todos) => stored.push(todos)
+  );
+  const result = await exec.execute(
+    "tc1",
+    "todowrite",
+    JSON.stringify({
+      todos: [
+        { content: "Reproduce the failure", status: "completed" },
+        { content: "Patch the parser", status: "in_progress", active_form: "Patching the parser" },
+        { content: "Add regression tests", status: "pending" },
+      ],
+    })
+  );
+  assert.match(result.content, /Todo list updated/);
+  assert.match(result.content, /\[x\] Reproduce the failure/);
+  assert.match(result.content, /\[>\] Patch the parser/);
+  assert.match(result.content, /\[ \] Add regression tests/);
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0]?.length, 3);
+
+  const bad = await exec.execute(
+    "tc2",
+    "todowrite",
+    JSON.stringify({ todos: [{ content: "x", status: "wat" }] })
+  );
+  assert.match(bad.content, /status.*must be one of/i);
+  assert.equal(stored.length, 1);
+});
+
+test("write_file elides long content in client previews but writes the full file", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-preview-elide-"));
+  const path = join(dir, "out.txt");
+  const big = "x".repeat(5000);
+  const conn = createConnectionStub({ permission: "allow" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "write_file",
+      JSON.stringify({ path, content: big })
+    );
+    assert.match(result.content, /written successfully/);
+    // The disk write is complete...
+    assert.equal(readFileSync(path, "utf8"), big);
+    // ...but the client-facing rawInput is elided.
+    const announce = conn.updates.find(
+      (u) => (u.update as { rawInput?: { content?: unknown } }).rawInput?.content !== undefined
+    ) as { update: { rawInput: { content: string } } };
+    assert.match(announce.update.rawInput.content, /5000 chars\]$/);
+    assert.ok(announce.update.rawInput.content.length < 300);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("permission prompts receive the full payload while UI cards stay elided", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-permission-full-"));
+  const conn = createConnectionStub({ permission: "allow" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
+  try {
+    const big = "x".repeat(5000);
+    await exec.execute(
+      "tc1",
+      "write_file",
+      JSON.stringify({ path: join(dir, "written.txt"), content: big })
+    );
+
+    const editPath = join(dir, "editable.txt");
+    writeFileSync(editPath, `${"y".repeat(400)} old ${"y".repeat(400)}`, "utf8");
+    const replacement = "z".repeat(5000);
+    await exec.execute(
+      "tc2",
+      "edit_file",
+      JSON.stringify({ path: editPath, old_text: "old", new_text: replacement })
+    );
+
+    await exec.execute("tc3", "run_command", JSON.stringify({ command: "printf '%s' ok" }));
+
+    // Every permission request carries the complete, unelided payload — the
+    // user approves exactly what will run, never a truncated prefix.
+    assert.equal(conn.permissionRequests.length, 3);
+    const [writeReq, editReq, runReq] = conn.permissionRequests as Array<{
+      toolCall: { rawInput: Record<string, unknown> };
+    }>;
+    assert.equal(writeReq.toolCall.rawInput["content"], big);
+    assert.equal(editReq.toolCall.rawInput["new_text"], replacement);
+    assert.equal(editReq.toolCall.rawInput["old_text"], "old");
+    assert.equal(runReq.toolCall.rawInput["command"], "printf '%s' ok");
+
+    // The sessionUpdate announcement cards, in contrast, stay elided.
+    const announce = conn.updates.find(
+      (u) => (u.update as { rawInput?: { content?: unknown } }).rawInput?.content !== undefined
+    ) as { update: { rawInput: { content: string } } };
+    assert.match(announce.update.rawInput.content, /5000 chars\]$/);
+    assert.ok(announce.update.rawInput.content.length < 300);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
