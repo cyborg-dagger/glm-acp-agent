@@ -66,6 +66,19 @@ test("writeCredentials writes a 0600-permission file", () => {
   });
 });
 
+test("writeCredentials restricts an existing credentials file before replacing it", () => {
+  if (process.platform === "win32") return; // POSIX-only
+  withTmp((dir) => {
+    const path = join(dir, "credentials.json");
+    writeFileSync(path, '{"z_ai_api_key":"old-key"}\n', { mode: 0o644 });
+
+    writeCredentials("new-key", path);
+
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.equal(readCredentialsKey(path), "new-key");
+  });
+});
+
 test("writeCredentials refuses an empty key", () => {
   withTmp((dir) => {
     const path = join(dir, "credentials.json");

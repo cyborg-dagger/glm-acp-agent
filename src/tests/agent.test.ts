@@ -1653,6 +1653,173 @@ test("prompt echoes userMessageId and reports usage", async () => {
   assert.deepEqual(result.usage, { inputTokens: 10, outputTokens: 5, totalTokens: 15 });
 });
 
+test("aggregates usage across model calls and counts one usage object per response", async () => {
+  const conn = createConnectionStub();
+  const calls: Array<ReadonlyArray<{ role: string; tool_calls?: unknown }>> = [];
+  let callIndex = 0;
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{ role: string; tool_calls?: unknown }>
+    ): AsyncGenerator<GlmStreamChunk> {
+      calls.push(messages);
+      callIndex++;
+      if (callIndex === 1) {
+        yield {
+          usage: {
+            inputTokens: 10,
+            outputTokens: 5,
+            totalTokens: 15,
+            cachedReadTokens: 2,
+            cachedWriteTokens: 3,
+            thoughtTokens: 4,
+          },
+        };
+        // A provider may repeat usage while finishing one streamed response.
+        // The response must contribute once, using its final usage snapshot.
+        yield {
+          usage: {
+            inputTokens: 11,
+            outputTokens: 6,
+            totalTokens: 17,
+            cachedReadTokens: 5,
+            cachedWriteTokens: 7,
+            thoughtTokens: 8,
+          },
+        };
+        yield {
+          toolCall: { id: "tc-usage", name: "list_files", arguments: JSON.stringify({ path: "." }) },
+        };
+        yield { done: true, stopReason: "tool_calls" };
+      } else {
+        yield {
+          usage: {
+            inputTokens: 20,
+            outputTokens: 7,
+            totalTokens: 27,
+            cachedReadTokens: 3,
+            cachedWriteTokens: 4,
+            thoughtTokens: 6,
+          },
+        };
+        yield { text: "done" };
+        yield { done: true, stopReason: "stop" };
+      }
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+  const result = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "list" }] });
+
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(calls.length, 2);
+  assert.deepEqual(result.usage, {
+    inputTokens: 31,
+    outputTokens: 13,
+    totalTokens: 44,
+    cachedReadTokens: 8,
+    cachedWriteTokens: 11,
+    thoughtTokens: 14,
+  });
+});
+
+test("cancelled multi-tool turns persist the full assistant call list and completed results", async () => {
+  const { store, cleanup } = makeTempStore();
+  const dir = makeTempCwd({ "one.txt": "one", "two.txt": "two" });
+  try {
+    const conn = createConnectionStub();
+    let callIndex = 0;
+    let cancelIssued = false;
+    let followUpMessages: ReadonlyArray<{
+      role: string;
+      tool_calls?: Array<{ id: string }>;
+      tool_call_id?: string;
+      content?: unknown;
+    }> = [];
+    const glm = {
+      async *streamChat(
+        messages: ReadonlyArray<{ role: string; tool_calls?: Array<{ id: string }> }>
+      ): AsyncGenerator<GlmStreamChunk> {
+        callIndex++;
+        if (callIndex === 1) {
+          yield {
+            toolCall: { id: "a", name: "list_files", arguments: JSON.stringify({ path: "." }) },
+          };
+          yield {
+            toolCall: { id: "b", name: "list_files", arguments: JSON.stringify({ path: "." }) },
+          };
+          yield { done: true, stopReason: "tool_calls" };
+        } else {
+          followUpMessages = [...messages];
+          yield { text: "continued" };
+          yield { done: true, stopReason: "stop" };
+        }
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: dir.cwd, mcpServers: [] });
+
+    const originalSessionUpdate = conn.sessionUpdate.bind(conn);
+    conn.sessionUpdate = async (params) => {
+      await originalSessionUpdate(params);
+      const update = params.update as { sessionUpdate?: string; toolCallId?: string };
+      if (!cancelIssued && update.sessionUpdate === "tool_call" && update.toolCallId === "a") {
+        cancelIssued = true;
+        await agent.cancel({ sessionId });
+      }
+    };
+
+    const cancelled = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "list" }] });
+    assert.equal(cancelled.stopReason, "cancelled");
+    assert.equal(callIndex, 1, "cancellation must prevent the follow-up model call");
+
+    const persisted = store.load(sessionId);
+    assert.ok(persisted, "cancelled prompts must still persist their history");
+    const persistedAssistant = persisted?.messages.find((message) => {
+      if (message.role !== "assistant") return false;
+      return (message as { tool_calls?: Array<{ id: string }> }).tool_calls?.length === 2;
+    });
+    assert.deepEqual(
+      (persistedAssistant as { tool_calls?: Array<{ id: string }> } | undefined)?.tool_calls?.map(
+        (toolCall) => toolCall.id
+      ),
+      ["a", "b"]
+    );
+    const persistedTools = persisted?.messages.filter((message) => message.role === "tool") ?? [];
+    assert.deepEqual(
+      persistedTools.map((message) => (message as { tool_call_id?: string }).tool_call_id),
+      ["a", "b"]
+    );
+    assert.match(
+      String(persistedTools[1]?.content),
+      /cancel/i,
+      "the pending call needs a synthetic result so the next request is valid"
+    );
+
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] });
+    assert.deepEqual(
+      followUpMessages.slice(-4).map((message) => message.role),
+      ["assistant", "tool", "tool", "user"]
+    );
+    assert.deepEqual(
+      followUpMessages[followUpMessages.length - 4]?.tool_calls?.map((toolCall) => toolCall.id),
+      ["a", "b"]
+    );
+    assert.deepEqual(
+      followUpMessages
+        .slice(-4, -1)
+        .filter((message) => message.role === "tool")
+        .map((message) => message.tool_call_id),
+      ["a", "b"]
+    );
+  } finally {
+    dir.cleanup();
+    cleanup();
+  }
+});
+
 test("prompt converts resource_link and embedded resource blocks", async () => {
   const conn = createConnectionStub();
   let captured = "";
@@ -1692,6 +1859,9 @@ test("tool call result is fed back into the next streamChat call", async () => {
   const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-agent-tool-read-"));
   writeFileSync(pathJoin(dir, "x.ts"), "export const x = 1;", "utf8");
   const conn = createConnectionStub();
+  // With both fs capabilities the executor reads the client's unsaved buffer.
+  // Seed it with content that differs from disk so the contract is observable.
+  conn.fileResponses.set(pathJoin(dir, "x.ts"), "buffer contents");
 
   let callIndex = 0;
   const glm = {
@@ -1709,7 +1879,7 @@ test("tool call result is fed back into the next streamChat call", async () => {
         const toolMsg = messages.find((m) => m.role === "tool");
         assert.ok(toolMsg, "expected a tool role message in the second call");
         assert.equal(toolMsg?.tool_call_id, "tc1");
-        assert.equal(toolMsg?.content, "export const x = 1;");
+        assert.equal(toolMsg?.content, "buffer contents");
         yield { text: "Done." };
         yield { done: true, stopReason: "stop" };
       }
@@ -1729,7 +1899,7 @@ test("tool call result is fed back into the next streamChat call", async () => {
     });
     assert.equal(result.stopReason, "end_turn");
     assert.equal(callIndex, 2);
-    assert.deepEqual(conn.reads, []);
+    assert.deepEqual(conn.reads, [pathJoin(dir, "x.ts")]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 
@@ -44,11 +44,15 @@ class StubClient implements Client {
   reads: Array<{ path: string }> = [];
   fileContents = new Map<string, string>();
   permissionResponses: Array<{ outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" } }> = [];
+  permissionStarted: (() => void) | null = null;
+  permissionRelease: Promise<void> | null = null;
 
   async sessionUpdate(params: Parameters<Client["sessionUpdate"]>[0]): Promise<void> {
     this.updates.push(params as unknown as Record<string, unknown>);
   }
   async requestPermission(): Promise<ReturnType<NonNullable<Client["requestPermission"]>>> {
+    this.permissionStarted?.();
+    if (this.permissionRelease) await this.permissionRelease;
     const next = this.permissionResponses.shift();
     return next ?? { outcome: { outcome: "selected", optionId: "allow" } };
   }
@@ -156,7 +160,9 @@ test("end-to-end tool call: agent reads a local file from the session cwd", asyn
 
   await clientConn.initialize({
     protocolVersion: PROTOCOL_VERSION,
-    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+    // This case covers the agent-process fallback; buffered reads are covered
+    // by the executor and protocol unit tests with divergent buffer content.
+    clientCapabilities: {},
   });
   const session = await clientConn.newSession({ cwd: dir, mcpServers: [] });
   try {
@@ -219,6 +225,111 @@ test("end-to-end cancellation via session/cancel notification", async () => {
   await clientConn.cancel({ sessionId: session.sessionId });
   const result = await promptPromise;
   assert.equal(result.stopReason, "cancelled");
+});
+
+test("end-to-end cancellation while permission is pending leaves valid history for the next prompt", async () => {
+  const { a, b } = pairedStreams();
+  const stub = new StubClient();
+  const cwd = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-integration-cancel-permission-"));
+  let resolvePermissionStarted!: () => void;
+  const permissionStarted = new Promise<void>((resolve) => (resolvePermissionStarted = resolve));
+  let releasePermission!: () => void;
+  const permissionRelease = new Promise<void>((resolve) => (releasePermission = resolve));
+  stub.permissionStarted = () => {
+    stub.permissionStarted = null;
+    resolvePermissionStarted();
+  };
+  stub.permissionRelease = permissionRelease;
+  stub.permissionResponses = [{ outcome: { outcome: "selected", optionId: "allow" } }];
+
+  let callIndex = 0;
+  let followUpMessages: ReadonlyArray<{
+    role: string;
+    tool_calls?: Array<{ id: string }>;
+    tool_call_id?: string;
+    content?: unknown;
+  }> = [];
+  const glm = {
+    async *streamChat(
+      messages: ReadonlyArray<{
+        role: string;
+        tool_calls?: Array<{ id: string }>;
+        tool_call_id?: string;
+        content?: unknown;
+      }>
+    ): AsyncGenerator<GlmStreamChunk> {
+      callIndex++;
+      if (callIndex === 1) {
+        yield {
+          toolCall: {
+            id: "write-1",
+            name: "write_file",
+            arguments: JSON.stringify({ path: "cancelled.txt", content: "should not run" }),
+          },
+        };
+        yield { done: true, stopReason: "tool_calls" };
+      } else {
+        followUpMessages = [...messages];
+        yield { text: "continued" };
+        yield { done: true, stopReason: "stop" };
+      }
+    },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _agentConn = new AgentSideConnection(
+    (conn) => new GlmAcpAgent(conn, { glm, sessionStore: null }),
+    a
+  );
+  const clientConn = new ClientSideConnection(() => stub, b);
+
+  try {
+    await clientConn.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: {},
+    });
+    const session = await clientConn.newSession({ cwd, mcpServers: [] });
+
+    const firstPrompt = clientConn.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "write" }],
+    });
+    await permissionStarted;
+    await clientConn.cancel({ sessionId: session.sessionId });
+    let cancellationTimer!: NodeJS.Timeout;
+    const cancelledBeforePermissionResolved = await Promise.race([
+      firstPrompt.then(() => true),
+      new Promise<boolean>((resolve) => {
+        cancellationTimer = setTimeout(() => resolve(false), 1000);
+      }),
+    ]);
+    clearTimeout(cancellationTimer);
+    assert.equal(cancelledBeforePermissionResolved, true, "cancel must settle while permission is pending");
+    const cancelled = await firstPrompt;
+    assert.equal(cancelled.stopReason, "cancelled");
+    assert.equal(callIndex, 1);
+
+    // Resolve the original permission request after the turn has already
+    // returned; cancellation must prevent this late approval from writing.
+    releasePermission();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(existsSync(pathJoin(cwd, "cancelled.txt")), false);
+
+    const continued = await clientConn.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "continue" }],
+    });
+    assert.equal(continued.stopReason, "end_turn");
+    assert.deepEqual(followUpMessages.slice(-3).map((message) => message.role), [
+      "assistant",
+      "tool",
+      "user",
+    ]);
+    assert.equal(followUpMessages[followUpMessages.length - 2]?.tool_call_id, "write-1");
+  } finally {
+    releasePermission();
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("end-to-end session/list and session/close advertised on initialize and routable", async () => {
