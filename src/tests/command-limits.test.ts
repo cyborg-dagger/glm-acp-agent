@@ -1,6 +1,9 @@
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import childProcess from "node:child_process";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ToolExecutor } from "../tools/executor.js";
@@ -133,7 +136,7 @@ test("finite command output is capped across stdout and stderr with a truncation
     assert.ok(capturedBytes <= 10, `captured ${capturedBytes} bytes`);
     assert.equal(raw.outputTruncated, true);
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -157,7 +160,7 @@ test("a byte cap never exposes a partial UTF-8 code point", async () => {
     assert.ok(Buffer.byteLength(String(raw.stdout ?? ""), "utf8") <= 1);
     assert.equal(raw.stdout, "");
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -197,7 +200,7 @@ test("a command timeout terminates the process tree and marks the tool failed", 
     assert.equal(existsSync(ready), true);
     assert.equal(existsSync(marker), false);
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -229,7 +232,7 @@ test("a normal background shell exit survives a longer deadline", async () => {
     assert.equal(await waitForFile(marker, 2_500), true);
     assert.equal(lastUpdate(connection).status, "completed");
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -238,7 +241,6 @@ test("shell-exit cleanup prevents a deadline from killing inherited pipes", asyn
   const cwd = mkdtempSync(join(tmpdir(), "glm-command-limits-background-race-"));
   const ready = join(cwd, "ready");
   const release = join(cwd, "release");
-  const shellExited = join(cwd, "shell-exited");
   const marker = join(cwd, "background-finished");
   writeFileSync(
     join(cwd, "foreground-fixture.cjs"),
@@ -255,6 +257,21 @@ test("shell-exit cleanup prevents a deadline from killing inherited pipes", asyn
     "utf8"
   );
   mock.timers.enable({ apis: ["setTimeout"] });
+  let shellExitResolve!: () => void;
+  const shellExitEvent = new Promise<void>((resolve) => {
+    shellExitResolve = resolve;
+  });
+  const originalSpawn = childProcess.spawn;
+  const spawnMock = mock.method(
+    childProcess,
+    "spawn",
+    ((...args: Parameters<typeof originalSpawn>) => {
+      const child = originalSpawn(...args);
+      if (args[0] === "sh") child.once("exit", shellExitResolve);
+      return child;
+    }) as typeof childProcess.spawn
+  );
+  syncBuiltinESMExports();
   try {
     const pending = withEnv(
       {
@@ -266,7 +283,7 @@ test("shell-exit cleanup prevents a deadline from killing inherited pipes", asyn
           "tc1",
           "run_command",
           JSON.stringify({
-            command: "trap \"echo shell-exited > shell-exited\" EXIT; node foreground-fixture.cjs; node background-race-fixture.cjs & echo started",
+            command: "node foreground-fixture.cjs; node background-race-fixture.cjs & echo started",
           })
         )
     );
@@ -274,11 +291,9 @@ test("shell-exit cleanup prevents a deadline from killing inherited pipes", asyn
     assert.equal(await waitForFile(ready, 2_000), true);
     mock.timers.tick(950);
     writeFileSync(release, "release");
-    assert.equal(await waitForFile(shellExited, 2_000), true);
-    // Let the real child exit event schedule its inherited-pipe drain timer.
-    for (let index = 0; index < 1_000; index++) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
+    // Wait for the actual ChildProcess exit event. Its continuation runs after
+    // the executor's exit handler has cleared the command deadline.
+    await shellExitEvent;
     mock.timers.tick(100);
     const result = await pending;
     assert.match(result.content, /Exit code: 0/);
@@ -287,8 +302,10 @@ test("shell-exit cleanup prevents a deadline from killing inherited pipes", asyn
     assert.equal(await waitForFile(marker, 2_500), true);
     assert.equal(lastUpdate(connection).status, "completed");
   } finally {
+    spawnMock.mock.restore();
+    syncBuiltinESMExports();
     mock.timers.reset();
-    rmSync(cwd, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 

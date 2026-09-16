@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -105,6 +106,25 @@ function shellNodeCommand(): string {
 
 function shellFixturePath(absolutePath: string, relativePath: string): string {
   return JSON.stringify(process.platform === "win32" ? relativePath : absolutePath);
+}
+
+async function removeTestDirectory(path: string): Promise<void> {
+  const attempts = process.platform === "win32" ? 40 : 1;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await rm(path, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (process.platform !== "win32" || !["EBUSY", "EPERM", "ENOTEMPTY"].includes(code ?? "")) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  throw lastError;
 }
 
 type FetchCall = {
@@ -1137,7 +1157,7 @@ test(
       await new Promise((resolve) => setTimeout(resolve, 500));
       assert.equal(readFileSync(marker, "utf8"), "done");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      await removeTestDirectory(dir);
     }
   }
 );
