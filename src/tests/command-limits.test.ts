@@ -59,10 +59,6 @@ function lastUpdate(connection: ReturnType<typeof createConnectionStub>) {
   };
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
 async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -170,6 +166,14 @@ test("a command timeout terminates the process tree and marks the tool failed", 
   const cwd = mkdtempSync(join(tmpdir(), "glm-command-limits-timeout-"));
   const ready = join(cwd, "ready");
   const marker = join(cwd, "late");
+  writeFileSync(
+    join(cwd, "timeout-fixture.cjs"),
+    'const fs = require("node:fs");\n' +
+      'fs.writeFileSync("ready", "ready");\n' +
+      'setInterval(() => process.stdout.write("x"), 1);\n' +
+      'setTimeout(() => fs.writeFileSync("late", "late"), 700);\n',
+    "utf8"
+  );
   try {
     const started = Date.now();
     const result = await withEnv(
@@ -182,8 +186,7 @@ test("a command timeout terminates the process tree and marks the tool failed", 
           "tc1",
           "run_command",
           JSON.stringify({
-            command:
-              `${shellQuote(process.execPath)} -e 'const fs = require("node:fs"); fs.writeFileSync(${JSON.stringify(ready)}, "ready"); setInterval(() => process.stdout.write("x"), 1); setTimeout(() => fs.writeFileSync(${JSON.stringify(marker)}, "late"), 700)'`,
+            command: "node timeout-fixture.cjs",
           })
         )
     );
@@ -202,6 +205,11 @@ test("a normal background shell exit survives a longer deadline", async () => {
   const connection = createConnectionStub();
   const cwd = mkdtempSync(join(tmpdir(), "glm-command-limits-background-deadline-"));
   const marker = join(cwd, "background-finished");
+  writeFileSync(
+    join(cwd, "background-fixture.cjs"),
+    'setTimeout(() => require("node:fs").writeFileSync("background-finished", "done"), 1100);\n',
+    "utf8"
+  );
   try {
     const result = await withEnv(
       {
@@ -213,7 +221,7 @@ test("a normal background shell exit survives a longer deadline", async () => {
           "tc1",
           "run_command",
           JSON.stringify({
-            command: `${shellQuote(process.execPath)} -e 'setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(marker)}, "done"), 1100)' & echo started`,
+            command: "node background-fixture.cjs & echo started",
           })
         )
     );
@@ -232,6 +240,20 @@ test("shell-exit cleanup prevents a deadline from killing inherited pipes", asyn
   const release = join(cwd, "release");
   const shellExited = join(cwd, "shell-exited");
   const marker = join(cwd, "background-finished");
+  writeFileSync(
+    join(cwd, "foreground-fixture.cjs"),
+    'const fs = require("node:fs");\n' +
+      'fs.writeFileSync("ready", "ready");\n' +
+      'const wait = setInterval(() => {\n' +
+      '  if (fs.existsSync("release")) { clearInterval(wait); process.exit(0); }\n' +
+      '}, 1);\n',
+    "utf8"
+  );
+  writeFileSync(
+    join(cwd, "background-race-fixture.cjs"),
+    'setTimeout(() => require("node:fs").writeFileSync("background-finished", "done"), 1500);\n',
+    "utf8"
+  );
   mock.timers.enable({ apis: ["setTimeout"] });
   try {
     const pending = withEnv(
@@ -244,7 +266,7 @@ test("shell-exit cleanup prevents a deadline from killing inherited pipes", asyn
           "tc1",
           "run_command",
           JSON.stringify({
-            command: `trap "echo shell-exited > shell-exited" EXIT; ${shellQuote(process.execPath)} -e 'const fs = require("node:fs"); fs.writeFileSync(${JSON.stringify(ready)}, "ready"); const wait = setInterval(() => { if (fs.existsSync(${JSON.stringify(release)})) { clearInterval(wait); process.exit(0); } }, 1)' ; ${shellQuote(process.execPath)} -e 'setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(marker)}, "done"), 1500)' & echo started`,
+            command: "trap \"echo shell-exited > shell-exited\" EXIT; node foreground-fixture.cjs; node background-race-fixture.cjs & echo started",
           })
         )
     );

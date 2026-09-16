@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeCredentials } from "../llm/credentials.js";
 import { ToolExecutor, isProcessGroupAlive } from "../tools/executor.js";
@@ -94,6 +94,17 @@ function escapeRegExp(value: string): string {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+// Git Bash translates native Windows paths embedded in `sh -c` command text.
+// Keep fixture files relative to the shell cwd there, while retaining absolute
+// paths on POSIX where no translation occurs.
+function shellNodeCommand(): string {
+  return process.platform === "win32" ? "node" : shellQuote(process.execPath);
+}
+
+function shellFixturePath(absolutePath: string, relativePath: string): string {
+  return JSON.stringify(process.platform === "win32" ? relativePath : absolutePath);
 }
 
 type FetchCall = {
@@ -274,7 +285,7 @@ test("list_files and run_command execute in the agent process without terminal c
     const ls = await exec.execute("tc1", "list_files", JSON.stringify({ path: "." }));
     assert.match(ls.content, /entry\.txt/);
     const rc = await exec.execute("tc2", "run_command", JSON.stringify({ command: "pwd" }));
-    assert.match(rc.content, new RegExp(escapeRegExp(dir)));
+    assert.match(rc.content, new RegExp(escapeRegExp(basename(dir))));
     assert.equal(conn.terminalCalls.length, 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -964,7 +975,7 @@ test("run_command runs through sh -c so quoting/pipes work", async () => {
   );
   assert.match(result.content, /Exit code: 0/);
   assert.match(result.content, /MIXED/);
-  assert.match(result.content, new RegExp(escapeRegExp(dir)));
+  assert.match(result.content, new RegExp(escapeRegExp(basename(dir))));
   assert.equal(conn.terminalCalls.length, 0);
   rmSync(dir, { recursive: true, force: true });
 });
@@ -1039,7 +1050,7 @@ test(
       dir
     );
     try {
-      const command = `${shellQuote(process.execPath)} -e 'const fs = require("node:fs"); process.on("SIGTERM", () => {}); fs.writeFileSync(${JSON.stringify(ready)}, "ready"); setTimeout(() => fs.writeFileSync(${JSON.stringify(marker)}, "late"), 1000)' ; echo shell-finished`;
+      const command = `${shellNodeCommand()} -e 'const fs = require("node:fs"); process.on("SIGTERM", () => {}); fs.writeFileSync(${shellFixturePath(ready, "ready")}, "ready"); setTimeout(() => fs.writeFileSync(${shellFixturePath(marker, "should-not-exist")}, "late"), 1000)' ; echo shell-finished`;
       const pending = exec.execute("tc1", "run_command", JSON.stringify({ command }));
       const deadline = Date.now() + 1_000;
       while (!existsSync(ready) && Date.now() < deadline) {
@@ -1071,7 +1082,10 @@ const connection = {
 const abortController = new AbortController();
 const exec = new ToolExecutor(connection, "s1", { fs: {} }, abortController.signal, null, null, cwd);
 const quote = (value) => "'" + value.replaceAll("'", "'\\\\''") + "'";
-const command = quote(process.execPath) + " -e 'const fs = require(\\"node:fs\\"); process.on(\\"SIGTERM\\", () => {}); fs.writeFileSync(" + JSON.stringify(ready) + ", \\"ready\\"); setTimeout(() => fs.writeFileSync(" + JSON.stringify(marker) + ", \\"late\\"), 700)' ; echo shell-finished";
+const shellNode = process.platform === "win32" ? "node" : quote(process.execPath);
+const shellReady = process.platform === "win32" ? "ready" : ready;
+const shellMarker = process.platform === "win32" ? "should-not-exist" : marker;
+const command = shellNode + " -e 'const fs = require(\\"node:fs\\"); process.on(\\"SIGTERM\\", () => {}); fs.writeFileSync(" + JSON.stringify(shellReady) + ", \\"ready\\"); setTimeout(() => fs.writeFileSync(" + JSON.stringify(shellMarker) + ", \\"late\\"), 700)' ; echo shell-finished";
 const pending = exec.execute("tc1", "run_command", JSON.stringify({ command }));
 const deadline = Date.now() + 1000;
 while (!existsSync(ready) && Date.now() < deadline) {
@@ -1117,7 +1131,7 @@ test(
     const conn = createConnectionStub();
     const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
     try {
-      const command = `${process.execPath} -e 'setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(marker)}, "done"), 250)' >/dev/null 2>&1 & echo started`;
+      const command = `${shellNodeCommand()} -e 'setTimeout(() => require("node:fs").writeFileSync(${shellFixturePath(marker, "background-finished")}, "done"), 250)' >/dev/null 2>&1 & echo started`;
       const result = await exec.execute("tc1", "run_command", JSON.stringify({ command }));
       assert.match(result.content, /Exit code: 0/);
       await new Promise((resolve) => setTimeout(resolve, 500));
