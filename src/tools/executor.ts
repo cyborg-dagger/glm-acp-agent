@@ -14,6 +14,10 @@ import {
 import type { SessionMcpTools } from "./session-mcp-client.js";
 import type { VisionMcpClient } from "./vision-mcp-client.js";
 import type { SessionModeId } from "../protocol/agent.js";
+import {
+  readCommandLimits,
+  type CommandLimits,
+} from "./command-limits.js";
 
 /**
  * Result returned after executing a tool call against the ACP client.
@@ -704,12 +708,28 @@ export class ToolExecutor {
     }
 
     try {
-      const { stdout, stderr, exitCode, signal } = await runShellCommand(
+      const limits = readCommandLimits();
+      const result = await runShellCommand(
         command,
         this.sessionCwd,
-        this.signal
+        this.signal,
+        limits
       );
-      const output = formatCommandOutput({ stdout, stderr, exitCode, signal });
+      const output = formatCommandOutput(result, limits);
+
+      if (result.timedOut) {
+        await this.connection.sessionUpdate({
+          sessionId: this.sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            status: "failed",
+            content: [{ type: "content", content: { type: "text", text: output } }],
+            rawOutput: elideForPreview(result),
+          },
+        });
+        return { content: output };
+      }
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -718,7 +738,7 @@ export class ToolExecutor {
           toolCallId,
           status: "completed",
           content: [{ type: "content", content: { type: "text", text: output } }],
-          rawOutput: elideForPreview({ stdout, stderr, exitCode, signal }),
+          rawOutput: elideForPreview(result),
         },
       });
 
@@ -1217,8 +1237,9 @@ function stringValue(value: unknown): string | undefined {
 function runShellCommand(
   command: string,
   cwd: string,
-  signal?: AbortSignal
-): Promise<{ stdout: string; stderr: string; exitCode: number | null; signal: NodeJS.Signals | null }> {
+  signal?: AbortSignal,
+  limits: CommandLimits = readCommandLimits()
+): Promise<ShellCommandResult> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(new Error("The operation was aborted"));
@@ -1239,40 +1260,76 @@ function runShellCommand(
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
+    let capturedBytes = 0;
+    let outputTruncated = false;
     let settled = false;
     let abortRequested = false;
+    let timedOut = false;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    let streamDestroyTimer: NodeJS.Timeout | undefined;
+
+    const capture = (target: Buffer[], chunk: Buffer | Uint8Array) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = limits.outputLimitBytes - capturedBytes;
+      if (remaining <= 0) {
+        if (buffer.length > 0) outputTruncated = true;
+        return;
+      }
+      const bytes = Math.min(remaining, buffer.length);
+      if (bytes > 0) {
+        // Copy the retained prefix. A subarray would keep the entire incoming
+        // chunk alive, allowing one noisy write to bypass the memory bound.
+        target.push(Buffer.from(buffer.subarray(0, bytes)));
+        capturedBytes += bytes;
+      }
+      if (bytes < buffer.length) outputTruncated = true;
+    };
+
+    const terminateAndEscalate = () => {
+      terminateProcessTree(child);
+      // A process can ignore SIGTERM. Escalate after a short grace period so
+      // an aborted or timed-out tool cannot keep the prompt turn alive. The
+      // guard keeps the SIGKILL from ever landing on a process group the OS
+      // has recycled for unrelated work.
+      if (!forceKillTimer) {
+        forceKillTimer = setTimeout(() => {
+          forceKillTimer = undefined;
+          if (!isProcessGroupAlive(child.pid)) return;
+          terminateProcessTree(child, true);
+        }, 250);
+      }
+    };
 
     const onAbort = () => {
       if (settled) return;
       abortRequested = true;
-      terminateProcessTree(child);
-      // A process can ignore SIGTERM. Escalate after a short grace period so
-      // an aborted tool cannot keep the prompt turn alive indefinitely. The
-      // guard below keeps the SIGKILL from ever landing on a process group
-      // the OS has recycled for unrelated work.
-      forceKillTimer = setTimeout(() => {
-        if (!isProcessGroupAlive(child.pid)) return;
-        terminateProcessTree(child, true);
-      }, 250);
+      terminateAndEscalate();
+    };
+    const onTimeout = () => {
+      if (settled) return;
+      timedOut = true;
+      terminateAndEscalate();
     };
     const cleanup = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (streamDestroyTimer) clearTimeout(streamDestroyTimer);
       if (forceKillTimer) {
         // Keep escalation armed only while the detached group may still hold
         // SIGTERM-resistant descendants; once the group is gone the delayed
         // SIGKILL must never fire (stale process-group ID).
-        if (!abortRequested || !isProcessGroupAlive(child.pid)) {
+        if ((!abortRequested && !timedOut) || !isProcessGroupAlive(child.pid)) {
           clearTimeout(forceKillTimer);
         }
       }
       signal?.removeEventListener("abort", onAbort);
     };
 
+    const timeoutTimer = setTimeout(onTimeout, limits.timeoutMs);
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) onAbort();
 
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.stdout.on("data", (chunk: Buffer) => capture(stdout, chunk));
+    child.stderr.on("data", (chunk: Buffer) => capture(stderr, chunk));
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
@@ -1280,11 +1337,15 @@ function runShellCommand(
       reject(err);
     });
     child.on("exit", () => {
+      // The shell is the command's foreground process. Once it exits normally,
+      // only inherited pipes from intentionally backgrounded work may remain;
+      // do not let the deadline kill that work during the short drain grace.
+      clearTimeout(timeoutTimer);
       // The shell exited. Normal commands will close their streams immediately,
       // firing "close" within milliseconds. For daemons that inherit stdio and
       // keep pipes open, forcefully destroy the streams after a brief grace
       // period so "close" fires and the Promise can resolve.
-      setTimeout(() => {
+      streamDestroyTimer = setTimeout(() => {
         if (!settled) {
           child.stdout.destroy();
           child.stderr.destroy();
@@ -1296,10 +1357,12 @@ function runShellCommand(
       settled = true;
       cleanup();
       resolve({
-        stdout: Buffer.concat(stdout).toString("utf8"),
-        stderr: Buffer.concat(stderr).toString("utf8"),
+        stdout: decodeCapturedOutput(stdout),
+        stderr: decodeCapturedOutput(stderr),
         exitCode,
         signal: closeSignal,
+        outputTruncated,
+        timedOut,
       });
     });
   });
@@ -1320,6 +1383,15 @@ export function isProcessGroupAlive(pid: number | undefined): boolean {
     // by another user — still alive, so leave escalation armed.
     return (err as NodeJS.ErrnoException).code !== "ESRCH";
   }
+}
+
+interface ShellCommandResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  outputTruncated: boolean;
+  timedOut: boolean;
 }
 
 function terminateProcessTree(child: ReturnType<typeof spawn>, force = false): void {
@@ -1361,12 +1433,79 @@ function formatCommandOutput(result: {
   stderr: string;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
-}): string {
+  outputTruncated?: boolean;
+  timedOut?: boolean;
+}, limits?: CommandLimits): string {
   const lines = [`Exit code: ${result.exitCode ?? "unknown"}`];
   if (result.signal) lines.push(`Signal: ${result.signal}`);
+  if (result.timedOut && limits) lines.push(`Command timed out after ${limits.timeoutMs} ms.`);
+  if (result.outputTruncated && limits) {
+    lines.push(`Output truncated: command output exceeded ${limits.outputLimitBytes} bytes.`);
+  }
   lines.push("", "STDOUT:", result.stdout.length > 0 ? result.stdout : "(empty)");
   lines.push("", "STDERR:", result.stderr.length > 0 ? result.stderr : "(empty)");
   return lines.join("\n");
+}
+
+/**
+ * Decode captured bytes without allowing malformed or partial UTF-8 to turn
+ * into a replacement character that is larger than the bytes we retained.
+ * Invalid bytes are discarded; valid UTF-8 sequences are copied unchanged.
+ */
+function decodeCapturedOutput(chunks: Buffer[]): string {
+  const bytes = Buffer.concat(chunks);
+  const valid: number[] = [];
+  let index = 0;
+  while (index < bytes.length) {
+    const first = bytes[index]!;
+    let length = 0;
+    if (first <= 0x7f) {
+      length = 1;
+    } else if (first >= 0xc2 && first <= 0xdf) {
+      length = validUtf8Continuation(bytes, index, 2) ? 2 : 0;
+    } else if (first === 0xe0) {
+      length = validUtf8Continuation(bytes, index, 3, 0xa0) ? 3 : 0;
+    } else if (first >= 0xe1 && first <= 0xec) {
+      length = validUtf8Continuation(bytes, index, 3) ? 3 : 0;
+    } else if (first === 0xed) {
+      length = validUtf8Continuation(bytes, index, 3, undefined, 0x9f) ? 3 : 0;
+    } else if (first >= 0xee && first <= 0xef) {
+      length = validUtf8Continuation(bytes, index, 3) ? 3 : 0;
+    } else if (first === 0xf0) {
+      length = validUtf8Continuation(bytes, index, 4, 0x90) ? 4 : 0;
+    } else if (first >= 0xf1 && first <= 0xf3) {
+      length = validUtf8Continuation(bytes, index, 4) ? 4 : 0;
+    } else if (first === 0xf4) {
+      length = validUtf8Continuation(bytes, index, 4, undefined, 0x8f) ? 4 : 0;
+    }
+
+    if (length > 0) {
+      for (let offset = 0; offset < length; offset++) valid.push(bytes[index + offset]!);
+      index += length;
+    } else {
+      index++;
+    }
+  }
+  return Buffer.from(valid).toString("utf8");
+}
+
+function validUtf8Continuation(
+  bytes: Buffer,
+  start: number,
+  length: number,
+  minimumSecond?: number,
+  maximumSecond?: number
+): boolean {
+  if (start + length > bytes.length) return false;
+  const second = bytes[start + 1]!;
+  if (minimumSecond !== undefined && second < minimumSecond) return false;
+  if (maximumSecond !== undefined && second > maximumSecond) return false;
+  if (second < 0x80 || second > 0xbf) return false;
+  for (let offset = 2; offset < length; offset++) {
+    const value = bytes[start + offset]!;
+    if (value < 0x80 || value > 0xbf) return false;
+  }
+  return true;
 }
 
 function unwrapVisionText(mcpResult: unknown): string {

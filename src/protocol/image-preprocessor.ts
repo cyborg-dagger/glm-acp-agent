@@ -12,6 +12,15 @@ export interface PreprocessedPrompt {
   cleanups: Array<() => Promise<void>>;
 }
 
+/** File operations are injectable so preparation failures can be exercised without filesystem races. */
+export interface ImagePreprocessorFileOps {
+  mkdtemp: (prefix: string) => Promise<string>;
+  writeFile: (path: string, data: Uint8Array) => Promise<void>;
+  rm: (path: string, options: { recursive: boolean; force: boolean }) => Promise<void>;
+}
+
+const defaultFileOps: ImagePreprocessorFileOps = { mkdtemp, writeFile, rm };
+
 /**
  * Replace every ACP image block with a text annotation containing the result
  * of a Vision MCP `image_analysis` call. ACP image blocks may carry a usable
@@ -25,7 +34,8 @@ export interface PreprocessedPrompt {
 export async function preprocessImageBlocks(
   blocks: ReadonlyArray<Block>,
   visionClient: VisionMcpClient | null,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  fileOps: ImagePreprocessorFileOps = defaultFileOps
 ): Promise<PreprocessedPrompt> {
   if (!blocks.some((b) => b.type === "image")) {
     return { blocks: [...blocks], cleanups: [] };
@@ -35,49 +45,117 @@ export async function preprocessImageBlocks(
   const cleanups: Array<() => Promise<void>> = [];
   let imageIndex = 0;
 
-  for (const block of blocks) {
-    if (block.type !== "image") {
-      out.push(block);
-      continue;
-    }
-    imageIndex += 1;
+  try {
+    for (const block of blocks) {
+      if (block.type !== "image") {
+        out.push(block);
+        continue;
+      }
+      imageIndex += 1;
 
-    if (!visionClient) {
-      out.push(textBlock(`<image_attached index="${imageIndex}" mime="${block.mimeType}">image attached (not analyzed; Vision MCP unavailable)</image_attached>`));
-      continue;
-    }
+      throwIfAborted(signal);
 
-    let imageSource: string;
-    if (typeof block.data === "string" && block.data.length > 0) {
-      const dir = await mkdtemp(pathJoin(tmpdir(), "glm-acp-image-"));
-      const ext = guessExtension(block.mimeType);
-      const path = pathJoin(dir, `image-${imageIndex}${ext}`);
-      await writeFile(path, Buffer.from(block.data, "base64"));
-      imageSource = path;
-      cleanups.push(async () => {
-        try { await rm(dir, { recursive: true, force: true }); } catch { /* best effort */ }
-      });
-    } else if (typeof block.uri === "string" && block.uri.length > 0) {
-      imageSource = block.uri;
-    } else {
-      out.push(textBlock(`<image_analysis_error index="${imageIndex}">image block has neither a uri nor base64 data</image_analysis_error>`));
-      continue;
-    }
+      if (!visionClient) {
+        out.push(textBlock(`<image_attached index="${imageIndex}" mime="${block.mimeType}">image attached (not analyzed; Vision MCP unavailable)</image_attached>`));
+        continue;
+      }
 
-    try {
-      const result = await visionClient.callTool("image_analysis", {
-        image_source: imageSource,
-        prompt: "Describe this image in detail, including any text, code, UI elements, or other visible content.",
-      }, signal);
-      const text = extractText(result);
-      out.push(textBlock(`<image_analysis index="${imageIndex}">\n${text}\n</image_analysis>`));
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      out.push(textBlock(`<image_analysis_error index="${imageIndex}">${message}</image_analysis_error>`));
+      let imageSource: string;
+      if (typeof block.data === "string" && block.data.length > 0) {
+        const dir = await fileOps.mkdtemp(pathJoin(tmpdir(), "glm-acp-image-"));
+        // Register cleanup as soon as the directory exists. A write failure
+        // must not strand the directory before the caller receives a result.
+        cleanups.push(async () => {
+          try { await fileOps.rm(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+        });
+        throwIfAborted(signal);
+        const ext = guessExtension(block.mimeType);
+        const path = pathJoin(dir, `image-${imageIndex}${ext}`);
+        await fileOps.writeFile(path, Buffer.from(block.data, "base64"));
+        throwIfAborted(signal);
+        imageSource = path;
+      } else if (typeof block.uri === "string" && block.uri.length > 0) {
+        imageSource = block.uri;
+      } else {
+        out.push(textBlock(`<image_analysis_error index="${imageIndex}">image block has neither a uri nor base64 data</image_analysis_error>`));
+        continue;
+      }
+
+      try {
+        throwIfAborted(signal);
+        const visionOperation = Promise.resolve().then(() => {
+          // Cancellation can happen between the synchronous check above and
+          // this queued callback, especially for URI images with no fs await.
+          throwIfAborted(signal);
+          return visionClient.callTool("image_analysis", {
+            image_source: imageSource,
+            prompt: "Describe this image in detail, including any text, code, UI elements, or other visible content.",
+          }, signal);
+        });
+        const result = await waitForAbort(
+          visionOperation,
+          signal,
+        );
+        const text = extractText(result);
+        out.push(textBlock(`<image_analysis index="${imageIndex}">\n${text}\n</image_analysis>`));
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        const message = err instanceof Error ? err.message : String(err);
+        out.push(textBlock(`<image_analysis_error index="${imageIndex}">${message}</image_analysis_error>`));
+      }
     }
+  } catch (err) {
+    // The caller cannot receive our cleanup callbacks when preprocessing
+    // rejects, so perform them here before propagating the original error.
+    await runCleanups(cleanups);
+    throw err;
   }
 
   return { blocks: out, cleanups };
+}
+
+/** Resolve promptly on cancellation while still observing a late operation rejection. */
+function waitForAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return operation;
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error("Vision MCP call cancelled"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      },
+    );
+    // Attach the operation handlers before observing an already-aborted
+    // signal. The operation may already be scheduled and must still have its
+    // late rejection consumed even when cancellation wins immediately.
+    if (signal.aborted) onAbort();
+  });
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error("Vision MCP call cancelled");
+}
+
+async function runCleanups(cleanups: Array<() => Promise<void>>): Promise<void> {
+  for (const cleanup of cleanups.splice(0)) {
+    try { await cleanup(); } catch { /* best effort */ }
+  }
 }
 
 /**

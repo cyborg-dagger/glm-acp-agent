@@ -9,6 +9,8 @@ import { join as pathJoin } from "node:path";
 // leak into every assertion below.
 const fakeHome = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-test-home-"));
 process.env["HOME"] = fakeHome;
+// os.homedir() uses USERPROFILE on Windows, where HOME is not authoritative.
+process.env["USERPROFILE"] = fakeHome;
 
 const { discoverSlashCommands, parseSlashCommand, renderSlashCommand } =
   await import("../protocol/slash-commands.js");

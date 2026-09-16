@@ -11,6 +11,8 @@
  *                       falls back to the credentials file written by --setup.
  *   ACP_GLM_MODEL     - (optional) Override the default model (default: glm-5.3)
  *   ACP_GLM_MAX_TURNS - (optional) Max model/tool turns per prompt (default: 100)
+ *   ACP_GLM_COMMAND_TIMEOUT_MS - (optional) run_command deadline in milliseconds (default: 120000)
+ *   ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES - (optional) combined run_command stdout/stderr capture limit (default: 65536)
  */
 import { startConnection } from "./protocol/connection.js";
 import { parseMaxTurnsFlag } from "./cli-args.js";
@@ -41,6 +43,8 @@ if (args.includes("--setup")) {
       "  Z_AI_API_KEY                   API key (overrides the stored credentials)",
       "  ACP_GLM_MODEL                  Default model id (e.g. glm-5.3)",
       "  ACP_GLM_MAX_TURNS              Max model/tool turns per prompt (default 100)",
+      "  ACP_GLM_COMMAND_TIMEOUT_MS     run_command deadline in milliseconds (default 120000)",
+      "  ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES  Combined run_command stdout/stderr limit in bytes (default 65536)",
       "  ACP_GLM_AVAILABLE_MODELS       Comma-separated list of advertised models",
       "  ACP_GLM_BASE_URL               Override the Z.AI API base URL",
       "  ACP_GLM_MAX_TOKENS             Per-call max output tokens (default 32768)",

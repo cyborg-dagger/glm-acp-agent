@@ -146,6 +146,12 @@ interface SessionState {
    * to observe its abort before mutating shared session state.
    */
   promptPromise: Promise<void> | null;
+  /** True while closeSession is waiting for the active prompt to unwind. */
+  closing: boolean;
+  /** True after closeSession has disposed and removed this session. */
+  closed: boolean;
+  /** De-duplicates concurrent closeSession calls. */
+  closePromise: Promise<void> | null;
   title: string | null;
   updatedAt: string;
   /** Active model for this session (clients can change via `session/set_model`). */
@@ -400,6 +406,9 @@ export class GlmAcpAgent implements Agent {
       messages: [systemPrompt],
       abortController: null,
       promptPromise: null,
+      closing: false,
+      closed: false,
+      closePromise: null,
       title: null,
       updatedAt: new Date().toISOString(),
       model,
@@ -721,28 +730,23 @@ export class GlmAcpAgent implements Agent {
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const session = this.sessions.get(params.sessionId);
-    if (!session) {
+    if (!session || session.closing || session.closed) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
 
-    // The ACP spec serializes prompts per-session – the client should not send
-    // a new prompt while another is running. Defensively cancel any stale
-    // controller and wait for the previous loop to fully unwind so it stops
-    // mutating session.messages or emitting updates before we start the new
-    // one.
-    if (session.abortController) {
-      session.abortController.abort();
-    }
-    if (session.promptPromise) {
-      try {
-        await session.promptPromise;
-      } catch {
-        // The previous loop's failure is already reported back to its caller.
-      }
-    }
-
+    // Reserve this lifecycle synchronously, before preprocessing can await.
+    // Every queued prompt gets a distinct promise and chains behind the prompt
+    // that was current when it arrived; otherwise several callers can all
+    // resume from one old promise and enter the model concurrently.
+    const predecessor = session.promptPromise;
+    session.abortController?.abort();
     const abortController = new AbortController();
     session.abortController = abortController;
+    let resolvePromptPromise!: () => void;
+    const promptPromise = new Promise<void>((resolve) => {
+      resolvePromptPromise = resolve;
+    });
+    session.promptPromise = promptPromise;
 
     // Abort the prompt automatically if the underlying connection closes.
     const onConnectionClose = () => abortController.abort();
@@ -753,59 +757,76 @@ export class GlmAcpAgent implements Agent {
       abortController.abort();
     }
 
-    // Convert ACP content blocks into a GLM user message. Most models receive
-    // plain text, with images preprocessed through Vision MCP. Native vision
-    // models receive OpenAI-style multimodal content parts directly.
-    if (isDebugEnabled()) {
-      for (const line of buildPromptBlockDiagnosticLines(params.prompt)) {
-        debug(line);
-      }
-    }
-    // Clients invoke an advertised command by sending `/name …` as ordinary
-    // prompt text, so expand it here into the instructions its definition
-    // holds. Unknown `/foo` is left alone and reaches the model as prose.
-    const promptBlocks = expandPromptCommand(params.prompt, session.commands);
-    const visionNative = isVisionNativeModel(session.model);
-    const preprocessed = visionNative
-      ? { blocks: promptBlocks, cleanups: [] }
-      : await preprocessImageBlocks(
-          promptBlocks,
-          this.visionClient,
-          abortController.signal
-        );
-    const userContent = visionNative
-      ? renderVisionNativePromptBlocks(preprocessed.blocks)
-      : renderPromptBlocks(preprocessed.blocks).content;
-    const userMessage: GlmMessage = { role: "user", content: userContent };
-    session.messages.push(userMessage);
-
-    // What the user typed, rendered from the blocks as they arrived — before
-    // command expansion and image analysis rewrote them for the model. Kept
-    // separately so `session/load` replays the conversation the user had (and
-    // the title names it), not the one the model saw. Persisted only when the
-    // two actually diverge.
-    const displayText = renderPromptBlocks(params.prompt).plainText;
-    if (displayText !== stringifyUserMessage(userContent)) {
-      session.displayText.set(userMessage, displayText);
-    }
-
     // Echo back the client-supplied messageId on every response (success,
     // cancelled, or error) so the client can correlate the turn.
     const userMessageId = params.messageId ?? undefined;
 
-    let resolvePromptPromise!: () => void;
-    session.promptPromise = new Promise<void>((resolve) => {
-      resolvePromptPromise = resolve;
-    });
+    let preprocessed: { blocks: PromptRequest["prompt"]; cleanups: Array<() => Promise<void>> } | undefined;
+    const cancelledResponse = (): PromptResponse => {
+      const cancelled: PromptResponse = { stopReason: "cancelled" };
+      if (userMessageId) cancelled.userMessageId = userMessageId;
+      return cancelled;
+    };
 
     try {
+      if (predecessor) {
+        try {
+          await predecessor;
+        } catch {
+          // A previous loop's failure is already reported to its caller.
+        }
+      }
+      if (abortController.signal.aborted || session.closing || session.closed) {
+        return cancelledResponse();
+      }
+
+      // Convert ACP content blocks into a GLM user message. Most models receive
+      // plain text, with images preprocessed through Vision MCP. Native vision
+      // models receive OpenAI-style multimodal content parts directly.
+      if (isDebugEnabled()) {
+        for (const line of buildPromptBlockDiagnosticLines(params.prompt)) {
+          debug(line);
+        }
+      }
+      // Clients invoke an advertised command by sending `/name …` as ordinary
+      // prompt text, so expand it here into the instructions its definition
+      // holds. Unknown `/foo` is left alone and reaches the model as prose.
+      const promptBlocks = expandPromptCommand(params.prompt, session.commands);
+      const visionNative = isVisionNativeModel(session.model);
+      preprocessed = visionNative
+        ? { blocks: promptBlocks, cleanups: [] }
+        : await preprocessImageBlocks(
+            promptBlocks,
+            this.visionClient,
+            abortController.signal
+          );
+      if (abortController.signal.aborted || session.closing || session.closed) {
+        return cancelledResponse();
+      }
+      const userContent = visionNative
+        ? renderVisionNativePromptBlocks(preprocessed.blocks)
+        : renderPromptBlocks(preprocessed.blocks).content;
+      const userMessage: GlmMessage = { role: "user", content: userContent };
+      session.messages.push(userMessage);
+
+      // What the user typed, rendered from the blocks as they arrived — before
+      // command expansion and image analysis rewrote them for the model. Kept
+      // separately so `session/load` replays the conversation the user had.
+      const displayText = renderPromptBlocks(params.prompt).plainText;
+      if (displayText !== stringifyUserMessage(userContent)) {
+        session.displayText.set(userMessage, displayText);
+      }
+
       const { stopReason, usage } = await this.runPromptLoop(
         params.sessionId,
         session,
         abortController.signal
       );
 
-      session.abortController = null;
+      if (session.closing || session.closed) {
+        return cancelledResponse();
+      }
+      if (session.abortController === abortController) session.abortController = null;
       session.updatedAt = new Date().toISOString();
 
       // Emit a session_info_update with the (possibly first-set) title and
@@ -841,13 +862,9 @@ export class GlmAcpAgent implements Agent {
       error(`prompt error: session=${params.sessionId}`, err instanceof Error ? err.message : String(err));
       // If the abort happened concurrently with another error, prefer the
       // cancelled stop reason – that's what the spec asks for.
-      if (abortController.signal.aborted) {
-        session.abortController = null;
-        const cancelled: PromptResponse = { stopReason: "cancelled" };
-        if (userMessageId) cancelled.userMessageId = userMessageId;
-        return cancelled;
+      if (abortController.signal.aborted || session.closing || session.closed) {
+        return cancelledResponse();
       }
-      session.abortController = null;
       // Surface the error to the user as an agent message so the IDE displays
       // something instead of a silent JSON-RPC error.
       const message = err instanceof Error ? err.message : String(err);
@@ -861,12 +878,14 @@ export class GlmAcpAgent implements Agent {
       throw err;
     } finally {
       connSignal?.removeEventListener("abort", onConnectionClose);
-      // Always resolve the promptPromise so a subsequent prompt can proceed.
-      session.promptPromise = null;
-      resolvePromptPromise();
       for (const cleanup of preprocessed?.cleanups ?? []) {
         try { await cleanup(); } catch { /* best effort */ }
       }
+      // A newer queued prompt may own these fields already. Only the owner
+      // may clear them, and resolution follows all preprocessing/cleanup.
+      if (session.abortController === abortController) session.abortController = null;
+      if (session.promptPromise === promptPromise) session.promptPromise = null;
+      resolvePromptPromise();
     }
   }
 
@@ -877,17 +896,30 @@ export class GlmAcpAgent implements Agent {
 
   async closeSession(params: CloseSessionRequest): Promise<void> {
     const session = this.sessions.get(params.sessionId);
-    session?.abortController?.abort();
-    if (session) {
+    if (!session) return;
+    if (session.closePromise) return session.closePromise;
+
+    session.closing = true;
+    session.abortController?.abort();
+    const closePromise = (async () => {
+      // Wait for the whole lifecycle, including preprocessing and temporary
+      // file cleanup, before persisting or disposing anything it may use.
+      const active = session.promptPromise;
+      if (active) {
+        try { await active; } catch { /* lifecycle promises resolve in finally */ }
+      }
+      session.closed = true;
       // Persist final state on close so a subsequent loadSession/resume can
       // pick the conversation back up. closeSession only releases in-memory
       // resources; the on-disk record is intentionally retained.
       this.persistSession(params.sessionId, session);
       await session.mcpTools?.dispose();
-    }
-    this.sessions.delete(params.sessionId);
-    // Session is gone from memory; its task list must not linger in the map.
-    this.sessionTodos.delete(params.sessionId);
+      this.sessions.delete(params.sessionId);
+      // Session is gone from memory; its task list must not linger in the map.
+      this.sessionTodos.delete(params.sessionId);
+    })();
+    session.closePromise = closePromise;
+    return closePromise;
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -948,14 +980,22 @@ export class GlmAcpAgent implements Agent {
     const mcpTools = await connectSessionMcpServers(params.mcpServers);
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
     await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
+    const restoredMessages = rebuildRestoredMessages(
+      persisted.messages,
+      params.cwd,
+      toolDefinitions
+    );
 
     // Restore in-memory state. We do NOT carry over the abortController /
     // promptPromise — those are transient.
     const restored: SessionState = {
       cwd: params.cwd,
-      messages: persisted.messages,
+      messages: restoredMessages,
       abortController: null,
       promptPromise: null,
+      closing: false,
+      closed: false,
+      closePromise: null,
       title: persisted.title,
       updatedAt: persisted.updatedAt,
       model: persisted.model,
@@ -964,7 +1004,11 @@ export class GlmAcpAgent implements Agent {
       mode: persisted.mode,
       thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
       commands: discoverSlashCommands(params.cwd),
-      displayText: deserializeDisplayText(persisted.messages, persisted.displayText),
+      displayText: deserializeRestoredDisplayText(
+        persisted.messages,
+        restoredMessages,
+        persisted.displayText
+      ),
     };
     this.sessions.set(params.sessionId, restored);
 
@@ -973,7 +1017,7 @@ export class GlmAcpAgent implements Agent {
     // doesn't render them on its own.
     await this.replayMessages(
       params.sessionId,
-      persisted.messages,
+      restoredMessages,
       restored.displayText
     );
 
@@ -1003,13 +1047,20 @@ export class GlmAcpAgent implements Agent {
     const newSessionId = randomUUID();
     const forkedTitle =
       persisted.title === null ? null : `${persisted.title} (fork)`;
-    const forkedMessages = structuredClone(persisted.messages);
+    const forkedMessages = rebuildRestoredMessages(
+      structuredClone(persisted.messages),
+      params.cwd,
+      toolDefinitions
+    );
     const forked: SessionState = {
       cwd: params.cwd,
       // Deep-clone messages so the fork doesn't share state with the parent.
       messages: forkedMessages,
       abortController: null,
       promptPromise: null,
+      closing: false,
+      closed: false,
+      closePromise: null,
       title: forkedTitle,
       updatedAt: new Date().toISOString(),
       model: persisted.model,
@@ -1020,7 +1071,11 @@ export class GlmAcpAgent implements Agent {
       commands: discoverSlashCommands(params.cwd),
       // Re-key onto the cloned messages: the parent's map is keyed by the
       // originals, which the fork no longer holds.
-      displayText: deserializeDisplayText(forkedMessages, persisted.displayText),
+      displayText: deserializeRestoredDisplayText(
+        persisted.messages,
+        forkedMessages,
+        persisted.displayText
+      ),
     };
     this.sessions.set(newSessionId, forked);
     this.persistSession(newSessionId, forked);
@@ -1048,12 +1103,20 @@ export class GlmAcpAgent implements Agent {
     const mcpTools = await connectSessionMcpServers(params.mcpServers ?? []);
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
     await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
+    const restoredMessages = rebuildRestoredMessages(
+      persisted.messages,
+      params.cwd,
+      toolDefinitions
+    );
 
     const restored: SessionState = {
       cwd: params.cwd,
-      messages: persisted.messages,
+      messages: restoredMessages,
       abortController: null,
       promptPromise: null,
+      closing: false,
+      closed: false,
+      closePromise: null,
       title: persisted.title,
       updatedAt: persisted.updatedAt,
       model: persisted.model,
@@ -1062,7 +1125,11 @@ export class GlmAcpAgent implements Agent {
       mode: persisted.mode,
       thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
       commands: discoverSlashCommands(params.cwd),
-      displayText: deserializeDisplayText(persisted.messages, persisted.displayText),
+      displayText: deserializeRestoredDisplayText(
+        persisted.messages,
+        restoredMessages,
+        persisted.displayText
+      ),
     };
     this.sessions.set(params.sessionId, restored);
 
@@ -1445,6 +1512,30 @@ export class GlmAcpAgent implements Agent {
 }
 
 /**
+ * Rebuild the leading system prompt for a session entering a new process or
+ * working directory while retaining the conversation messages that follow it.
+ * The returned array is always new so a fork can refresh its prompt without
+ * changing the source session's message history.
+ */
+function rebuildRestoredMessages(
+  messages: GlmMessage[],
+  cwd: string,
+  toolDefinitions: ReadonlyArray<ToolDefinition>
+): GlmMessage[] {
+  const systemPrompt: GlmMessage = {
+    role: "system",
+    content: buildSystemPrompt({
+      cwd,
+      tools: toolDefinitions.map((tool) => tool.function.name),
+      agentsMd: loadProjectContext(cwd),
+    }),
+  };
+  return messages[0]?.role === "system"
+    ? [systemPrompt, ...messages.slice(1)]
+    : [systemPrompt, ...messages];
+}
+
+/**
  * Render a list of ACP content blocks (after image preprocessing) into the
  * plain-string user message we send to the chat-completions endpoint.
  *
@@ -1613,6 +1704,22 @@ function deserializeDisplayText(
     if (message) out.set(message, text);
   }
   return out;
+}
+
+/** Re-key display text when restoring a record that needed a new system message prepended. */
+function deserializeRestoredDisplayText(
+  sourceMessages: ReadonlyArray<GlmMessage>,
+  restoredMessages: ReadonlyArray<GlmMessage>,
+  persisted: Record<string, string> | undefined
+): SessionState["displayText"] {
+  const offset = restoredMessages.length - sourceMessages.length;
+  if (!persisted || offset === 0) {
+    return deserializeDisplayText(restoredMessages, persisted);
+  }
+  const shifted = Object.fromEntries(
+    Object.entries(persisted).map(([index, text]) => [String(Number(index) + offset), text])
+  );
+  return deserializeDisplayText(restoredMessages, shifted);
 }
 
 /** Flatten the `content` of a user message into a plain string for replay. */
