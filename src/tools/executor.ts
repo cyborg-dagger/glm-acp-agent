@@ -1235,11 +1235,23 @@ function runShellCommand(
       abortRequested = true;
       terminateProcessTree(child);
       // A process can ignore SIGTERM. Escalate after a short grace period so
-      // an aborted tool cannot keep the prompt turn alive indefinitely.
-      forceKillTimer = setTimeout(() => terminateProcessTree(child, true), 250);
+      // an aborted tool cannot keep the prompt turn alive indefinitely. The
+      // guard below keeps the SIGKILL from ever landing on a process group
+      // the OS has recycled for unrelated work.
+      forceKillTimer = setTimeout(() => {
+        if (!isProcessGroupAlive(child.pid)) return;
+        terminateProcessTree(child, true);
+      }, 250);
     };
     const cleanup = () => {
-      if (forceKillTimer && !abortRequested) clearTimeout(forceKillTimer);
+      if (forceKillTimer) {
+        // Keep escalation armed only while the detached group may still hold
+        // SIGTERM-resistant descendants; once the group is gone the delayed
+        // SIGKILL must never fire (stale process-group ID).
+        if (!abortRequested || !isProcessGroupAlive(child.pid)) {
+          clearTimeout(forceKillTimer);
+        }
+      }
       signal?.removeEventListener("abort", onAbort);
     };
 
@@ -1278,6 +1290,23 @@ function runShellCommand(
       });
     });
   });
+}
+
+export function isProcessGroupAlive(pid: number | undefined): boolean {
+  if (!pid) return false;
+  if (process.platform === "win32") {
+    // No POSIX process groups here: keep the previous behavior of leaving the
+    // escalation timer armed (taskkill on a dead pid fails harmlessly).
+    return true;
+  }
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    // ESRCH: the process group no longer exists. EPERM: it exists but is owned
+    // by another user — still alive, so leave escalation armed.
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
 }
 
 function terminateProcessTree(child: ReturnType<typeof spawn>, force = false): void {

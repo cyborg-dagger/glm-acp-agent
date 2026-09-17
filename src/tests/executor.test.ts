@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeCredentials } from "../llm/credentials.js";
-import { ToolExecutor } from "../tools/executor.js";
+import { ToolExecutor, isProcessGroupAlive } from "../tools/executor.js";
 import type { VisionMcpClient } from "../tools/vision-mcp-client.js";
 
 interface StubTerminal {
@@ -1125,6 +1125,32 @@ test(
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+);
+
+test(
+  "isProcessGroupAlive reports live groups as alive and exited groups as gone",
+  { timeout: 5_000 },
+  async () => {
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 800)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    const exited = new Promise<void>((resolve) => child.on("exit", () => resolve()));
+    assert.ok(child.pid, "detached child never started");
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(isProcessGroupAlive(child.pid), true, "live group reported dead");
+    } finally {
+      try {
+        process.kill(-child.pid!, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+    await exited;
+    assert.equal(isProcessGroupAlive(child.pid), false, "exited group reported alive");
+    assert.equal(isProcessGroupAlive(undefined), false, "missing pid reported alive");
   }
 );
 
