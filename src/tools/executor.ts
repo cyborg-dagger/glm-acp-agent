@@ -338,6 +338,10 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Write cancelled by user." };
     }
+    if (permissionResult.type === "aborted") {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Write cancelled by turn." };
+    }
     if (permissionResult.type === "reject") {
       await this.markFailed(toolCallId, "Rejected by user.");
       return { content: "Write rejected by user." };
@@ -489,6 +493,10 @@ export class ToolExecutor {
     if (permissionResult.type === "cancelled") {
       await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Edit cancelled by user." };
+    }
+    if (permissionResult.type === "aborted") {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Edit cancelled by turn." };
     }
     if (permissionResult.type === "reject") {
       await this.markFailed(toolCallId, "Rejected by user.");
@@ -664,6 +672,10 @@ export class ToolExecutor {
     if (permissionResult.type === "cancelled") {
       await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Command cancelled by user." };
+    }
+    if (permissionResult.type === "aborted") {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Command cancelled by turn." };
     }
     if (permissionResult.type === "reject") {
       await this.markFailed(toolCallId, "Rejected by user.");
@@ -963,12 +975,13 @@ export class ToolExecutor {
     | { type: "allow" }
     | { type: "reject" }
     | { type: "cancelled" }
+    | { type: "aborted" }
     | { type: "error"; message: string }
   > {
     const mode = this.getMode();
 
     if (this.signal?.aborted) {
-      return { type: "cancelled" };
+      return { type: "aborted" };
     }
 
     // bypass_permissions: allow everything without prompting
@@ -1018,7 +1031,7 @@ export class ToolExecutor {
           abortPromise.then(() => ({ kind: "aborted" as const })),
         ]);
         if (outcome.kind === "aborted") {
-          return { type: "cancelled" };
+          return { type: "aborted" };
         }
         return this.permissionOutcome(outcome.response);
       } finally {

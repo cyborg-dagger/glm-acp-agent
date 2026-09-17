@@ -583,7 +583,7 @@ test("write_file does not mutate after the turn aborts while permission is pendi
     abortController.abort();
     resolvePermission();
     const result = await pending;
-    assert.match(result.content, /cancelled/i);
+    assert.match(result.content, /cancelled by turn/i);
     assert.equal(writeCalls, 0);
     assert.equal(existsSync(path), false);
   } finally {
@@ -627,7 +627,7 @@ test("edit_file does not mutate after the turn aborts while permission is pendin
     abortController.abort();
     resolvePermission();
     const result = await pending;
-    assert.match(result.content, /cancelled/i);
+    assert.match(result.content, /cancelled by turn/i);
     assert.equal(writeCalls, 0);
     assert.equal(readFileSync(path, "utf8"), "before");
   } finally {
@@ -1250,6 +1250,34 @@ test("run_command cancelled by user marks call failed and skips execution", asyn
     JSON.stringify({ command: "printf should-not-run" })
   );
   assert.match(result.content, /cancelled by user/i);
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "failed");
+  assert.equal(conn.terminalCalls.length, 0);
+});
+
+test("run_command turn abort during permission prompt reports cancelled by turn", async () => {
+  const abortController = new AbortController();
+  let permissionStarted!: () => void;
+  const started = new Promise<void>((resolve) => { permissionStarted = resolve; });
+  const conn = {
+    updates: [] as Array<Record<string, unknown>>,
+    terminalCalls: [] as Array<{ command: string; args?: string[] }>,
+    async sessionUpdate(payload: Record<string, unknown>) { this.updates.push(payload); },
+    async requestPermission() {
+      permissionStarted();
+      return new Promise<never>(() => {});
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, abortController.signal);
+  const pending = exec.execute(
+    "tc1",
+    "run_command",
+    JSON.stringify({ command: "printf should-not-run" })
+  );
+  await started;
+  abortController.abort();
+  const result = await pending;
+  assert.match(result.content, /cancelled by turn/i);
   const last = conn.updates.at(-1) as { update: { status?: string } };
   assert.equal(last.update.status, "failed");
   assert.equal(conn.terminalCalls.length, 0);
