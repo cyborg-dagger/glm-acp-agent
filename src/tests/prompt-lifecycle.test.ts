@@ -65,13 +65,54 @@ test("cancelled delayed vision preprocessing settles without starting the model"
   await started;
   assert.equal(existsSync(sourcePath), true);
   await agent.cancel({ sessionId });
+  // The prompt lifecycle cannot settle while the vision request is still in
+  // flight, so release it before awaiting the cancelled prompt.
+  releaseVision();
   const result = await prompt;
   assert.equal(result.stopReason, "cancelled");
   assert.equal(result.userMessageId, "cancelled-1");
   assert.equal(modelCalls, 0);
-  releaseVision();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(existsSync(sourcePath), false, "abort must remove materialized image data");
+});
+
+test("cancelled vision request defers materialized-image cleanup until it settles", async () => {
+  const conn = connection();
+  let visionStarted!: () => void;
+  const started = new Promise<void>((resolve) => { visionStarted = resolve; });
+  let releaseVision!: () => void;
+  const visionDone = new Promise<void>((resolve) => { releaseVision = resolve; });
+  let sourcePath = "";
+  const vision: VisionMcpClient = {
+    async callTool(_name, args) {
+      sourcePath = String(args["image_source"]);
+      visionStarted();
+      await visionDone;
+      return { content: [{ type: "text", text: "late" }] };
+    },
+    async dispose() {},
+  };
+  const agent = new GlmAcpAgent(conn as never, {
+    visionClient: vision,
+    sessionStore: null,
+    glm: textGlm(),
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const prompt = agent.prompt({ sessionId, prompt: imagePrompt(), messageId: "defer-cleanup-1" });
+  await started;
+  await agent.cancel({ sessionId });
+  await new Promise((resolve) => setImmediate(resolve));
+  // Cancellation has been observed, but the vision request is still running:
+  // its materialized image must survive until the request settles.
+  assert.equal(existsSync(sourcePath), true, "cleanup must not race the in-flight vision request");
+  releaseVision();
+  const result = await prompt;
+  assert.equal(result.stopReason, "cancelled");
+  assert.equal(
+    existsSync(sourcePath),
+    false,
+    "materialized image is removed once the request settles and the lifecycle unwinds",
+  );
 });
 
 test("preprocessing abort before vision startup observes a rejecting late operation and makes no vision call", async () => {
@@ -161,12 +202,14 @@ test("cancellation after vision starts still observes its late rejection", async
     },
     async dispose() {},
   };
-  await assert.rejects(
-    preprocessImageBlocks([{ type: "image", data: "", mimeType: "image/png", uri: "https://example.test/image.png" }], vision, controller.signal),
-    /cancelled|aborted/i,
-  );
-  assert.equal(visionCalls, 1);
+  const prepared = preprocessImageBlocks([{ type: "image", data: "", mimeType: "image/png", uri: "https://example.test/image.png" }], vision, controller.signal);
+  // Let the queued vision startup run so the abort races an in-flight operation.
+  await new Promise((resolve) => setImmediate(resolve));
+  // The rejection is held until the operation settles: settle it, then observe
+  // both the cancellation error and that the late rejection was consumed.
   rejectVision(new Error("late vision failure"));
+  await assert.rejects(prepared, /cancelled|aborted/i);
+  assert.equal(visionCalls, 1);
   await new Promise((resolve) => setImmediate(resolve));
 });
 
@@ -226,9 +269,11 @@ test("close waits for preprocessing cleanup before persisting and removing the s
   const prompt = agent.prompt({ sessionId, prompt: imagePrompt() });
   await prepStarted;
   const closing = agent.closeSession({ sessionId });
+  // The lifecycle — including the in-flight vision request — must settle
+  // before close can persist, so release the request before awaiting.
+  releaseVision();
   await prompt;
   await closing;
-  releaseVision();
   assert.equal(saveSawCleanedImage, true, "close must persist only after lifecycle cleanup");
   assert.equal(existsSync(sourcePath), false);
   await assert.rejects(agent.prompt({ sessionId, prompt: [{ type: "text", text: "late" }] }), /Session not found/);

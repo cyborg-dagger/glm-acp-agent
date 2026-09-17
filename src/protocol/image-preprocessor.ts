@@ -114,17 +114,31 @@ export async function preprocessImageBlocks(
   return { blocks: out, cleanups };
 }
 
-/** Resolve promptly on cancellation while still observing a late operation rejection. */
+/**
+ * Wait for the operation, rejecting on cancellation — but never before the
+ * operation itself has settled. Cleanups that delete materialized images, the
+ * prompt lifecycle, and session close all follow this rejection, so letting it
+ * run ahead of the request would let cleanup race a still-active Vision MCP
+ * call. (The vision client rejects an aborted call promptly, so this wait is
+ * short in practice.) Late operation rejections are consumed either way.
+ */
 function waitForAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return operation;
   return new Promise<T>((resolve, reject) => {
     let settled = false;
+    const cancelError = () => new Error("Vision MCP call cancelled");
     const cleanup = () => signal.removeEventListener("abort", onAbort);
     const onAbort = () => {
       if (settled) return;
       settled = true;
       cleanup();
-      reject(new Error("Vision MCP call cancelled"));
+      // Hold the rejection until the request settles so cleanup cannot race
+      // the in-flight Vision MCP call. Its outcome is discarded — the prompt
+      // was cancelled — but observing it here also consumes a late rejection.
+      operation.then(
+        () => reject(cancelError()),
+        () => reject(cancelError()),
+      );
     };
     signal.addEventListener("abort", onAbort, { once: true });
     operation.then(
