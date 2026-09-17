@@ -408,6 +408,32 @@ test("read_file paginates a legacy editor full buffer for a short offset page", 
   }
 });
 
+test("read_file treats a one-line legacy editor buffer as EOF past its only line", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-legacy-single-line-"));
+  const path = join(dir, "single-line.txt");
+  writeFileSync(path, "only-line", "utf8");
+  const updates: Array<Record<string, unknown>> = [];
+  const conn = {
+    async sessionUpdate(payload: Record<string, unknown>) { updates.push(payload); },
+    // This client ignores both line and limit, including the far-beyond-EOF probe.
+    async readTextFile() {
+      return { content: "only-line" };
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "read_file",
+      JSON.stringify({ path, offset: 2, limit: 2 }),
+    );
+    assert.match(result.content, /offset 2 is beyond the last line of .* \(1 line\)/);
+    assert.doesNotMatch(result.content, /only-line/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("read_file final page reports end of file without a next-offset hint", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-final-page-"));
   const path = join(dir, "paged.txt");

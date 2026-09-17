@@ -47,6 +47,8 @@ export interface TodoItem {
 const DEFAULT_READ_LIMIT = 2000;
 /** Upper bound for an explicit limit — keeps one call from flooding the context. */
 const HARD_READ_LIMIT = 5000;
+/** Valid ACP line number that is beyond any practical editor buffer. */
+const EDITOR_EOF_PROBE_LINE = 0xffffffff;
 /** Strings longer than this are elided in client-facing previews (UI cards), never in tool results. */
 const PREVIEW_STRING_LIMIT = 240;
 const PREVIEW_HEAD = 120;
@@ -446,11 +448,12 @@ export class ToolExecutor {
       let legacyFullBuffer = false;
       if (offset > 1 && lines.length > 0 && lines.length <= limit + 1) {
         // A few older ACP clients ignore line/limit and return a short full
-        // buffer. A three-line file is indistinguishable from a conforming
-        // two-line page plus lookahead, so probe line 1 with limit 1 before
-        // deciding which line numbers the response represents.
-        const probe = await readEditorLines(1, 1);
-        if (probe.length > 1) {
+        // buffer. A short file is indistinguishable from a conforming page,
+        // so probe a far-beyond-EOF line before deciding which line numbers
+        // the response represents. ACP defines line as a uint32, so this is
+        // valid for conforming clients and cannot be a real file line here.
+        const probe = await readEditorLines(EDITOR_EOF_PROBE_LINE, 1);
+        if (probe.length > 0) {
           lines = probe;
           legacyFullBuffer = true;
         }
