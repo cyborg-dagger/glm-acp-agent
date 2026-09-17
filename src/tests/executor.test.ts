@@ -345,6 +345,34 @@ test("read_file truncates large files with a range marker", async () => {
   }
 });
 
+test("read_file treats editor line pagination as pagination, not byte truncation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-page-"));
+  const path = join(dir, "paged.txt");
+  writeFileSync(path, "line-1\nline-2\nline-3\nline-4", "utf8");
+  const updates: Array<Record<string, unknown>> = [];
+  const conn = {
+    async sessionUpdate(payload: Record<string, unknown>) { updates.push(payload); },
+    async readTextFile(params: { line?: number; limit?: number }) {
+      const lines = ["line-1", "line-2", "line-3", "line-4"];
+      const line = params.line ?? 1;
+      const limit = params.limit ?? lines.length;
+      return { content: lines.slice(line - 1, line - 1 + limit).join("\n") };
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "read_file",
+      JSON.stringify({ path, limit: 2 }),
+    );
+    assert.match(result.content, /showing lines 1-2 \(total unknown\); pass offset=3/);
+    assert.doesNotMatch(result.content, /scan stopped at .*byte read limit/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("read_file final page reports end of file without a next-offset hint", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-final-page-"));
   const path = join(dir, "paged.txt");
