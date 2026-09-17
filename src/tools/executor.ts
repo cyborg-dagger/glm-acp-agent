@@ -20,7 +20,7 @@ import {
   type CommandLimits,
 } from "./command-limits.js";
 import { readResourceLimits, type ResourceLimits } from "./resource-limits.js";
-import { boundToolResult } from "./tool-output.js";
+import { boundToolResult, takeUtf8Prefix } from "./tool-output.js";
 import { readLocalTextFileBounded, readLocalTextPage, type TextPage } from "./file-reader.js";
 
 /**
@@ -203,6 +203,8 @@ export class ToolExecutor {
       const shown = `${page.firstLine}-${page.lastCompleteLine}`;
       if (page.incompleteLine !== undefined) {
         content += `${content ? "\n" : ""}[showing complete lines ${shown}; line ${page.incompleteLine} is incomplete because the ${this.resourceLimits.fileReadBytes}-byte scan limit was reached. Narrow the input or use an explicitly bounded command for byte-level inspection.]`;
+      } else if (page.truncated) {
+        content += `\n[scan stopped at the ${this.resourceLimits.fileReadBytes}-byte read limit after line ${page.lastCompleteLine}; total lines are unknown${page.nextLine === undefined ? ". Narrow the input or use an explicitly bounded command for byte-level inspection." : `; pass offset=${page.nextLine} to continue`} ]`;
       } else if (page.nextLine !== undefined) {
         content += `\n[showing lines ${shown}${page.totalLines === undefined ? " (total unknown)" : ` of ${page.totalLines}`}; pass offset=${page.nextLine} to read the next chunk]`;
       } else if (page.totalLines !== undefined && offset > 1) {
@@ -659,10 +661,16 @@ export class ToolExecutor {
         }
         outputLines.push(line);
       }
-      if (entryLimitReached || byteLimitReached) {
-        outputLines.push(`[listing truncated: returned a subset; entries=${this.resourceLimits.listEntries}, bytes=${this.resourceLimits.listBytes}]`);
-      }
-      const output = outputLines.join("\n");
+      const marker = `[listing truncated: returned a subset; entries=${this.resourceLimits.listEntries}, bytes=${this.resourceLimits.listBytes}]`;
+      const listingTruncated = entryLimitReached || byteLimitReached;
+      const output = listingTruncated
+        ? (() => {
+            const markerBytes = Buffer.byteLength(marker, "utf8");
+            const prefixBudget = Math.max(0, this.resourceLimits.listBytes - markerBytes - 1);
+            const prefix = takeUtf8Prefix(outputLines.join("\n"), prefixBudget);
+            return `${prefix ? `${prefix}\n` : ""}${marker}`;
+          })()
+        : outputLines.join("\n");
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,

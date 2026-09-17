@@ -1,5 +1,5 @@
 import { open } from "node:fs/promises";
-import { takeUtf8Prefix } from "./tool-output.js";
+import { StringDecoder } from "node:string_decoder";
 
 export interface TextPage {
   text: string;
@@ -58,12 +58,13 @@ export async function readLocalTextPage(
     const currentLine = completeLines.length + 1;
     const pageEndsAtKnownPartial = !eof && hasPartial && safeOffset <= currentLine && safeOffset + safeLimit - 1 >= currentLine;
     const pageEndsAtBudget = !eof && (hasPartial || bytes.length === maxReadBytes);
+    const canContinueAfterCompleteBoundary = !eof && !hasPartial && safeOffset <= completeLines.length;
     return {
       text: selected.join("\n") + (pageEndsAtKnownPartial && selected.length === 0 ? decodeUtf8Safely(bytes.subarray(lineStart)) : ""),
       firstLine: safeOffset,
       lastCompleteLine: safeOffset + selected.length - 1,
       ...(totalLines === undefined ? {} : { totalLines }),
-      ...(totalLines !== undefined && end < totalLines ? { nextLine: end + 1 } : {}),
+      ...(totalLines !== undefined && end < totalLines ? { nextLine: end + 1 } : canContinueAfterCompleteBoundary ? { nextLine: completeLines.length + 1 } : {}),
       truncated: pageEndsAtBudget,
       ...(pageEndsAtKnownPartial ? { incompleteLine: currentLine } : {}),
     };
@@ -95,5 +96,7 @@ export async function readLocalTextFileBounded(path: string, maxReadBytes: numbe
 }
 
 function decodeUtf8Safely(bytes: Buffer): string {
-  return takeUtf8Prefix(bytes.toString("utf8"), bytes.length);
+  // StringDecoder retains an incomplete trailing sequence instead of emitting
+  // U+FFFD; by not calling end(), the bounded scan drops that incomplete tail.
+  return new StringDecoder("utf8").write(bytes);
 }

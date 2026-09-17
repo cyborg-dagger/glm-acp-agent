@@ -424,8 +424,7 @@ test("read_file bounds a real large local result before it can enter model histo
   const conn = createConnectionStub();
   const limits: ResourceLimits = {
     toolResultBytes: 128, fileReadBytes: 8 * 1024 * 1024, listEntries: 2000, listBytes: 262_144,
-    fsConcurrency: 16, mcpTimeoutMs: 120_000, mcpBodyBytes: 262_144, mcpFrameBytes: 262_144,
-    discoveryPages: 20, discoveryTools: 500, discoverySchemaBytes: 262_144,
+    fsConcurrency: 16,
   };
   const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir, () => "default", () => undefined, limits);
   try {

@@ -191,9 +191,6 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_READ_FILE_LIMIT_BYTES` | No | `8388608` | Maximum local bytes consumed while reading a page or whole file for `edit_file`. A bounded scan may not know the total line count. |
 | `ACP_GLM_LIST_FILES_MAX_ENTRIES` | No | `2000` | Maximum entries collected by `list_files`; larger directories return a disclosed subset. |
 | `ACP_GLM_LIST_FILES_LIMIT_BYTES` | No | `262144` | Maximum bytes assembled for a `list_files` result before its truncation marker. |
-| `ACP_GLM_MCP_REQUEST_TIMEOUT_MS` | No | `120000` | Timeout used by bounded MCP request transports. |
-| `ACP_GLM_MCP_RESPONSE_LIMIT_BYTES` | No | `262144` | Response-body limit used by bounded MCP transports. |
-| `ACP_GLM_MCP_STDIO_FRAME_LIMIT_BYTES` | No | `262144` | Maximum accepted stdio MCP frame size. |
 | `ACP_GLM_THINKING` | No | auto-detected | Force thinking mode `true` / `false` |
 | `ACP_GLM_STREAM_THINKING` | No | `true` | Forward reasoning tokens to the client as `agent_thought_chunk`; set `false` to keep reasoning off the wire (the model still thinks — only the client-side stream is silenced) |
 | `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |

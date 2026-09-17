@@ -44,3 +44,9 @@ test("local reader does not emit a replacement character when the scan stops in 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("local reader discloses a scan ending after a complete line", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-file-reader-")); const path = join(dir, "cap.txt");
+  writeFileSync(path, "a\nb\nc\n");
+  try { const page = await readLocalTextPage(path, 1, 20, 4); assert.equal(page.truncated, true); assert.equal(page.nextLine, 3); } finally { rmSync(dir, { recursive: true, force: true }); }
+});

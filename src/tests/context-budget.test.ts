@@ -25,3 +25,22 @@ test("compaction note preserves string user content and identifies omissions", (
   assert.match(String(noted.content), /original user request/);
   assert.match(String(noted.content), /omitted 2 completed exchanges/);
 });
+
+test("compaction updates one note instead of appending another", () => {
+  const once = appendCompactionNote({ role: "user", content: "request" }, 1, 0);
+  const twice = appendCompactionNote(once, 2, 1);
+  assert.equal(String(twice.content).match(/Context compaction/g)?.length, 1);
+  assert.match(String(twice.content), /omitted 3 completed exchanges/);
+});
+
+test("compaction evicts old complete tool batches within one live user turn", () => {
+  const messages: GlmMessage[] = [{ role: "system", content: "rules" }, { role: "user", content: "current" }];
+  for (const id of ["old", "new"]) {
+    messages.push({ role: "assistant", content: null, reasoning_content: `${id} reasoning`, tool_calls: [{ id, type: "function", function: { name: "read_file", arguments: `{"id":"${id}"}` } }] });
+    messages.push({ role: "tool", tool_call_id: id, content: "x".repeat(30_000) });
+  }
+  const result = compactToBudget(messages, { contextWindow: 7_000, maxOutputTokens: 1_000, toolSchemaTokens: 0, safetyTokens: 4_096 }, true);
+  assert.ok(result.removedExchanges >= 1);
+  assert.ok(!result.messages.some(message => message.role === "tool" && message.tool_call_id === "old"));
+  assert.ok(result.messages.some(message => message.role === "assistant" && message.tool_calls?.some(call => call.id === "new")));
+});

@@ -81,11 +81,24 @@ export function compactToBudget(
     estimate = estimateMessagesTokens(currentMessages());
   }
 
+  // A single user request can span many assistant/tool rounds. Remove only
+  // complete oldest batches, retaining the current user message, retained
+  // arguments/reasoning, and the newest completed batch when it fits.
+  while (estimate > desired) {
+    const active = currentTurns[activeIndex]!;
+    const batches = completeToolBatches(active);
+    if (batches.length <= 1) break;
+    const [start, end] = batches[0]!;
+    currentTurns[activeIndex] = active.filter((_, index) => index < start || index > end);
+    removedExchanges += 1;
+    estimate = estimateMessagesTokens(currentMessages());
+  }
+
   // Preserve the newest complete exchange whenever it fits. Older completed
   // exchanges are removed whole, so tool IDs never dangle from their calls.
   // Ten recent user turns are normally retained for conversational cohesion.
   // An actual provider overflow uses force and may yield this preference.
-  const minimumTurns = force ? 1 : 10;
+  const minimumTurns = 1;
   while (estimate > desired && currentTurns.length > minimumTurns) {
     currentTurns.shift();
     removedExchanges += 1;
@@ -103,9 +116,13 @@ export function compactToBudget(
 }
 
 export function appendCompactionNote(message: GlmMessage, removed: number, reduced: number): GlmMessage {
-  const note = `[Context compaction: omitted ${removed} completed exchange${removed === 1 ? "" : "s"}; shortened ${reduced} tool result${reduced === 1 ? "" : "s"}. The original user request remains above.]`;
-  if (typeof message.content === "string") return { ...message, content: `${message.content}\n\n${note}` } as GlmMessage;
-  if (Array.isArray(message.content)) return { ...message, content: [...message.content, { type: "text", text: note }] } as GlmMessage;
+  const pattern = /\n?\n?\[Context compaction: omitted (\d+) completed exchanges?; shortened (\d+) tool results?\. The original user request remains above\.\]/;
+  const previous = typeof message.content === "string" ? message.content.match(pattern) : undefined;
+  const totalRemoved = removed + Number(previous?.[1] ?? 0);
+  const totalReduced = reduced + Number(previous?.[2] ?? 0);
+  const note = `[Context compaction: omitted ${totalRemoved} completed exchange${totalRemoved === 1 ? "" : "s"}; shortened ${totalReduced} tool result${totalReduced === 1 ? "" : "s"}. The original user request remains above.]`;
+  if (typeof message.content === "string") return { ...message, content: `${message.content.replace(pattern, "")}\n\n${note}` } as GlmMessage;
+  if (Array.isArray(message.content)) return { ...message, content: [...message.content.filter(part => !(part.type === "text" && typeof part.text === "string" && pattern.test(part.text))), { type: "text", text: note }] } as GlmMessage;
   return { ...message, content: note } as GlmMessage;
 }
 
@@ -121,6 +138,20 @@ function groupTurns(messages: readonly GlmMessage[]): GlmMessage[][] {
   }
   if (current.length > 0) turns.push(current);
   return turns;
+}
+
+function completeToolBatches(messages: readonly GlmMessage[]): Array<[number, number]> {
+  const batches: Array<[number, number]> = [];
+  for (let start = 0; start < messages.length; start++) {
+    const assistant = messages[start];
+    if (assistant?.role !== "assistant" || !assistant.tool_calls?.length) continue;
+    let end = start;
+    while (end + 1 < messages.length && messages[end + 1]?.role === "tool") end++;
+    const ids = new Set(assistant.tool_calls.map(call => call.id));
+    const returned = new Set(messages.slice(start + 1, end + 1).filter(message => message.role === "tool").map(message => message.tool_call_id));
+    if ([...ids].every(id => returned.has(id))) batches.push([start, end]);
+  }
+  return batches;
 }
 
 function estimateMessageTokens(message: GlmMessage): number {

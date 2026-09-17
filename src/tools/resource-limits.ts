@@ -4,12 +4,6 @@ export interface ResourceLimits {
   listEntries: number;
   listBytes: number;
   fsConcurrency: number;
-  mcpTimeoutMs: number;
-  mcpBodyBytes: number;
-  mcpFrameBytes: number;
-  discoveryPages: number;
-  discoveryTools: number;
-  discoverySchemaBytes: number;
 }
 
 type Environment = Record<string, string | undefined>;
@@ -41,11 +35,5 @@ export function readResourceLimits(
     listEntries: positiveInteger(env, "ACP_GLM_LIST_FILES_MAX_ENTRIES", DEFAULT_LIST_ENTRIES, 1, DEFAULT_LIST_ENTRIES, warn),
     listBytes: positiveInteger(env, "ACP_GLM_LIST_FILES_LIMIT_BYTES", DEFAULT_LIST_BYTES, 128, Number.MAX_SAFE_INTEGER, warn),
     fsConcurrency: 16,
-    mcpTimeoutMs: positiveInteger(env, "ACP_GLM_MCP_REQUEST_TIMEOUT_MS", 120_000, 1, 2_147_483_647, warn),
-    mcpBodyBytes: positiveInteger(env, "ACP_GLM_MCP_RESPONSE_LIMIT_BYTES", DEFAULT_TOOL_RESULT_BYTES, 128, Number.MAX_SAFE_INTEGER, warn),
-    mcpFrameBytes: positiveInteger(env, "ACP_GLM_MCP_STDIO_FRAME_LIMIT_BYTES", DEFAULT_TOOL_RESULT_BYTES, 128, Number.MAX_SAFE_INTEGER, warn),
-    discoveryPages: 20,
-    discoveryTools: 500,
-    discoverySchemaBytes: 262_144,
   };
 }
