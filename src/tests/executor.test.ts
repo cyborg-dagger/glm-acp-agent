@@ -1166,6 +1166,14 @@ test(
   "isProcessGroupAlive reports live groups as alive and exited groups as gone",
   { timeout: 5_000 },
   async () => {
+    if (process.platform === "win32") {
+      // No POSIX process groups on Windows: the probe deliberately reports
+      // "alive" so the escalation timer stays armed (taskkill on a dead pid
+      // is a harmless no-op). Only the missing-pid case reports "gone".
+      assert.equal(isProcessGroupAlive(12345), true, "win32 probe must stay permissive");
+      assert.equal(isProcessGroupAlive(undefined), false, "missing pid reported alive");
+      return;
+    }
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 800)"], {
       detached: true,
       stdio: "ignore",
