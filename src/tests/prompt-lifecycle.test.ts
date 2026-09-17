@@ -12,13 +12,16 @@ import type { VisionMcpClient } from "../tools/vision-mcp-client.js";
 
 function connection() {
   const updates: Array<Record<string, unknown>> = [];
+  const permissionRequests: unknown[] = [];
   return {
     updates,
+    permissionRequests,
     signal: new AbortController().signal,
     async sessionUpdate(params: Record<string, unknown>) {
       updates.push(params);
     },
-    async requestPermission() {
+    async requestPermission(params: unknown) {
+      permissionRequests.push(params);
       return { outcome: { outcome: "selected", optionId: "allow" } };
     },
   };
@@ -312,6 +315,88 @@ test("a follow-up prompt starts after the cancelled image turn has fully unwound
   assert.equal(followUp.stopReason, "end_turn");
   assert.equal(followUp.userMessageId, "second");
   assert.equal(modelCalls, 1);
+});
+
+test("a malformed tool argument result is paired in history before the model and next prompt continue", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-invalid-tool-history-"));
+  const sessionStore = new SessionStore(storeRoot);
+  const modelInputs: Array<Array<{ role: string; tool_call_id?: string; content?: unknown; tool_calls?: unknown[] }>> = [];
+  let calls = 0;
+  const glm = {
+    async *streamChat(messages: Array<{ role: string; tool_call_id?: string; content?: unknown; tool_calls?: unknown[] }>): AsyncGenerator<GlmStreamChunk> {
+      modelInputs.push(structuredClone(messages));
+      calls += 1;
+      if (calls === 1) {
+        yield { toolCall: { id: "bad-root", name: "write_file", arguments: "null" } };
+        yield { done: true, stopReason: "tool_calls" };
+        return;
+      }
+      yield { text: calls === 2 ? "recovered" : "follow-up" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "write it" }] })).stopReason, "end_turn");
+    assert.equal(conn.permissionRequests.length, 0);
+    const historyForRecovery = modelInputs[1]!;
+    const assistantIndex = historyForRecovery.findIndex((message) => message.role === "assistant" && message.tool_calls);
+    assert.ok(assistantIndex >= 0);
+    assert.deepEqual(historyForRecovery[assistantIndex + 1], {
+      role: "tool",
+      tool_call_id: "bad-root",
+      content: "Error: Tool arguments must be a JSON object.",
+    });
+
+    assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] })).stopReason, "end_turn");
+    assert.equal(calls, 3);
+    await agent.closeSession({ sessionId });
+    const persisted = sessionStore.load(sessionId);
+    assert.ok(persisted);
+    assert.ok(persisted.messages.some((message) => message.role === "tool" && message.tool_call_id === "bad-root"));
+  } finally {
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("an unexpected executor failure has a matching uncertain tool result before the model continues", async () => {
+  const conn = connection();
+  const sessionUpdate = conn.sessionUpdate.bind(conn);
+  let failFailedNotification = true;
+  conn.sessionUpdate = async (params: Record<string, unknown>) => {
+    const update = params["update"] as { sessionUpdate?: string; status?: string };
+    if (failFailedNotification && update.sessionUpdate === "tool_call" && update.status === "failed") {
+      failFailedNotification = false;
+      throw new Error("synthetic tool notification interruption");
+    }
+    await sessionUpdate(params);
+  };
+  const modelInputs: Array<Array<{ role: string; tool_call_id?: string; content?: unknown; tool_calls?: unknown[] }>> = [];
+  let calls = 0;
+  const glm = {
+    async *streamChat(messages: Array<{ role: string; tool_call_id?: string; content?: unknown; tool_calls?: unknown[] }>): AsyncGenerator<GlmStreamChunk> {
+      modelInputs.push(structuredClone(messages));
+      calls += 1;
+      if (calls === 1) {
+        yield { toolCall: { id: "interrupted", name: "write_file", arguments: "null" } };
+        yield { done: true, stopReason: "tool_calls" };
+        return;
+      }
+      yield { text: "recovered" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "write it" }] })).stopReason, "end_turn");
+  assert.equal(calls, 2);
+  assert.deepEqual(modelInputs[1]!.at(-1), {
+    role: "tool",
+    tool_call_id: "interrupted",
+    content: "Error: tool execution failed unexpectedly; its outcome may be unknown.",
+  });
 });
 
 test("queued prompts form a chain so only the newest prompt can reach the model", async () => {

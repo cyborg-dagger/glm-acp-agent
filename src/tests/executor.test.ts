@@ -205,6 +205,65 @@ test("invalid JSON arguments yield a failed tool_call notification", async () =>
   assert.equal(last.update.status, "failed");
 });
 
+test("invalid roots and write/edit arguments fail before permissions or filesystem mutations", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-invalid-write-"));
+  const path = join(dir, "note.txt");
+  writeFileSync(path, "remove this", "utf8");
+  const cases = [
+    ["write_file", "null"],
+    ["write_file", "[]"],
+    ["write_file", "\"text\""],
+    ["write_file", "1"],
+    ["write_file", "true"],
+    ["write_file", "{"],
+    ["write_file", JSON.stringify({ path })],
+    ["write_file", JSON.stringify({ path, content: null })],
+    ["edit_file", JSON.stringify({ path, old_text: "remove this" })],
+    ["edit_file", JSON.stringify({ path, old_text: "remove this", new_text: null })],
+  ] as const;
+  try {
+    for (const [toolName, rawArguments] of cases) {
+      const conn = createConnectionStub({ permission: "allow" });
+      const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+      const result = await exec.execute(`tc-${toolName}-${rawArguments.length}`, toolName, rawArguments);
+      assert.match(result.content, /required|string|JSON object|could not parse/i);
+      assert.equal(conn.permissionRequests.length, 0);
+      assert.equal(conn.writeTextFileCalls.length, 0);
+      const update = conn.updates.at(-1) as { update: { sessionUpdate: string; status?: string } };
+      assert.equal(update.update.sessionUpdate, "tool_call");
+      assert.equal(update.update.status, "failed");
+    }
+    assert.equal(readFileSync(path, "utf8"), "remove this");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("explicit empty write and edit text remain valid destructive operations", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-empty-write-"));
+  const writePath = join(dir, "write.txt");
+  const editPath = join(dir, "edit.txt");
+  writeFileSync(writePath, "existing", "utf8");
+  writeFileSync(editPath, "before unique snippet after", "utf8");
+  const conn = createConnectionStub({ permission: "allow" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const write = await exec.execute("tc-write-empty", "write_file", JSON.stringify({ path: writePath, content: "" }));
+    const edit = await exec.execute(
+      "tc-edit-empty",
+      "edit_file",
+      JSON.stringify({ path: editPath, old_text: "unique snippet", new_text: "" })
+    );
+    assert.match(write.content, /written successfully/);
+    assert.match(edit.content, /edited successfully/);
+    assert.equal(readFileSync(writePath, "utf8"), "");
+    assert.equal(readFileSync(editPath, "utf8"), "before  after");
+    assert.equal(conn.permissionRequests.length, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("unknown tool name yields a failed tool_call notification", async () => {
   const conn = createConnectionStub();
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);

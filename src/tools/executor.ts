@@ -18,6 +18,7 @@ import {
   readCommandLimits,
   type CommandLimits,
 } from "./command-limits.js";
+import { validateToolArguments } from "./argument-validation.js";
 
 /**
  * Result returned after executing a tool call against the ACP client.
@@ -99,17 +100,13 @@ export class ToolExecutor {
     toolName: string,
     rawArguments: string
   ): Promise<ToolResult> {
-    let args: Record<string, unknown>;
-    try {
-      args =
-        rawArguments.trim().length === 0
-          ? {}
-          : (JSON.parse(rawArguments) as Record<string, unknown>);
-    } catch {
-      const message = `Error: could not parse tool arguments as JSON: ${rawArguments}`;
+    const validation = validateToolArguments(toolName, rawArguments);
+    if (!validation.ok) {
+      const message = `Error: ${validation.message}`;
       await this.failedToolCall(toolCallId, toolName, {}, message);
       return { content: message };
     }
+    const args = validation.value;
 
     switch (toolName) {
       case "read_file":
