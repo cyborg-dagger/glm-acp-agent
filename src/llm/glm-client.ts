@@ -4,6 +4,7 @@ import type { ModelInfo, Usage } from "@agentclientprotocol/sdk";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { resolveApiKey } from "./credentials.js";
 import { debug, error } from "./logger.js";
+import { validateStreamCompletion } from "./stream-state.js";
 
 /**
  * Reasoning effort levels exposed to ACP clients via the `thought_level`
@@ -432,15 +433,13 @@ export class GlmClient {
       }
     }
 
-    // Flush any assembled tool calls and emit a final done chunk. Only emit
-    // calls that have both an id and a name – partial entries can be left
-    // behind by upstream errors and would just confuse the agent loop.
-    for (const [, tc] of pendingToolCalls) {
-      if (tc.id && tc.name) yield { toolCall: tc };
+    signal?.throwIfAborted();
+    const calls = [...pendingToolCalls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
+    const stopReason = validateStreamCompletion(lastFinishReason, calls);
+    if (stopReason === "tool_calls") {
+      for (const call of calls) yield { toolCall: call };
     }
-    pendingToolCalls.clear();
-
-    yield { done: true, stopReason: lastFinishReason };
+    yield { done: true, stopReason };
   }
 }
 

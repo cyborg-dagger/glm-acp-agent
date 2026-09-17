@@ -67,6 +67,7 @@ import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
 import { debug, error, isDebugEnabled } from "../llm/logger.js";
+import { validateStreamCompletion } from "../llm/stream-state.js";
 
 /**
  * Maximum bytes of AGENTS.md / CLAUDE.md to embed in the system prompt.
@@ -1370,6 +1371,12 @@ export class GlmAcpAgent implements Agent {
             lastStopReason = chunk.stopReason;
           }
         }
+        if (!signal.aborted) {
+          lastStopReason = validateStreamCompletion(lastStopReason, toolCalls);
+          if (lastStopReason === "length" || lastStopReason === "content_filter") {
+            toolCalls.length = 0;
+          }
+        }
       } catch (err) {
         commitTurnUsage();
         if (signal.aborted) {
@@ -1392,6 +1399,11 @@ export class GlmAcpAgent implements Agent {
         } else if (!cancelledDuringStream && isOverflow) {
           throw new Error("Context overflow persisted after emergency compaction", { cause: err });
         } else if (!cancelledDuringStream) {
+          // Keep text the client has already seen, but never retain an
+          // incomplete executable tool batch from an interrupted stream.
+          if (assistantText.length > 0) {
+            session.messages.push({ role: "assistant", content: assistantText });
+          }
           throw err;
         }
       }
