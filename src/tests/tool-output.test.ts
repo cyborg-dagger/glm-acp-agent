@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { boundToolResult } from "../tools/tool-output.js";
+import { boundToolResult, takeUtf8Suffix } from "../tools/tool-output.js";
 
 test("tool output fits an inclusive UTF-8 budget without splitting characters", () => {
   const result = boundToolResult("🙂".repeat(100_000), 262_144);
@@ -17,4 +17,8 @@ test("tool output keeps complete characters at both retained boundaries", () => 
   const result = boundToolResult("α".repeat(1_000) + "🙂".repeat(1_000), 128);
   assert.ok(!result.includes("\uFFFD"));
   assert.equal(Buffer.byteLength(result, "utf8") <= 128, true);
+});
+
+test("suffix helper keeps a trailing supplementary character intact", () => {
+  assert.equal(takeUtf8Suffix("x🙂", 4), "🙂");
 });
