@@ -1036,10 +1036,58 @@ export class GlmAcpAgent implements Agent {
     params: ForkSessionRequest
   ): Promise<ForkSessionResponse> {
     const source = this.sessions.get(params.sessionId);
-    const persisted = source
-      ? this.snapshot(params.sessionId, source)
-      : this.requirePersisted(params.sessionId);
-    const mcpTools = await this.connectMcpServers(params.mcpServers ?? []);
+    if (!source) {
+      const persisted = this.requirePersisted(params.sessionId);
+      const mcpTools = await this.connectMcpServers(params.mcpServers ?? []);
+      return this.createFork(params, persisted, mcpTools);
+    }
+
+    const record = this.transitions.get(params.sessionId)
+      ?? this.registerTransition(params.sessionId, source.lifecycle);
+    const lifecycle = record.lifecycle;
+    const lease = lifecycle.begin("snapshotting");
+    record.original = source;
+    let deferLeaseRelease = false;
+    const transition = Promise.resolve().then(async (): Promise<ForkSessionResponse> => {
+      let provisional: SessionMcpTools | null = null;
+      try {
+        source.abortController?.abort();
+        const drained = await this.drainPrompt(source);
+        if (!drained) {
+          deferLeaseRelease = true;
+          this.releaseAfterPromptDrain(source, lifecycle, lease, record);
+          throw new Error(`Session fork timed out waiting for prompt cleanup: ${lease.generation}`);
+        }
+        if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
+          throw new Error(`Session fork cancelled: ${params.sessionId}`);
+        }
+        const persisted = this.snapshot(params.sessionId, source);
+        provisional = await this.connectMcpServers(params.mcpServers ?? []);
+        if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
+          throw new Error(`Session fork cancelled: ${params.sessionId}`);
+        }
+        const response = this.createFork(params, persisted, provisional);
+        provisional = null;
+        return response;
+      } finally {
+        await provisional?.dispose();
+        if (!deferLeaseRelease) lease.release();
+      }
+    });
+    record.promise = transition;
+    try {
+      return await transition;
+    } finally {
+      if (record.promise === transition) record.promise = null;
+      if (!deferLeaseRelease && record.original === source) record.original = null;
+    }
+  }
+
+  private createFork(
+    params: ForkSessionRequest,
+    persisted: PersistedSession,
+    mcpTools: SessionMcpTools,
+  ): ForkSessionResponse {
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const newSessionId = randomUUID();
@@ -1293,7 +1341,8 @@ export class GlmAcpAgent implements Agent {
 
   private isDrainingOriginal(sessionId: string, session: SessionState): boolean {
     const record = this.transitions.get(sessionId);
-    if (record?.original === session && record.lifecycle.phase === "restoring") return true;
+    if (record?.original === session &&
+        (record.lifecycle.phase === "restoring" || record.lifecycle.phase === "snapshotting")) return true;
     // A normal close aborts the prompt and waits for it before persisting. The
     // closing generation must still finish its canonical history (without UI
     // notifications), otherwise already-received text or an in-flight tool
