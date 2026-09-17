@@ -842,6 +842,91 @@ test("shutdown is idempotent and stops new session admission", async () => {
   await assert.rejects(agent.newSession({ cwd: "/tmp", mcpServers: [] }), /shutting down/);
 });
 
+test("shutdown persists partial streamed assistant text without late UI updates", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    let firstChunkSeen!: () => void;
+    const partialChunkSeen = new Promise<void>((resolve) => { firstChunkSeen = resolve; });
+    const glm = {
+      async *streamChat(
+        _messages: ReadonlyArray<{ role: string }>,
+        signal?: AbortSignal,
+      ): AsyncGenerator<GlmStreamChunk> {
+        // Record a tool call before the partial text so the shutdown checkpoint
+        // must include both the assistant call and its synthetic cancellation
+        // result, keeping the next resumed turn protocol-valid.
+        yield {
+          toolCall: {
+            id: "shutdown-tool",
+            name: "list_files",
+            arguments: JSON.stringify({ path: "." }),
+          },
+        };
+        yield { text: "partial answer" };
+        firstChunkSeen();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        // The provider can have already queued another chunk when shutdown
+        // aborts the request. The prompt loop must discard it from the UI.
+        yield { text: "late answer" };
+        yield { done: true, stopReason: "stop" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    const prompting = agent.prompt({ sessionId, prompt: [{ type: "text", text: "answer" }] });
+    await partialChunkSeen;
+    const stopping = agent.shutdown("sigterm");
+    const result = await prompting;
+    await stopping;
+
+    assert.equal(result.stopReason, "cancelled");
+    const persisted = store.load(sessionId);
+    assert.ok(persisted, "shutdown must checkpoint the in-flight session");
+    assert.deepEqual(
+      persisted?.messages.map((message) => message.role),
+      ["system", "user", "assistant", "tool"],
+      "the partial turn and cancelled tool call must remain valid history",
+    );
+    const persistedAssistant = persisted?.messages[2];
+    assert.equal(persistedAssistant?.content, "partial answer", "shutdown must preserve text received before the abort");
+    assert.deepEqual(
+      (persistedAssistant as { tool_calls?: Array<{ id: string }> } | undefined)?.tool_calls?.map(
+        (toolCall) => toolCall.id,
+      ),
+      ["shutdown-tool"],
+      "the assistant tool call must be retained with the partial text",
+    );
+    assert.equal(
+      (persisted?.messages[3] as { tool_call_id?: string } | undefined)?.tool_call_id,
+      "shutdown-tool",
+      "the interrupted tool call needs a matching synthetic result",
+    );
+    assert.match(
+      String(persisted?.messages[3]?.content),
+      /cancel/i,
+      "the interrupted tool call must be resumable",
+    );
+    assert.equal(
+      conn.updates.some((update) =>
+        (update.update as { sessionUpdate?: string; content?: { text?: string } }).content?.text === "late answer"
+      ),
+      false,
+      "chunks delivered after shutdown begins must not reach the client",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test("shutdown disposes a provisional MCP setup that completes after admission closes", async () => {
   const conn = createConnectionStub();
   let resolveSetup!: (tools: unknown) => void;
