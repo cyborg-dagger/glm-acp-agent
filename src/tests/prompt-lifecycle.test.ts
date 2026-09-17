@@ -862,6 +862,125 @@ test("close persists an in-flight tool result without late tool updates", async 
   }
 });
 
+test("fork waits for an active tool and clones a complete assistant/tool batch", async () => {
+  const updates: Array<Record<string, unknown>> = [];
+  let readStarted!: () => void;
+  const readReady = new Promise<void>((resolve) => { readStarted = resolve; });
+  let releaseRead!: () => void;
+  const readDone = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate(params: Record<string, unknown>) { updates.push(params); },
+    async readTextFile() {
+      readStarted();
+      await readDone;
+      return { content: "forked contents" };
+    },
+    async writeTextFile() {},
+    async requestPermission() {
+      return { outcome: { outcome: "selected", optionId: "allow" } };
+    },
+  };
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-tool-history-"));
+  const store = new SessionStore(storeRoot);
+  let connections = 0;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { toolCall: { id: "fork-read", name: "read_file", arguments: JSON.stringify({ path: "a.txt" }) } };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, {
+    glm,
+    sessionStore: store,
+    connectSessionMcpServers: async () => {
+      connections += 1;
+      return new SessionMcpTools([]);
+    },
+  });
+  await agent.initialize({
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+  } as never);
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read" }] });
+    await readReady;
+    const fork = agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(connections, 1, "child resources must not be created before the parent drains");
+    releaseRead();
+    assert.equal((await prompt).stopReason, "cancelled");
+    const forked = await fork;
+    const persisted = store.load(forked.sessionId);
+    const assistant = persisted?.messages.find(
+      (message) => message.role === "assistant" && message.tool_calls?.some((call) => call.id === "fork-read")
+    );
+    const result = persisted?.messages.find(
+      (message) => message.role === "tool" && message.tool_call_id === "fork-read"
+    );
+    assert.ok(assistant);
+    assert.equal(result?.content, "forked contents");
+    assert.equal(connections, 2);
+    assert.equal(updates.filter((update) => {
+      const body = update.update as { sessionUpdate?: string; toolCallId?: string };
+      return body.sessionUpdate === "tool_call_update" && body.toolCallId === "fork-read";
+    }).length, 0);
+  } finally {
+    releaseRead();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("a timed-out fork creates no child resources and reopens after the prompt drains", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-timeout-"));
+  const store = new SessionStore(storeRoot);
+  let started!: () => void;
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  let connections = 0;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      calls += 1;
+      if (calls === 1) {
+        started();
+        await blocked;
+      }
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, {
+    glm,
+    sessionStore: store,
+    sessionDrainTimeoutMs: 0,
+    connectSessionMcpServers: async () => {
+      connections += 1;
+      return new SessionMcpTools([]);
+    },
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "blocked" }] });
+    await ready;
+    await assert.rejects(
+      agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] }),
+      /fork timed out/i,
+    );
+    assert.equal(connections, 1);
+    release();
+    await prompt;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "again" }] })).stopReason, "end_turn");
+  } finally {
+    release();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
 test("restore completes a streamed tool batch with cancelled tool results", async () => {
   const conn = connection();
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-tool-batch-"));
