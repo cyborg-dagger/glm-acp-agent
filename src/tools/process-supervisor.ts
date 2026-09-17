@@ -15,6 +15,9 @@ export interface ManagedProcess {
 const TERM_GRACE_MS = 250;
 const KILL_SETTLE_MS = 500;
 const PROBE_INTERVAL_MS = 20;
+// A direct runtime shutdown has no CLI-level deadline. Do not let a stuck
+// taskkill helper make that library path wait forever.
+const TASKKILL_TIMEOUT_MS = 1_000;
 
 /**
  * Tracks command process groups for one ACP agent. A command remains owned
@@ -179,12 +182,19 @@ function taskkill(pid: number): Promise<boolean> {
     const settle = (value: boolean) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timeout);
       resolve(value);
     };
     const killer = spawn("taskkill", ["/pid", String(pid), "/t", "/f"], {
       stdio: "ignore",
       windowsHide: true,
     });
+    const timeout = setTimeout(() => {
+      // The helper itself is agent-owned too. Stop it before reporting the
+      // failed tree kill so callers can retry or finish their bounded cleanup.
+      try { killer.kill("SIGKILL"); } catch { /* already exited */ }
+      settle(false);
+    }, TASKKILL_TIMEOUT_MS);
     killer.once("error", () => settle(false));
     killer.once("close", (code) => settle(code === 0));
   });

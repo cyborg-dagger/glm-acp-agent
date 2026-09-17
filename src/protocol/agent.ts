@@ -183,6 +183,13 @@ interface SessionState {
   displayText: WeakMap<GlmMessage, string>;
 }
 
+/** A connected MCP client that remains agent-owned until its session installs it. */
+interface PendingMcpSetup {
+  tools: Promise<SessionMcpTools>;
+  release: () => void;
+  dispose: () => Promise<void>;
+}
+
 /** ACP stop reasons that the prompt loop can produce internally. */
 type InternalStopReason = StopReason;
 
@@ -265,7 +272,7 @@ export class GlmAcpAgent implements Agent {
   private _visionClient: VisionMcpClient | null;
   private visionClientExplicit: boolean;
   private readonly mcpConnector: NonNullable<GlmAcpAgentOptions["mcpConnector"]>;
-  private readonly pendingSetups = new Set<Promise<SessionMcpTools>>();
+  private readonly pendingSetups = new Set<PendingMcpSetup>();
   private readonly processSupervisor = new ProcessSupervisor();
   private shuttingDown = false;
   private shutdownPromise: Promise<void> | null = null;
@@ -395,7 +402,8 @@ export class GlmAcpAgent implements Agent {
     if (this.shuttingDown) throw new Error("Agent is shutting down");
     const sessionId = randomUUID();
     debug(`newSession: id=${sessionId} cwd=${params.cwd} model=${getDefaultModel()}`);
-    const mcpTools = await this.connectMcpForSession(params.mcpServers);
+    const setup = this.connectMcpForSession(params.mcpServers);
+    const mcpTools = await setup.tools;
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const systemPrompt: GlmMessage = {
@@ -432,6 +440,7 @@ export class GlmAcpAgent implements Agent {
       commands: discoverSlashCommands(params.cwd),
       displayText: new WeakMap(),
     });
+    setup.release();
 
     this.scheduleAvailableCommands(sessionId);
 
@@ -958,7 +967,7 @@ export class GlmAcpAgent implements Agent {
       const closes = sessions
         .map(([, session]) => session.closePromise)
         .filter((close): close is Promise<void> => close !== null);
-      const setups = [...this.pendingSetups];
+      const setups = [...this.pendingSetups].map((setup) => setup.dispose());
       const drained = await settlesWithin(Promise.allSettled([...prompts, ...closes, ...setups]), 4_000);
 
       for (const [sessionId, session] of sessions) {
@@ -1045,11 +1054,13 @@ export class GlmAcpAgent implements Agent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     if (this.shuttingDown) throw new Error("Agent is shutting down");
     const persisted = this.requirePersisted(params.sessionId);
-    const mcpTools = await this.connectMcpForSession(params.mcpServers);
+    const setup = this.connectMcpForSession(params.mcpServers);
+    const mcpTools = await setup.tools;
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
-    await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
+    const previous = this.sessions.get(params.sessionId);
+    if (previous) await this.disposeSessionTools(previous);
     if (this.shuttingDown) {
-      await mcpTools.dispose();
+      await setup.dispose();
       throw new Error("Agent is shutting down");
     }
     const restoredMessages = rebuildRestoredMessages(
@@ -1084,6 +1095,7 @@ export class GlmAcpAgent implements Agent {
       ),
     };
     this.sessions.set(params.sessionId, restored);
+    setup.release();
 
     // Replay user/assistant text turns so the client can rehydrate its UI.
     // Tool / system messages are skipped — they're internal and the client
@@ -1115,7 +1127,8 @@ export class GlmAcpAgent implements Agent {
     const persisted = source
       ? this.snapshot(params.sessionId, source)
       : this.requirePersisted(params.sessionId);
-    const mcpTools = await this.connectMcpForSession(params.mcpServers ?? []);
+    const setup = this.connectMcpForSession(params.mcpServers ?? []);
+    const mcpTools = await setup.tools;
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const newSessionId = randomUUID();
@@ -1153,6 +1166,7 @@ export class GlmAcpAgent implements Agent {
       ),
     };
     this.sessions.set(newSessionId, forked);
+    setup.release();
     this.persistSession(newSessionId, forked);
 
     // Notify on the *created* session id — the parent thread's command list is
@@ -1176,11 +1190,13 @@ export class GlmAcpAgent implements Agent {
   ): Promise<ResumeSessionResponse> {
     if (this.shuttingDown) throw new Error("Agent is shutting down");
     const persisted = this.requirePersisted(params.sessionId);
-    const mcpTools = await this.connectMcpForSession(params.mcpServers ?? []);
+    const setup = this.connectMcpForSession(params.mcpServers ?? []);
+    const mcpTools = await setup.tools;
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
-    await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
+    const previous = this.sessions.get(params.sessionId);
+    if (previous) await this.disposeSessionTools(previous);
     if (this.shuttingDown) {
-      await mcpTools.dispose();
+      await setup.dispose();
       throw new Error("Agent is shutting down");
     }
     const restoredMessages = rebuildRestoredMessages(
@@ -1213,6 +1229,7 @@ export class GlmAcpAgent implements Agent {
       ),
     };
     this.sessions.set(params.sessionId, restored);
+    setup.release();
 
     this.scheduleAvailableCommands(params.sessionId);
 
@@ -1233,23 +1250,34 @@ export class GlmAcpAgent implements Agent {
   // Persistence helpers
   // ---------------------------------------------------------------------------
 
-  /** Track MCP setup until it either installs into a session or is disposed. */
+  /** Track MCP setup until it installs into a session or shutdown disposes it. */
   private connectMcpForSession(
     servers: Parameters<typeof connectSessionMcpServers>[0]
-  ): Promise<SessionMcpTools> {
-    if (this.shuttingDown) return Promise.reject(new Error("Agent is shutting down"));
-    const setup = this.mcpConnector(servers).then(async (mcpTools) => {
-      if (this.shuttingDown) {
-        await mcpTools.dispose();
-        throw new Error("Agent is shutting down");
+  ): PendingMcpSetup {
+    let disposePromise: Promise<void> | null = null;
+    const source = Promise.resolve().then(() => this.mcpConnector(servers));
+    const dispose = (): Promise<void> => {
+      if (!disposePromise) {
+        disposePromise = source.then(
+          (mcpTools) => mcpTools.dispose(),
+          () => undefined
+        );
       }
-      return mcpTools;
-    });
+      return disposePromise;
+    };
+    const setup: PendingMcpSetup = {
+      tools: source.then(async (mcpTools) => {
+        if (this.shuttingDown) {
+          await dispose();
+          throw new Error("Agent is shutting down");
+        }
+        return mcpTools;
+      }),
+      release: () => this.pendingSetups.delete(setup),
+      dispose,
+    };
     this.pendingSetups.add(setup);
-    void setup.then(
-      () => this.pendingSetups.delete(setup),
-      () => this.pendingSetups.delete(setup)
-    );
+    void source.catch(() => setup.release());
     return setup;
   }
 

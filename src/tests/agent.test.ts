@@ -886,6 +886,64 @@ test("shutdown joins an in-progress close instead of disposing its MCP tools twi
   assert.equal(disposals, 1);
 });
 
+for (const [name, restore] of [
+  ["loadSession", (agent: GlmAcpAgent, sessionId: string) => agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] })],
+  ["resumeSession", (agent: GlmAcpAgent, sessionId: string) => agent.resumeSession({ sessionId, cwd: "/tmp", mcpServers: [] })],
+] as const) {
+  test(`shutdown retains a provisional MCP client while ${name} disposes its replaced client`, async () => {
+    const { store, cleanup } = makeTempStore();
+    let releaseOldDispose!: () => void;
+    const oldDisposeReleased = new Promise<void>((resolve) => { releaseOldDispose = resolve; });
+    let oldDisposeStarted!: () => void;
+    const oldDisposeStartedPromise = new Promise<void>((resolve) => { oldDisposeStarted = resolve; });
+    let oldDisposals = 0;
+    let replacementDisposals = 0;
+    const oldTools = {
+      async dispose() {
+        oldDisposals += 1;
+        oldDisposeStarted();
+        await oldDisposeReleased;
+      },
+    };
+    const replacementTools = { async dispose() { replacementDisposals += 1; } };
+    let connections = 0;
+    const agent = new GlmAcpAgent(createConnectionStub() as never, {
+      sessionStore: store,
+      mcpConnector: async () => (++connections === 1 ? oldTools : replacementTools) as never,
+    });
+    const sessionId = "11111111-1111-1111-1111-111111111111";
+    try {
+      store.save({
+        sessionId,
+        cwd: "/tmp",
+        messages: [{ role: "system", content: "you are a coding assistant" }],
+        title: null,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        model: "glm-5.1",
+        mode: "default",
+      });
+      await agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+
+      const restoring = restore(agent, sessionId);
+      await oldDisposeStartedPromise;
+      const stopping = agent.shutdown("disconnect");
+      let shutdownFinished = false;
+      void stopping.then(() => { shutdownFinished = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(shutdownFinished, false, "shutdown must wait for the replacement MCP cleanup");
+
+      releaseOldDispose();
+      await assert.rejects(restoring, /shutting down/);
+      await stopping;
+      assert.equal(oldDisposals, 1);
+      assert.equal(replacementDisposals, 1);
+    } finally {
+      releaseOldDispose?.();
+      cleanup();
+    }
+  });
+}
+
 test("authenticate is a no-op", async () => {
   const conn = createConnectionStub();
   const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
