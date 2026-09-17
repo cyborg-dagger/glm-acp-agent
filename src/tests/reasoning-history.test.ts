@@ -77,10 +77,15 @@ test("session store rejects non-string reasoning and preserves valid empty reaso
   const store = new SessionStore(cwd);
   try {
     for (const value of [null, 42, {}, [], "", "unchanged\n思考"]) {
-      store.save({ sessionId: "shape", cwd, model: "glm-5.3", mode: "default", title: null,
+      const record = { sessionId: "shape", cwd, model: "glm-5.3", mode: "default" as const, title: null,
         updatedAt: new Date().toISOString(), messages: [
           { role: "assistant", content: "answer", reasoning_content: value } as GlmMessage,
-        ] });
+        ] };
+      if (typeof value === "string") store.save(record);
+      else {
+        assert.throws(() => store.save(record), /invalid persisted/i);
+        writeFileSync(join(cwd, "shape.json"), JSON.stringify(record));
+      }
       assert.equal(store.load("shape") !== undefined, typeof value === "string");
     }
   } finally { rmSync(cwd, { recursive: true, force: true }); }
