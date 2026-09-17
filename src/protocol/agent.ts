@@ -1198,11 +1198,34 @@ export class GlmAcpAgent implements Agent {
       (todos) => this.sessionTodos.set(sessionId, todos)
     );
 
-    let lastUsage: Usage | undefined;
+    let totalUsage: Usage | undefined;
     let overflowRetryCount = 0;
 
+    const addUsage = (usage: Usage | undefined): void => {
+      if (!usage) return;
+      if (!totalUsage) {
+        totalUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+      }
+      totalUsage.inputTokens += usage.inputTokens;
+      totalUsage.outputTokens += usage.outputTokens;
+      totalUsage.totalTokens += usage.totalTokens;
+      for (const key of ["cachedReadTokens", "cachedWriteTokens", "thoughtTokens"] as const) {
+        const value = usage[key];
+        if (typeof value !== "number") continue;
+        totalUsage[key] = (totalUsage[key] ?? 0) + value;
+      }
+    };
+
+    const cancelledToolResult = (toolCallId: string): void => {
+      session.messages.push({
+        role: "tool",
+        tool_call_id: toolCallId,
+        content: "Tool call cancelled before execution.",
+      });
+    };
+
     for (let turn = 0; turn < this.maxTurns; turn++) {
-      if (signal.aborted) return { stopReason: "cancelled" };
+      if (signal.aborted) return { stopReason: "cancelled", usage: totalUsage };
 
       // Proactive compaction: check if history exceeds 90% of context window.
       const window = getContextWindow(session.model);
@@ -1221,6 +1244,14 @@ export class GlmAcpAgent implements Agent {
 
       let assistantText = "";
       let lastStopReason: string | undefined;
+      let turnUsage: Usage | undefined;
+      let usageCommitted = false;
+      let cancelledDuringStream = false;
+      const commitTurnUsage = (): void => {
+        if (usageCommitted) return;
+        usageCommitted = true;
+        addUsage(turnUsage);
+      };
 
       let retryTurn = false;
       try {
@@ -1231,7 +1262,10 @@ export class GlmAcpAgent implements Agent {
           tools: session.toolDefinitions,
           reasoningEffort: session.thoughtLevel,
         })) {
-          if (signal.aborted) return { stopReason: "cancelled" };
+          if (signal.aborted) {
+            cancelledDuringStream = true;
+            break;
+          }
 
           if (chunk.thinking && this.streamThinking) {
             await this.connection.sessionUpdate({
@@ -1260,7 +1294,9 @@ export class GlmAcpAgent implements Agent {
           }
 
           if (chunk.usage) {
-            lastUsage = chunk.usage;
+            // A streamed response can repeat its final usage snapshot. Keep
+            // the last snapshot for this model call and merge it once below.
+            turnUsage = chunk.usage;
           }
 
           if (chunk.done) {
@@ -1268,14 +1304,17 @@ export class GlmAcpAgent implements Agent {
           }
         }
       } catch (err) {
-        if (signal.aborted) return { stopReason: "cancelled" };
+        commitTurnUsage();
+        if (signal.aborted) {
+          cancelledDuringStream = true;
+        }
 
         const body = (err as { error?: { code?: string | number } })?.error;
         const isOverflow =
           body?.code === ERR_CONTEXT_OVERFLOW ||
           body?.code === String(ERR_CONTEXT_OVERFLOW);
 
-        if (isOverflow && overflowRetryCount < 1) {
+        if (!cancelledDuringStream && isOverflow && overflowRetryCount < 1) {
           debug(`promptLoop: context overflow (1261) detected, performing emergency compaction`);
           const window = getContextWindow(session.model);
           session.messages = compactMessages(session.messages, Math.floor(window * 0.7), {
@@ -1283,9 +1322,9 @@ export class GlmAcpAgent implements Agent {
           });
           overflowRetryCount++;
           retryTurn = true;
-        } else if (isOverflow) {
+        } else if (!cancelledDuringStream && isOverflow) {
           throw new Error("Context overflow persisted after emergency compaction", { cause: err });
-        } else {
+        } else if (!cancelledDuringStream) {
           throw err;
         }
       }
@@ -1294,6 +1333,8 @@ export class GlmAcpAgent implements Agent {
         turn--; // Re-run the same turn index
         continue;
       }
+
+      commitTurnUsage();
 
       // Record the assistant turn in history so the model has full context for
       // the next iteration.
@@ -1311,16 +1352,34 @@ export class GlmAcpAgent implements Agent {
         session.messages.push({ role: "assistant", content: assistantText });
       }
 
+      if (cancelledDuringStream || signal.aborted) {
+        for (const tc of toolCalls) cancelledToolResult(tc.id);
+        return { stopReason: "cancelled", usage: totalUsage };
+      }
+
       // No tool calls => model is done.
       if (toolCalls.length === 0) {
-        return { stopReason: this.mapStopReason(lastStopReason), usage: lastUsage };
+        return { stopReason: this.mapStopReason(lastStopReason), usage: totalUsage };
       }
 
       // Execute tool calls in declaration order and feed each result back.
+      let cancellationObserved = false;
       for (const tc of toolCalls) {
-        if (signal.aborted) return { stopReason: "cancelled", usage: lastUsage };
+        if (signal.aborted) {
+          cancelledToolResult(tc.id);
+          cancellationObserved = true;
+          continue;
+        }
 
-        const result = await executor.execute(tc.id, tc.name, tc.arguments);
+        let result: { content: string };
+        try {
+          result = await executor.execute(tc.id, tc.name, tc.arguments);
+        } catch (err) {
+          if (!signal.aborted) throw err;
+          cancelledToolResult(tc.id);
+          cancellationObserved = true;
+          continue;
+        }
         debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} contentLength=${result.content.length}`);
 
         session.messages.push({
@@ -1328,6 +1387,11 @@ export class GlmAcpAgent implements Agent {
           tool_call_id: tc.id,
           content: result.content,
         });
+        if (signal.aborted) cancellationObserved = true;
+      }
+
+      if (cancellationObserved || signal.aborted) {
+        return { stopReason: "cancelled", usage: totalUsage };
       }
 
       // Loop and continue – GLM expects a follow-up completion now that it has
@@ -1346,7 +1410,7 @@ export class GlmAcpAgent implements Agent {
         },
       },
     });
-    return { stopReason: "max_turn_requests", usage: lastUsage };
+    return { stopReason: "max_turn_requests", usage: totalUsage };
   }
 
   private mapStopReason(stopReason: string | undefined): InternalStopReason {

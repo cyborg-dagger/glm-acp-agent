@@ -171,7 +171,7 @@ export class ToolExecutor {
     });
 
     try {
-      const full = await readFile(absolutePath, "utf8");
+      const full = await this.performRead(absolutePath);
       const lines = full.split("\n");
       // split() turns a trailing newline into a phantom empty last line; drop
       // it so the reported line count matches what an editor shows.
@@ -338,9 +338,17 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Write cancelled by user." };
     }
+    if (permissionResult.type === "aborted") {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Write cancelled by turn." };
+    }
     if (permissionResult.type === "reject") {
       await this.markFailed(toolCallId, "Rejected by user.");
       return { content: "Write rejected by user." };
+    }
+    if (this.signal?.aborted) {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Write cancelled by turn." };
     }
 
     // Step 3: move to in_progress and execute.
@@ -354,6 +362,10 @@ export class ToolExecutor {
     });
 
     try {
+      if (this.signal?.aborted) {
+        await this.markFailed(toolCallId, "Cancelled by turn.");
+        return { content: "Write cancelled by turn." };
+      }
       await this.performWrite(absolutePath, content);
 
       await this.connection.sessionUpdate({
@@ -389,7 +401,7 @@ export class ToolExecutor {
   }
 
   /**
-   * Mirror of performWrite for reads, used by edit_file: when the client
+   * Mirror of performWrite for reads, used by read_file and edit_file: when the client
    * advertises BOTH `fs.readTextFile` and `fs.writeTextFile`, read through the
    * client so the edit is computed against the same contents the user sees (a
    * dirty editor buffer). Reading a client buffer we cannot write back would
@@ -482,9 +494,17 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Edit cancelled by user." };
     }
+    if (permissionResult.type === "aborted") {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Edit cancelled by turn." };
+    }
     if (permissionResult.type === "reject") {
       await this.markFailed(toolCallId, "Rejected by user.");
       return { content: "Edit rejected by user." };
+    }
+    if (this.signal?.aborted) {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Edit cancelled by turn." };
     }
 
     // The permission prompt can sit in front of the user for a while; re-read
@@ -520,7 +540,11 @@ export class ToolExecutor {
     });
 
     try {
-      await this.performWrite(absolutePath, latest.replace(oldText, newText));
+      if (this.signal?.aborted) {
+        await this.markFailed(toolCallId, "Cancelled by turn.");
+        return { content: "Edit cancelled by turn." };
+      }
+      await this.performWrite(absolutePath, latest.replace(oldText, () => newText));
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -649,6 +673,10 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Command cancelled by user." };
     }
+    if (permissionResult.type === "aborted") {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Command cancelled by turn." };
+    }
     if (permissionResult.type === "reject") {
       await this.markFailed(toolCallId, "Rejected by user.");
       return { content: "Command rejected by user." };
@@ -669,6 +697,11 @@ export class ToolExecutor {
         status: "in_progress",
       },
     });
+
+    if (this.signal?.aborted) {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Command cancelled by turn." };
+    }
 
     try {
       const { stdout, stderr, exitCode, signal } = await runShellCommand(
@@ -942,9 +975,14 @@ export class ToolExecutor {
     | { type: "allow" }
     | { type: "reject" }
     | { type: "cancelled" }
+    | { type: "aborted" }
     | { type: "error"; message: string }
   > {
     const mode = this.getMode();
+
+    if (this.signal?.aborted) {
+      return { type: "aborted" };
+    }
 
     // bypass_permissions: allow everything without prompting
     if (mode === "bypass_permissions") {
@@ -958,7 +996,7 @@ export class ToolExecutor {
 
     // default mode (or accept_edits with execute): prompt for permission
     try {
-      const permissionResponse = await this.connection.requestPermission({
+      const permissionPromise = this.connection.requestPermission({
         sessionId: this.sessionId,
         toolCall: {
           toolCallId: args.toolCallId,
@@ -977,21 +1015,48 @@ export class ToolExecutor {
         ],
       });
 
-      if (permissionResponse.outcome.outcome === "cancelled") {
-        return { type: "cancelled" };
+      if (!this.signal) {
+        return this.permissionOutcome(await permissionPromise);
       }
-      if (
-        permissionResponse.outcome.outcome === "selected" &&
-        permissionResponse.outcome.optionId === "reject"
-      ) {
-        return { type: "reject" };
+
+      let abortHandler: (() => void) | undefined;
+      const abortPromise = new Promise<"aborted">((resolve) => {
+        abortHandler = () => resolve("aborted");
+        this.signal!.addEventListener("abort", abortHandler, { once: true });
+        if (this.signal!.aborted) abortHandler();
+      });
+      try {
+        const outcome = await Promise.race([
+          permissionPromise.then((response) => ({ kind: "response" as const, response })),
+          abortPromise.then(() => ({ kind: "aborted" as const })),
+        ]);
+        if (outcome.kind === "aborted") {
+          return { type: "aborted" };
+        }
+        return this.permissionOutcome(outcome.response);
+      } finally {
+        if (abortHandler) this.signal.removeEventListener("abort", abortHandler);
       }
-      return { type: "allow" };
     } catch (err) {
       // Transport failure: return error so caller can handle appropriately
       const message = err instanceof Error ? err.message : String(err);
       return { type: "error", message };
     }
+  }
+
+  private permissionOutcome(permissionResponse: {
+    outcome: { outcome: string; optionId?: string };
+  }): { type: "allow" } | { type: "reject" } | { type: "cancelled" } {
+    if (permissionResponse.outcome.outcome === "cancelled") {
+      return { type: "cancelled" };
+    }
+    if (
+      permissionResponse.outcome.outcome === "selected" &&
+      permissionResponse.outcome.optionId === "reject"
+    ) {
+      return { type: "reject" };
+    }
+    return { type: "allow" };
   }
 
   /** Mark an in-progress tool call as failed. */
@@ -1155,9 +1220,12 @@ function runShellCommand(
   signal?: AbortSignal
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null; signal: NodeJS.Signals | null }> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("The operation was aborted"));
+      return;
+    }
     const child = spawn("sh", ["-c", command], {
       cwd,
-      signal,
       // Run the shell in its own process group so that background processes
       // (nohup, disown, &) survive after the main sh -c exits and don't
       // receive signals aimed at this agent. The child must stay ref'd: while
@@ -1172,12 +1240,43 @@ function runShellCommand(
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let settled = false;
+    let abortRequested = false;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+
+    const onAbort = () => {
+      if (settled) return;
+      abortRequested = true;
+      terminateProcessTree(child);
+      // A process can ignore SIGTERM. Escalate after a short grace period so
+      // an aborted tool cannot keep the prompt turn alive indefinitely. The
+      // guard below keeps the SIGKILL from ever landing on a process group
+      // the OS has recycled for unrelated work.
+      forceKillTimer = setTimeout(() => {
+        if (!isProcessGroupAlive(child.pid)) return;
+        terminateProcessTree(child, true);
+      }, 250);
+    };
+    const cleanup = () => {
+      if (forceKillTimer) {
+        // Keep escalation armed only while the detached group may still hold
+        // SIGTERM-resistant descendants; once the group is gone the delayed
+        // SIGKILL must never fire (stale process-group ID).
+        if (!abortRequested || !isProcessGroupAlive(child.pid)) {
+          clearTimeout(forceKillTimer);
+        }
+      }
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
 
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
+      cleanup();
       reject(err);
     });
     child.on("exit", () => {
@@ -1195,6 +1294,7 @@ function runShellCommand(
     child.on("close", (exitCode, closeSignal) => {
       if (settled) return;
       settled = true;
+      cleanup();
       resolve({
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
@@ -1203,6 +1303,57 @@ function runShellCommand(
       });
     });
   });
+}
+
+export function isProcessGroupAlive(pid: number | undefined): boolean {
+  if (!pid) return false;
+  if (process.platform === "win32") {
+    // No POSIX process groups here: keep the previous behavior of leaving the
+    // escalation timer armed (taskkill on a dead pid fails harmlessly).
+    return true;
+  }
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    // ESRCH: the process group no longer exists. EPERM: it exists but is owned
+    // by another user — still alive, so leave escalation armed.
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function terminateProcessTree(child: ReturnType<typeof spawn>, force = false): void {
+  if (!child.pid) return;
+  const signal: NodeJS.Signals = force ? "SIGKILL" : "SIGTERM";
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    killer.on("error", () => {
+      try {
+        child.kill(signal);
+      } catch {
+        /* already exited */
+      }
+    });
+    killer.unref();
+    return;
+  }
+
+  try {
+    // detached=true makes the shell the process-group leader. A negative PID
+    // targets the whole group, including foreground descendants.
+    process.kill(-child.pid, signal);
+  } catch {
+    // The shell may have exited between the abort event and this call. Fall
+    // back to the direct child so the cancellation still settles promptly.
+    try {
+      child.kill(signal);
+    } catch {
+      /* already exited */
+    }
+  }
 }
 
 function formatCommandOutput(result: {
