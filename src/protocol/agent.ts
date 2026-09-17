@@ -1036,32 +1036,31 @@ export class GlmAcpAgent implements Agent {
     params: ForkSessionRequest
   ): Promise<ForkSessionResponse> {
     const source = this.sessions.get(params.sessionId);
-    if (!source) {
-      const persisted = this.requirePersisted(params.sessionId);
-      const mcpTools = await this.connectMcpServers(params.mcpServers ?? []);
-      return this.createFork(params, persisted, mcpTools);
-    }
-
     const record = this.transitions.get(params.sessionId)
-      ?? this.registerTransition(params.sessionId, source.lifecycle);
+      ?? this.registerTransition(params.sessionId, source?.lifecycle ?? new SessionLifecycle());
     const lifecycle = record.lifecycle;
     const lease = lifecycle.begin("snapshotting");
-    record.original = source;
+    record.original = source ?? null;
     let deferLeaseRelease = false;
     const transition = Promise.resolve().then(async (): Promise<ForkSessionResponse> => {
       let provisional: SessionMcpTools | null = null;
       try {
-        source.abortController?.abort();
-        const drained = await this.drainPrompt(source);
-        if (!drained) {
-          deferLeaseRelease = true;
-          this.releaseAfterPromptDrain(source, lifecycle, lease, record);
-          throw new Error(`Session fork timed out waiting for prompt cleanup: ${lease.generation}`);
+        if (source) {
+          source.abortController?.abort();
+          const { drained, pending } = await this.drainPrompt(source);
+          if (!drained) {
+            deferLeaseRelease = true;
+            this.releaseAfterPromptDrain(pending, source, lifecycle, lease, record);
+            throw new Error(`Session fork timed out waiting for prompt cleanup: ${lease.generation}`);
+          }
         }
         if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
           throw new Error(`Session fork cancelled: ${params.sessionId}`);
         }
-        const persisted = this.snapshot(params.sessionId, source);
+        const persisted = source
+          ? this.snapshot(params.sessionId, source)
+          : this.requirePersisted(params.sessionId);
+        assertSettledToolHistory(persisted.messages);
         provisional = await this.connectMcpServers(params.mcpServers ?? []);
         if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
           throw new Error(`Session fork cancelled: ${params.sessionId}`);
@@ -1079,7 +1078,7 @@ export class GlmAcpAgent implements Agent {
       return await transition;
     } finally {
       if (record.promise === transition) record.promise = null;
-      if (!deferLeaseRelease && record.original === source) record.original = null;
+      if (!deferLeaseRelease && record.original === (source ?? null)) record.original = null;
     }
   }
 
@@ -2148,6 +2147,34 @@ function estimateTokens(messages: GlmMessage[]): number {
  * is sacred — it carries the live user message, and a request without it is not
  * a retry of anything.
  */
+/** Reject a fork source whose assistant/tool suffix is not provider-ready. */
+function assertSettledToolHistory(messages: readonly GlmMessage[]): void {
+  let pending: Set<string> | null = null;
+  for (const message of messages) {
+    if (pending) {
+      if (message.role !== "tool" || !pending.has(message.tool_call_id)) {
+        throw new Error(`Cannot fork session: missing tool result for ${[...pending].join(", ")}`);
+      }
+      pending.delete(message.tool_call_id);
+      if (pending.size === 0) pending = null;
+      continue;
+    }
+    if (message.role === "tool") {
+      throw new Error(`Cannot fork session: orphan tool result ${message.tool_call_id}`);
+    }
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      const ids = message.tool_calls.map((call) => call.id);
+      if (new Set(ids).size !== ids.length) {
+        throw new Error("Cannot fork session: duplicate tool call ids");
+      }
+      pending = new Set(ids);
+    }
+  }
+  if (pending) {
+    throw new Error(`Cannot fork session: missing tool result for ${[...pending].join(", ")}`);
+  }
+}
+
 function compactMessages(
   messages: GlmMessage[],
   targetTokens: number,

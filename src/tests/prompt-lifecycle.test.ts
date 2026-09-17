@@ -981,6 +981,75 @@ test("a timed-out fork creates no child resources and reopens after the prompt d
   }
 });
 
+test("an unloaded fork cannot race a restore of the same persisted session", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-unloaded-race-"));
+  const store = new SessionStore(storeRoot);
+  let restoreSetupStarted!: () => void;
+  const restoreSetupReady = new Promise<void>((resolve) => { restoreSetupStarted = resolve; });
+  let releaseRestoreSetup!: () => void;
+  const restoreSetupDone = new Promise<void>((resolve) => { releaseRestoreSetup = resolve; });
+  let connections = 0;
+  const agent = new GlmAcpAgent(conn as never, {
+    glm: textGlm(),
+    sessionStore: store,
+    connectSessionMcpServers: async () => {
+      connections += 1;
+      if (connections === 2) {
+        restoreSetupStarted();
+        await restoreSetupDone;
+      }
+      return new SessionMcpTools([]);
+    },
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    await agent.closeSession({ sessionId });
+    const resume = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await restoreSetupReady;
+    await assert.rejects(
+      agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] }),
+      /transition in progress/i,
+    );
+    releaseRestoreSetup();
+    await resume;
+  } finally {
+    releaseRestoreSetup();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("fork rejects persisted history with an unmatched assistant tool call", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-invalid-history-"));
+  const store = new SessionStore(storeRoot);
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  store.save({
+    sessionId,
+    cwd: tmpdir(),
+    messages: [
+      { role: "system", content: "rules" },
+      { role: "user", content: "read" },
+      { role: "assistant", content: null, tool_calls: [
+        { id: "missing-result", type: "function", function: { name: "read_file", arguments: "{}" } },
+      ] },
+    ],
+    title: null,
+    updatedAt: new Date().toISOString(),
+    model: "glm-4.7",
+    mode: "default",
+  });
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+  try {
+    await assert.rejects(
+      agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] }),
+      /missing tool result.*missing-result/i,
+    );
+  } finally {
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
 test("restore completes a streamed tool batch with cancelled tool results", async () => {
   const conn = connection();
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-tool-batch-"));
