@@ -1,5 +1,11 @@
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { remapArguments, resolveToolName, type DiscoveredTool } from "./mcp-arg-remap.js";
+import {
+  collectToolPages,
+  DEFAULT_MCP_MAX_PAGES,
+  DEFAULT_MCP_MAX_SCHEMA_BYTES,
+  DEFAULT_MCP_MAX_TOOLS,
+} from "./mcp-pagination.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_INITIALIZATION_TIMEOUT_MS = 30_000;
@@ -11,7 +17,7 @@ export interface VisionMcpClient {
   dispose(): Promise<void>;
 }
 
-interface StdioVisionMcpClientOptions {
+export interface StdioVisionMcpClientOptions {
   apiKey: string;
   /** Override the package spec for tests/pinning. Defaults to `@z_ai/mcp-server@latest`. */
   packageSpec?: string;
@@ -19,6 +25,9 @@ interface StdioVisionMcpClientOptions {
   initializationTimeoutMs?: number;
   /** Maximum time for an individual Vision MCP request. */
   requestTimeoutMs?: number;
+  maxPages?: number;
+  maxTools?: number;
+  maxSchemaBytes?: number;
   /** Platform override for tests. */
   platform?: NodeJS.Platform;
   /** Windows command interpreter override for tests. */
@@ -89,16 +98,30 @@ export class StdioVisionMcpClient implements VisionMcpClient {
   }
 
   private async rediscoverTools(signal?: AbortSignal, timeoutMs?: number): Promise<void> {
-    const result = await this.request("tools/list", {}, "Vision MCP tools/list", signal, timeoutMs) as
-      | { tools?: { name: string; inputSchema?: { properties?: Record<string, unknown> } }[] }
-      | undefined;
-    const tools = result?.tools ?? [];
-    if (tools.length > 0) {
-      this.discoveredTools = tools.map((t) => ({
-        name: t.name,
-        properties: t.inputSchema?.properties ? Object.keys(t.inputSchema.properties) : [],
-      }));
-    }
+    const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+    const rawTools = await collectToolPages({
+      signal: signal ?? new AbortController().signal,
+      maxPages: this.opts.maxPages ?? DEFAULT_MCP_MAX_PAGES,
+      maxTools: this.opts.maxTools ?? DEFAULT_MCP_MAX_TOOLS,
+      maxSchemaBytes: this.opts.maxSchemaBytes ?? DEFAULT_MCP_MAX_SCHEMA_BYTES,
+      requestPage: async (cursor, pageSignal) => {
+        const remaining = deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
+        const result = await this.request(
+          "tools/list",
+          cursor === undefined ? {} : { cursor },
+          "Vision MCP tools/list",
+          pageSignal,
+          remaining,
+        );
+        return parseToolPage(result);
+      },
+    });
+    const tools = rawTools.map((tool) => ({
+      name: tool.name,
+      properties: tool.inputSchema?.properties ? Object.keys(tool.inputSchema.properties) : [],
+    }));
+    assertUniqueToolNames(tools);
+    this.discoveredTools = tools;
   }
 
   async dispose(): Promise<void> {
@@ -368,6 +391,39 @@ function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, m
 
 function isSafeNpmPackageSpec(packageSpec: string): boolean {
   return /^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+(?:@[a-z0-9._-]+)?$/i.test(packageSpec);
+}
+
+interface RawVisionTool {
+  name: string;
+  inputSchema?: { properties?: Record<string, unknown> };
+  [key: string]: unknown;
+}
+
+function parseToolPage(result: unknown): { tools: RawVisionTool[]; nextCursor?: string | null } {
+  if (!result || typeof result !== "object") return { tools: [] };
+  const record = result as Record<string, unknown>;
+  const tools = Array.isArray(record.tools)
+    ? record.tools.filter((tool): tool is RawVisionTool =>
+        Boolean(tool) && typeof tool === "object" && typeof (tool as Record<string, unknown>).name === "string"
+      )
+    : [];
+  const nextCursor = record.nextCursor;
+  return {
+    tools,
+    nextCursor: nextCursor === undefined || nextCursor === null || typeof nextCursor === "string"
+      ? nextCursor
+      : nextCursor as never,
+  };
+}
+
+function assertUniqueToolNames(tools: DiscoveredTool[]): void {
+  const seen = new Set<string>();
+  for (const tool of tools) {
+    if (seen.has(tool.name)) {
+      throw new Error(`Vision MCP returned duplicate tool name "${tool.name}"`);
+    }
+    seen.add(tool.name);
+  }
 }
 
 function isVisionRetryableError(error: unknown): boolean {

@@ -1,6 +1,12 @@
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { McpServer, McpServerHttp, McpServerStdio } from "@agentclientprotocol/sdk";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "./definitions.js";
+import {
+  collectToolPages,
+  DEFAULT_MCP_MAX_PAGES,
+  DEFAULT_MCP_MAX_SCHEMA_BYTES,
+  DEFAULT_MCP_MAX_TOOLS,
+} from "./mcp-pagination.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 /** Generous: a cold `npx -y` fetch on Windows Defender can take well over a minute. */
@@ -40,23 +46,26 @@ interface McpTool {
   inputSchema?: Record<string, unknown>;
 }
 
-interface ToolBinding {
+export interface ToolBinding {
   exposedName: string;
   sourceName: string;
   client: ConnectedMcpClient;
   definition: ToolDefinition;
 }
 
-interface ConnectedMcpClient {
-  listTools(): Promise<McpTool[]>;
+export interface ConnectedMcpClient {
+  listTools(signal?: AbortSignal): Promise<McpTool[]>;
   callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown>;
   dispose(): Promise<void>;
 }
 
 export class SessionMcpTools {
   private bindings = new Map<string, ToolBinding>();
+  private clients: Set<ConnectedMcpClient>;
+  private disposePromise: Promise<void> | null = null;
 
-  constructor(bindings: ToolBinding[]) {
+  constructor(bindings: ToolBinding[], clients: ConnectedMcpClient[]) {
+    this.clients = new Set(clients);
     for (const binding of bindings) {
       this.bindings.set(binding.exposedName, binding);
     }
@@ -85,9 +94,15 @@ export class SessionMcpTools {
   }
 
   async dispose(): Promise<void> {
-    const clients = new Set(Array.from(this.bindings.values()).map((binding) => binding.client));
-    await Promise.all(Array.from(clients).map((client) => client.dispose().catch(() => undefined)));
-    this.bindings.clear();
+    if (!this.disposePromise) {
+      this.disposePromise = (async () => {
+        const clients = Array.from(this.clients);
+        await Promise.all(clients.map((client) => client.dispose().catch(() => undefined)));
+        this.clients.clear();
+        this.bindings.clear();
+      })();
+    }
+    await this.disposePromise;
   }
 }
 
@@ -103,6 +118,7 @@ export async function connectSessionMcpServers(
       const client = createClient(server);
       clients.push(client);
       const tools = await client.listTools();
+      assertUniqueSourceNames(tools, server.name);
       for (const tool of tools) {
         const exposedName = chooseToolName(tool.name, server.name, usedNames);
         usedNames.add(exposedName);
@@ -126,7 +142,7 @@ export async function connectSessionMcpServers(
     throw err;
   }
 
-  return new SessionMcpTools(bindings);
+  return new SessionMcpTools(bindings, clients);
 }
 
 function createClient(server: McpServer): ConnectedMcpClient {
@@ -143,13 +159,28 @@ class HttpMcpClient implements ConnectedMcpClient {
   private nextId = 1;
   private initialized: Promise<void> | null = null;
   private mcpSessionId: string | undefined;
+  private activeRequests = new Set<AbortController>();
+  private disposed = false;
 
   constructor(private server: McpServerHttp & { type: "http" }) {}
 
-  async listTools(): Promise<McpTool[]> {
+  async listTools(signal?: AbortSignal): Promise<McpTool[]> {
     await this.ensureInitialized();
-    const result = await this.request("tools/list", {}, "tools/list");
-    return extractTools(result);
+    return collectToolPages({
+      signal: signal ?? new AbortController().signal,
+      maxPages: DEFAULT_MCP_MAX_PAGES,
+      maxTools: DEFAULT_MCP_MAX_TOOLS,
+      maxSchemaBytes: DEFAULT_MCP_MAX_SCHEMA_BYTES,
+      requestPage: async (cursor, pageSignal) => {
+        const result = await this.request(
+          "tools/list",
+          cursor === undefined ? {} : { cursor },
+          "tools/list",
+          pageSignal,
+        );
+        return extractToolPage(result);
+      },
+    });
   }
 
   async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
@@ -158,11 +189,36 @@ class HttpMcpClient implements ConnectedMcpClient {
   }
 
   async dispose(): Promise<void> {
+    const sessionId = this.mcpSessionId;
+    this.disposed = true;
+    for (const controller of this.activeRequests) controller.abort();
     this.initialized = null;
     this.mcpSessionId = undefined;
+    if (!sessionId) return;
+
+    const controller = new AbortController();
+    let resolveTimeout: (() => void) | undefined;
+    const timeout = new Promise<void>((resolve) => { resolveTimeout = resolve; });
+    const timer = setTimeout(() => {
+      controller.abort();
+      resolveTimeout?.();
+    }, 1_000);
+    try {
+      const request = fetch(this.server.url, {
+        method: "DELETE",
+        headers: this.headers("DELETE", undefined, sessionId),
+        signal: controller.signal,
+      }).catch(() => undefined);
+      await Promise.race([request, timeout]);
+    } catch {
+      // A server may not support DELETE, and shutdown must remain bounded.
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async ensureInitialized(): Promise<void> {
+    if (this.disposed) throw new Error(`MCP ${this.server.name} client disposed`);
     if (this.initialized) return this.initialized;
     this.initialized = this.initialize();
     try {
@@ -218,7 +274,7 @@ class HttpMcpClient implements ConnectedMcpClient {
   }
 
   private async sendNotification(body: JsonRpcRequest): Promise<void> {
-    const response = await fetch(this.server.url, {
+    const response = await this.fetchWithLifecycle({
       method: "POST",
       headers: this.headers("notifications/initialized"),
       body: JSON.stringify(body),
@@ -235,12 +291,11 @@ class HttpMcpClient implements ConnectedMcpClient {
     signal?: AbortSignal,
     mcpName?: string
   ): Promise<{ body: JsonRpcResponse; sessionId?: string }> {
-    const response = await fetch(this.server.url, {
+    const response = await this.fetchWithLifecycle({
       method: "POST",
       headers: this.headers(mcpMethod, mcpName),
       body: JSON.stringify(body),
-      signal,
-    });
+    }, signal);
     const text = await response.text();
     if (!response.ok) {
       throw new Error(`MCP ${this.server.name} ${stage} failed: HTTP ${response.status}: ${text}`);
@@ -255,7 +310,21 @@ class HttpMcpClient implements ConnectedMcpClient {
     };
   }
 
-  private headers(mcpMethod: string, mcpName?: string): Headers {
+  private async fetchWithLifecycle(init: RequestInit, signal?: AbortSignal): Promise<Response> {
+    const controller = new AbortController();
+    this.activeRequests.add(controller);
+    const onAbort = () => controller.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) controller.abort();
+    try {
+      return await fetch(this.server.url, { ...init, signal: controller.signal });
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+      this.activeRequests.delete(controller);
+    }
+  }
+
+  private headers(mcpMethod: string, mcpName?: string, sessionId = this.mcpSessionId): Headers {
     const headers = new Headers();
     for (const header of this.server.headers) {
       headers.set(header.name, header.value);
@@ -264,7 +333,7 @@ class HttpMcpClient implements ConnectedMcpClient {
     headers.set("Content-Type", "application/json");
     headers.set("MCP-Protocol-Version", MCP_PROTOCOL_VERSION);
     headers.set("Mcp-Method", mcpMethod);
-    if (this.mcpSessionId) headers.set("MCP-Session-Id", this.mcpSessionId);
+    if (sessionId) headers.set("MCP-Session-Id", sessionId);
     if (mcpName) headers.set("Mcp-Name", mcpName);
     return headers;
   }
@@ -320,11 +389,24 @@ export class StdioMcpClient implements ConnectedMcpClient {
     this.killProcessTree = opts.killProcessTree ?? taskkillTree;
   }
 
-  async listTools(): Promise<McpTool[]> {
+  async listTools(signal?: AbortSignal): Promise<McpTool[]> {
     // Counted as an initialization waiter too, so a concurrent callTool abort cannot
     // tear down the handshake this call is still waiting on.
-    await this.awaitInitialization();
-    return extractTools(await this.request("tools/list", {}, "tools/list"));
+    await this.awaitInitialization(signal);
+    return collectToolPages({
+      signal: signal ?? new AbortController().signal,
+      maxPages: DEFAULT_MCP_MAX_PAGES,
+      maxTools: DEFAULT_MCP_MAX_TOOLS,
+      maxSchemaBytes: DEFAULT_MCP_MAX_SCHEMA_BYTES,
+      requestPage: async (cursor, pageSignal) => extractToolPage(
+        await this.request(
+          "tools/list",
+          cursor === undefined ? {} : { cursor },
+          "tools/list",
+          pageSignal,
+        )
+      ),
+    });
   }
 
   async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
@@ -693,17 +775,32 @@ function buildStdioEnv(server: McpServerStdio): NodeJS.ProcessEnv {
   return env;
 }
 
-function extractTools(result: unknown): McpTool[] {
-  if (!isRecord(result)) return [];
+function extractToolPage(result: unknown): { tools: McpTool[]; nextCursor?: string | null } {
+  if (!isRecord(result)) return { tools: [] };
   const tools = result["tools"];
-  if (!Array.isArray(tools)) return [];
-  return tools
+  const nextCursor = result["nextCursor"];
+  return {
+    tools: Array.isArray(tools) ? tools
     .filter((tool): tool is Record<string, unknown> => isRecord(tool) && typeof tool["name"] === "string")
     .map((tool) => ({
       name: tool["name"] as string,
       description: typeof tool["description"] === "string" ? tool["description"] : undefined,
       inputSchema: isRecord(tool["inputSchema"]) ? tool["inputSchema"] : undefined,
-    }));
+    })) : [],
+    nextCursor: nextCursor === null || nextCursor === undefined || typeof nextCursor === "string"
+      ? nextCursor
+      : nextCursor as never,
+  };
+}
+
+function assertUniqueSourceNames(tools: McpTool[], serverName: string): void {
+  const names = new Set<string>();
+  for (const tool of tools) {
+    if (names.has(tool.name)) {
+      throw new Error(`MCP server "${serverName}" returned duplicate tool name "${tool.name}"`);
+    }
+    names.add(tool.name);
+  }
 }
 
 function chooseToolName(sourceName: string, serverName: string, usedNames: Set<string>): string {

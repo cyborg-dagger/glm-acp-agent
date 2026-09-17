@@ -3,7 +3,13 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { McpServerStdio } from "@agentclientprotocol/sdk";
-import { StdioMcpClient } from "../tools/session-mcp-client.js";
+import {
+  SessionMcpTools,
+  StdioMcpClient,
+  type ConnectedMcpClient,
+  type ToolBinding,
+  connectSessionMcpServers,
+} from "../tools/session-mcp-client.js";
 
 interface FakeChild extends EventEmitter {
   stdin: Writable;
@@ -88,6 +94,94 @@ test("StdioMcpClient rejects an asynchronous spawn error instead of hanging", as
 
   await assert.rejects(listPromise, /could not launch `npx`/i);
   await client.dispose();
+});
+
+test("StdioMcpClient collects every tools/list page and forwards the opaque cursor", async () => {
+  const { child, written, pushStdout } = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+  const listPromise = client.listTools();
+
+  await new Promise((r) => setImmediate(r));
+  const init = JSON.parse(written[0]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: init.id, result: {} }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const firstList = JSON.parse(written[2]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({
+    jsonrpc: "2.0",
+    id: firstList.id,
+    result: { tools: [{ name: "first" }], nextCursor: "opaque/std-2" },
+  }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const secondList = JSON.parse(written[3]?.trim() ?? "{}") as { id: number; params: { cursor: string } };
+  assert.equal(secondList.params.cursor, "opaque/std-2");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: secondList.id, result: { tools: [{ name: "second" }] } }) + "\n");
+
+  assert.deepEqual((await listPromise).map((tool) => tool.name), ["first", "second"]);
+  const secondCall = client.callTool("second", {});
+  await new Promise((r) => setImmediate(r));
+  const secondCallBody = JSON.parse(written[4]?.trim() ?? "{}") as { id: number; params: { name: string } };
+  assert.equal(secondCallBody.params.name, "second");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: secondCallBody.id, result: { content: [{ type: "text", text: "ok" }] } }) + "\n");
+  await secondCall;
+  await client.dispose();
+});
+
+test("SessionMcpTools owns and disposes zero-tool clients exactly once", async () => {
+  let disposeCount = 0;
+  const client: ConnectedMcpClient = {
+    listTools: async () => [],
+    callTool: async () => undefined,
+    dispose: async () => { disposeCount += 1; },
+  };
+  const tools = new SessionMcpTools([] as ToolBinding[], [client, client]);
+  await Promise.all([tools.dispose(), tools.dispose()]);
+  assert.equal(disposeCount, 1);
+});
+
+test("HTTP MCP discovery collects a second page with its opaque cursor", async () => {
+  const savedFetch = globalThis.fetch;
+  const calls: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    calls.push(body);
+    if (body.method === "initialize") {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: {} }), {
+        headers: { "Content-Type": "application/json", "MCP-Session-Id": "session-http" },
+      });
+    }
+    if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (body.method === "tools/list" && calls.filter((entry) => entry.method === "tools/list").length === 1) {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "first" }], nextCursor: "opaque/http-2" } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (body.method === "tools/list") {
+      assert.deepEqual(body.params, { cursor: "opaque/http-2" });
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "second" }] } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (body.method === "tools/call") {
+      assert.equal((body.params as { name: string }).name, "second");
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { content: [{ type: "text", text: "ok" }] } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    throw new Error(`unexpected method ${String(body.method)}`);
+  }) as typeof fetch;
+  try {
+    const tools = await connectSessionMcpServers([{
+      type: "http",
+      name: "http",
+      url: "https://mcp.example.test",
+      headers: [],
+    }]);
+    assert.deepEqual(tools.toolNames, ["first", "second"]);
+    await tools.callTool("second", {});
+    await tools.dispose();
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
 });
 
 test("StdioMcpClient rejects a pending tools/call when the child errors asynchronously", async () => {
