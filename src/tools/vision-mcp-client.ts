@@ -2,6 +2,7 @@ import { spawn as nodeSpawn, spawnSync as nodeSpawnSync, type ChildProcessWithou
 import { remapArguments, resolveToolName, type DiscoveredTool } from "./mcp-arg-remap.js";
 import {
   collectToolPages,
+  assertValidToolPage,
   DEFAULT_MCP_MAX_PAGES,
   DEFAULT_MCP_MAX_SCHEMA_BYTES,
   DEFAULT_MCP_MAX_TOOLS,
@@ -400,7 +401,7 @@ interface RawVisionTool {
 }
 
 function parseToolPage(result: unknown): { tools: RawVisionTool[]; nextCursor?: string | null } {
-  if (!result || typeof result !== "object") return { tools: [] };
+  assertValidToolPage(result);
   const record = result as Record<string, unknown>;
   const tools = Array.isArray(record.tools)
     ? record.tools.filter((tool): tool is RawVisionTool =>

@@ -69,6 +69,24 @@ function stdioServer(overrides: Partial<McpServerStdio> = {}): McpServerStdio {
 
 const tick = () => new Promise((r) => setImmediate(r));
 
+test("HTTP discovery rejects malformed later pages rather than exposing a partial catalog", async () => {
+  const savedFetch = globalThis.fetch;
+  try {
+    for (const invalid of [null, { tools: {} }, { tools: [null] }, { tools: [{ name: 42 }] }]) {
+      let pages = 0;
+      globalThis.fetch = (async (_url, init) => {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+        const result = body.method === "tools/list"
+          ? (++pages === 1 ? { tools: [{ name: "first" }], nextCursor: "next" } : invalid)
+          : {};
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), { headers: { "Content-Type": "application/json" } });
+      }) as typeof fetch;
+      await assert.rejects(connectSessionMcpServers([{ type: "http", name: "fixture", url: "https://fixture.invalid", headers: [] }]), /malformed.*tools\/list/i);
+    }
+  } finally { globalThis.fetch = savedFetch; }
+});
+
 for (const operation of ["cancel", "dispose"]) {
   test(`HTTP ${operation} still aborts after response headers while body is pending`, async () => {
     const originalFetch = globalThis.fetch;

@@ -5,7 +5,21 @@ export interface ToolPage<T> {
 
 export const DEFAULT_MCP_MAX_PAGES = 100;
 export const DEFAULT_MCP_MAX_TOOLS = 1_000;
-export const DEFAULT_MCP_MAX_SCHEMA_BYTES = 5 * 1024 * 1024;
+export const DEFAULT_MCP_MAX_SCHEMA_BYTES = 4 * 1024 * 1024;
+
+/** Reject a malformed page before adapters can turn it into an empty catalog. */
+export function assertValidToolPage(result: unknown): asserts result is Record<string, unknown> & { tools: unknown[] } {
+  if (!result || typeof result !== "object" || Array.isArray(result) ||
+      !("tools" in result) || !Array.isArray(result.tools)) {
+    throw new Error("Malformed MCP tools/list result: tools must be an array.");
+  }
+  for (const tool of result.tools) {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool) ||
+        !("name" in tool) || typeof tool.name !== "string" || !tool.name.trim()) {
+      throw new Error("Malformed MCP tools/list result: each tool needs a nonempty name.");
+    }
+  }
+}
 
 export interface CollectToolPagesOptions<T> {
   requestPage: (cursor: string | undefined, signal: AbortSignal) => Promise<ToolPage<T>>;
@@ -57,7 +71,7 @@ export async function collectToolPages<T>(options: CollectToolPagesOptions<T>): 
       throw new Error("MCP tools/list returned a malformed cursor: nextCursor must be a string or null");
     }
     if (seenCursors.has(nextCursor)) {
-      throw new Error(`MCP tools/list cursor cycle detected for cursor ${JSON.stringify(nextCursor)}`);
+      throw new Error("MCP tools/list cursor cycle detected.");
     }
     seenCursors.add(nextCursor);
     cursor = nextCursor;

@@ -3,6 +3,7 @@ import type { McpServer, McpServerHttp, McpServerStdio } from "@agentclientproto
 import { TOOL_DEFINITIONS, type ToolDefinition } from "./definitions.js";
 import {
   collectToolPages,
+  assertValidToolPage,
   DEFAULT_MCP_MAX_PAGES,
   DEFAULT_MCP_MAX_SCHEMA_BYTES,
   DEFAULT_MCP_MAX_TOOLS,
@@ -784,7 +785,7 @@ function buildStdioEnv(server: McpServerStdio): NodeJS.ProcessEnv {
 }
 
 function extractToolPage(result: unknown): { tools: McpTool[]; nextCursor?: string | null } {
-  if (!isRecord(result)) return { tools: [] };
+  assertValidToolPage(result);
   const tools = result["tools"];
   const nextCursor = result["nextCursor"];
   return {
