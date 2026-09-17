@@ -53,6 +53,7 @@ import {
   type ThoughtLevel,
 } from "../llm/glm-client.js";
 import { ToolExecutor, type TodoItem } from "../tools/executor.js";
+import { ProcessSupervisor } from "../tools/process-supervisor.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
@@ -259,6 +260,9 @@ export class GlmAcpAgent implements Agent {
   private sessionStore: SessionStore | null;
   private _visionClient: VisionMcpClient | null;
   private visionClientExplicit: boolean;
+  private readonly processSupervisor = new ProcessSupervisor();
+  private shuttingDown = false;
+  private shutdownPromise: Promise<void> | null = null;
 
   constructor(
     private connection: AgentSideConnection,
@@ -381,6 +385,7 @@ export class GlmAcpAgent implements Agent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    if (this.shuttingDown) throw new Error("Agent is shutting down");
     const sessionId = randomUUID();
     debug(`newSession: id=${sessionId} cwd=${params.cwd} model=${getDefaultModel()}`);
     const mcpTools = await connectSessionMcpServers(params.mcpServers);
@@ -922,6 +927,56 @@ export class GlmAcpAgent implements Agent {
     return closePromise;
   }
 
+  /**
+   * Stop admitting work and release all resources owned by this ACP runtime.
+   * Concurrent close/signal paths share one promise so disposals and process
+   * signals happen once.
+   */
+  shutdown(_reason: "disconnect" | "sigterm" | "sigint" | "fatal"): Promise<void> {
+    void _reason;
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shuttingDown = true;
+    this.shutdownPromise = (async () => {
+      const sessions = [...this.sessions.entries()];
+      for (const [, session] of sessions) {
+        session.closing = true;
+        session.abortController?.abort();
+      }
+
+      await this.processSupervisor.terminateAll();
+      const prompts = sessions
+        .map(([, session]) => session.promptPromise)
+        .filter((prompt): prompt is Promise<void> => prompt !== null);
+      const drained = await settlesWithin(Promise.allSettled(prompts), 4_000);
+
+      for (const [sessionId, session] of sessions) {
+        session.closed = true;
+        this.persistSession(sessionId, session);
+      }
+      await Promise.allSettled(sessions.map(([, session]) => session.mcpTools?.dispose()));
+      this.sessions.clear();
+      this.sessionTodos.clear();
+      await this._visionClient?.dispose();
+
+      if (this.processSupervisor.hasActiveProcesses()) {
+        await this.processSupervisor.forceTerminateAll();
+      }
+      if (this.processSupervisor.hasActiveProcesses()) {
+        throw new Error("Agent shutdown left active command processes");
+      }
+      if (!drained) throw new Error("Agent shutdown timed out waiting for prompt cleanup");
+    })();
+    return this.shutdownPromise;
+  }
+
+  /** Used by the CLI deadline path before reporting a nonzero exit. */
+  async forceShutdown(): Promise<void> {
+    await this.processSupervisor.forceTerminateAll();
+    if (this.processSupervisor.hasActiveProcesses()) {
+      throw new Error("Agent shutdown left active command processes");
+    }
+  }
+
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
     // Merge in-memory sessions with anything previously persisted to disk. The
     // store is the source of truth for closed/restarted sessions; in-memory
@@ -1262,7 +1317,8 @@ export class GlmAcpAgent implements Agent {
       session.cwd,
       // Use a thunk so mode changes mid-turn take effect on the next tool call.
       () => this.sessions.get(sessionId)?.mode ?? "default",
-      (todos) => this.sessionTodos.set(sessionId, todos)
+      (todos) => this.sessionTodos.set(sessionId, todos),
+      this.processSupervisor
     );
 
     let totalUsage: Usage | undefined;
@@ -1909,6 +1965,20 @@ function estimateTokens(messages: GlmMessage[]): number {
  * is sacred — it carries the live user message, and a request without it is not
  * a retry of anything.
  */
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function compactMessages(
   messages: GlmMessage[],
   targetTokens: number,

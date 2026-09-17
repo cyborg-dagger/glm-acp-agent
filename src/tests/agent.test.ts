@@ -832,6 +832,16 @@ test("closeSession clears the session's task list", async () => {
   assert.equal(todos.has(sessionId), false);
 });
 
+test("shutdown is idempotent and stops new session admission", async () => {
+  const conn = createConnectionStub();
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
+  const first = agent.shutdown("disconnect");
+  const second = agent.shutdown("sigterm");
+  assert.strictEqual(first, second);
+  await first;
+  await assert.rejects(agent.newSession({ cwd: "/tmp", mcpServers: [] }), /shutting down/);
+});
+
 test("authenticate is a no-op", async () => {
   const conn = createConnectionStub();
   const agent = new GlmAcpAgent(conn as never, { sessionStore: null });
