@@ -762,3 +762,49 @@ test("restore suppresses late tool updates and tool history from the draining ge
     await rm(storeRoot, { recursive: true, force: true });
   }
 });
+
+test("close after swap disposes the current replacement rather than the stale original", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-close-swapped-"));
+  const store = new SessionStore(storeRoot);
+  let oldDisposeStarted!: () => void;
+  const oldDisposeReady = new Promise<void>((resolve) => { oldDisposeStarted = resolve; });
+  let releaseOldDispose!: () => void;
+  const oldDisposeDone = new Promise<void>((resolve) => { releaseOldDispose = resolve; });
+  let oldDisposals = 0;
+  let replacementDisposals = 0;
+  const originalTools = new SessionMcpTools([]);
+  originalTools.dispose = async () => {
+    oldDisposals += 1;
+    oldDisposeStarted();
+    await oldDisposeDone;
+  };
+  const replacementTools = new SessionMcpTools([]);
+  replacementTools.dispose = async () => { replacementDisposals += 1; };
+  let connections = 0;
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: store,
+    connectSessionMcpServers: async () => {
+      connections += 1;
+      return connections === 1 ? originalTools : replacementTools;
+    },
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const resume = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await oldDisposeReady;
+    const close = agent.closeSession({ sessionId });
+    releaseOldDispose();
+    await assert.rejects(resume, /cancelled/i);
+    await close;
+    assert.equal(oldDisposals, 1);
+    assert.equal(replacementDisposals, 1);
+    await assert.rejects(
+      agent.prompt({ sessionId, prompt: [{ type: "text", text: "late" }] }),
+      /Session not found/i,
+    );
+  } finally {
+    releaseOldDispose();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
