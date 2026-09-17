@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/index.js";
+import type { ChatCompletionAssistantMessageParam, ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/index.js";
 import type { ModelInfo, Usage } from "@agentclientprotocol/sdk";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { resolveApiKey } from "./credentials.js";
@@ -121,7 +121,8 @@ export function resolveThoughtLevel(model: string, level: ThoughtLevel): Thought
 /**
  * A single message in the GLM conversation history.
  */
-export type GlmMessage = ChatCompletionMessageParam;
+export type GlmAssistantMessage = ChatCompletionAssistantMessageParam & { reasoning_content?: string };
+export type GlmMessage = Exclude<ChatCompletionMessageParam, ChatCompletionAssistantMessageParam> | GlmAssistantMessage;
 
 /**
  * A streamed chunk from the GLM API.
