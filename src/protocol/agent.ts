@@ -403,8 +403,9 @@ export class GlmAcpAgent implements Agent {
     const sessionId = randomUUID();
     debug(`newSession: id=${sessionId} cwd=${params.cwd} model=${getDefaultModel()}`);
     const setup = this.connectMcpForSession(params.mcpServers);
-    const mcpTools = await setup.tools;
-    const toolDefinitions = this.availableToolDefinitions(mcpTools);
+    try {
+      const mcpTools = await setup.tools;
+      const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const systemPrompt: GlmMessage = {
       role: "system",
@@ -421,7 +422,7 @@ export class GlmAcpAgent implements Agent {
     // default (thinking on, no explicit reasoning_effort).
     const thoughtLevel = resolveThoughtLevel(model, "max");
 
-    this.sessions.set(sessionId, {
+      this.sessions.set(sessionId, {
       cwd: params.cwd,
       messages: [systemPrompt],
       abortController: null,
@@ -439,17 +440,22 @@ export class GlmAcpAgent implements Agent {
       thoughtLevel,
       commands: discoverSlashCommands(params.cwd),
       displayText: new WeakMap(),
-    });
-    setup.release();
+      });
 
-    this.scheduleAvailableCommands(sessionId);
+      this.scheduleAvailableCommands(sessionId);
 
-    return {
-      sessionId,
-      models: this.modelsState(model),
-      modes: this.modesState("default"),
-      configOptions: this.configOptionsState(model, thoughtLevel, "default"),
-    };
+      return {
+        sessionId,
+        models: this.modelsState(model),
+        modes: this.modesState("default"),
+        configOptions: this.configOptionsState(model, thoughtLevel, "default"),
+      };
+    } catch (error) {
+      await setup.dispose();
+      throw error;
+    } finally {
+      setup.release();
+    }
   }
 
   /**
@@ -1055,15 +1061,14 @@ export class GlmAcpAgent implements Agent {
     if (this.shuttingDown) throw new Error("Agent is shutting down");
     const persisted = this.requirePersisted(params.sessionId);
     const setup = this.connectMcpForSession(params.mcpServers);
-    const mcpTools = await setup.tools;
-    const toolDefinitions = this.availableToolDefinitions(mcpTools);
-    const previous = this.sessions.get(params.sessionId);
-    if (previous) await this.disposeSessionTools(previous);
-    if (this.shuttingDown) {
-      await setup.dispose();
-      throw new Error("Agent is shutting down");
-    }
-    const restoredMessages = rebuildRestoredMessages(
+    let installed: SessionState | null = null;
+    try {
+      const mcpTools = await setup.tools;
+      const toolDefinitions = this.availableToolDefinitions(mcpTools);
+      const previous = this.sessions.get(params.sessionId);
+      if (previous) await this.disposeSessionTools(previous);
+      if (this.shuttingDown) throw new Error("Agent is shutting down");
+      const restoredMessages = rebuildRestoredMessages(
       persisted.messages,
       params.cwd,
       toolDefinitions
@@ -1071,7 +1076,7 @@ export class GlmAcpAgent implements Agent {
 
     // Restore in-memory state. We do NOT carry over the abortController /
     // promptPromise — those are transient.
-    const restored: SessionState = {
+      const restored: SessionState = {
       cwd: params.cwd,
       messages: restoredMessages,
       abortController: null,
@@ -1093,22 +1098,22 @@ export class GlmAcpAgent implements Agent {
         restoredMessages,
         persisted.displayText
       ),
-    };
-    this.sessions.set(params.sessionId, restored);
-    setup.release();
+      };
+      this.sessions.set(params.sessionId, restored);
+      installed = restored;
 
     // Replay user/assistant text turns so the client can rehydrate its UI.
     // Tool / system messages are skipped — they're internal and the client
     // doesn't render them on its own.
-    await this.replayMessages(
+      await this.replayMessages(
       params.sessionId,
       restoredMessages,
       restored.displayText
     );
 
-    this.scheduleAvailableCommands(params.sessionId);
+      this.scheduleAvailableCommands(params.sessionId);
 
-    return {
+      return {
       models: this.modelsState(persisted.model),
       modes: this.modesState(persisted.mode),
       configOptions: this.configOptionsState(
@@ -1116,7 +1121,18 @@ export class GlmAcpAgent implements Agent {
         restored.thoughtLevel,
         restored.mode
       ),
-    };
+      };
+    } catch (error) {
+      if (installed) {
+        if (this.sessions.get(params.sessionId) === installed) this.sessions.delete(params.sessionId);
+        await this.disposeSessionTools(installed);
+      } else {
+        await setup.dispose();
+      }
+      throw error;
+    } finally {
+      setup.release();
+    }
   }
 
   async unstable_forkSession(
@@ -1128,10 +1144,13 @@ export class GlmAcpAgent implements Agent {
       ? this.snapshot(params.sessionId, source)
       : this.requirePersisted(params.sessionId);
     const setup = this.connectMcpForSession(params.mcpServers ?? []);
-    const mcpTools = await setup.tools;
-    const toolDefinitions = this.availableToolDefinitions(mcpTools);
+    let installed: SessionState | null = null;
+    let newSessionId: string | null = null;
+    try {
+      const mcpTools = await setup.tools;
+      const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
-    const newSessionId = randomUUID();
+      newSessionId = randomUUID();
     const forkedTitle =
       persisted.title === null ? null : `${persisted.title} (fork)`;
     const forkedMessages = rebuildRestoredMessages(
@@ -1165,15 +1184,15 @@ export class GlmAcpAgent implements Agent {
         persisted.displayText
       ),
     };
-    this.sessions.set(newSessionId, forked);
-    setup.release();
+      this.sessions.set(newSessionId, forked);
+      installed = forked;
     this.persistSession(newSessionId, forked);
 
     // Notify on the *created* session id — the parent thread's command list is
     // unchanged and a notify there would repaint the wrong menu.
     this.scheduleAvailableCommands(newSessionId);
 
-    return {
+      return {
       sessionId: newSessionId,
       models: this.modelsState(forked.model),
       modes: this.modesState(forked.mode),
@@ -1182,7 +1201,18 @@ export class GlmAcpAgent implements Agent {
         forked.thoughtLevel,
         forked.mode
       ),
-    };
+      };
+    } catch (error) {
+      if (installed) {
+        if (this.sessions.get(newSessionId!) === installed) this.sessions.delete(newSessionId!);
+        await this.disposeSessionTools(installed);
+      } else {
+        await setup.dispose();
+      }
+      throw error;
+    } finally {
+      setup.release();
+    }
   }
 
   async resumeSession(
@@ -1191,21 +1221,20 @@ export class GlmAcpAgent implements Agent {
     if (this.shuttingDown) throw new Error("Agent is shutting down");
     const persisted = this.requirePersisted(params.sessionId);
     const setup = this.connectMcpForSession(params.mcpServers ?? []);
-    const mcpTools = await setup.tools;
-    const toolDefinitions = this.availableToolDefinitions(mcpTools);
-    const previous = this.sessions.get(params.sessionId);
-    if (previous) await this.disposeSessionTools(previous);
-    if (this.shuttingDown) {
-      await setup.dispose();
-      throw new Error("Agent is shutting down");
-    }
-    const restoredMessages = rebuildRestoredMessages(
+    let installed: SessionState | null = null;
+    try {
+      const mcpTools = await setup.tools;
+      const toolDefinitions = this.availableToolDefinitions(mcpTools);
+      const previous = this.sessions.get(params.sessionId);
+      if (previous) await this.disposeSessionTools(previous);
+      if (this.shuttingDown) throw new Error("Agent is shutting down");
+      const restoredMessages = rebuildRestoredMessages(
       persisted.messages,
       params.cwd,
       toolDefinitions
     );
 
-    const restored: SessionState = {
+      const restored: SessionState = {
       cwd: params.cwd,
       messages: restoredMessages,
       abortController: null,
@@ -1227,15 +1256,15 @@ export class GlmAcpAgent implements Agent {
         restoredMessages,
         persisted.displayText
       ),
-    };
-    this.sessions.set(params.sessionId, restored);
-    setup.release();
+      };
+      this.sessions.set(params.sessionId, restored);
+      installed = restored;
 
-    this.scheduleAvailableCommands(params.sessionId);
+      this.scheduleAvailableCommands(params.sessionId);
 
     // Resume does NOT replay history — the client keeps its own UI state and
     // just wants the agent to pick up where it left off.
-    return {
+      return {
       models: this.modelsState(persisted.model),
       modes: this.modesState(persisted.mode),
       configOptions: this.configOptionsState(
@@ -1243,7 +1272,18 @@ export class GlmAcpAgent implements Agent {
         restored.thoughtLevel,
         restored.mode
       ),
-    };
+      };
+    } catch (error) {
+      if (installed) {
+        if (this.sessions.get(params.sessionId) === installed) this.sessions.delete(params.sessionId);
+        await this.disposeSessionTools(installed);
+      } else {
+        await setup.dispose();
+      }
+      throw error;
+    } finally {
+      setup.release();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1261,7 +1301,7 @@ export class GlmAcpAgent implements Agent {
         disposePromise = source.then(
           (mcpTools) => mcpTools.dispose(),
           () => undefined
-        );
+        ).finally(() => setup.release());
       }
       return disposePromise;
     };

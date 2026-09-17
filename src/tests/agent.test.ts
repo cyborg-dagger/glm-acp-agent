@@ -858,6 +858,52 @@ test("shutdown disposes a provisional MCP setup that completes after admission c
   await assert.rejects(creating, /shutting down/);
   await stopping;
   assert.equal(disposals, 1);
+  assert.equal((agent as unknown as { pendingSetups: Set<unknown> }).pendingSetups.size, 0);
+});
+
+test("newSession disposes and releases MCP setup when post-connect construction fails", async () => {
+  let disposals = 0;
+  const tools = {
+    get toolDefinitions(): never { throw new Error("tool definitions failed"); },
+    async dispose() { disposals += 1; },
+  };
+  const agent = new GlmAcpAgent(createConnectionStub() as never, {
+    sessionStore: null,
+    mcpConnector: async () => tools as never,
+  });
+
+  await assert.rejects(agent.newSession({ cwd: "/tmp", mcpServers: [] }), /tool definitions failed/);
+  assert.equal(disposals, 1);
+  assert.equal((agent as unknown as { pendingSetups: Set<unknown> }).pendingSetups.size, 0);
+});
+
+test("loadSession disposes its replacement MCP client when replay fails", async () => {
+  const { store, cleanup } = makeTempStore();
+  let disposals = 0;
+  const tools = { async dispose() { disposals += 1; } };
+  const conn = createConnectionStub();
+  conn.sessionUpdate = async () => { throw new Error("replay failed"); };
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: store,
+    mcpConnector: async () => tools as never,
+  });
+  const sessionId = "22222222-2222-2222-2222-222222222222";
+  try {
+    store.save({
+      sessionId,
+      cwd: "/tmp",
+      messages: [{ role: "system", content: "you are a coding assistant" }, { role: "user", content: "ping" }],
+      title: null,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      model: "glm-5.1",
+      mode: "default",
+    });
+    await assert.rejects(agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] }), /replay failed/);
+    assert.equal(disposals, 1);
+    assert.equal((agent as unknown as { pendingSetups: Set<unknown> }).pendingSetups.size, 0);
+  } finally {
+    cleanup();
+  }
 });
 
 test("shutdown joins an in-progress close instead of disposing its MCP tools twice", async () => {
