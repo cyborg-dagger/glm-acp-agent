@@ -129,7 +129,7 @@ as prose, so typing a slash by accident never fails the turn.
 
 ## Prerequisites
 
-- **Node.js** 20 or later (native `fetch` and Web Streams required)
+- **Node.js** 20.19.0+, 22.13.0+, or 24+ (native `fetch` and Web Streams required)
 - **npm** 9 or later
 - A **Z.AI API key** — obtain one at <https://z.ai/manage-apikey/apikey-list>
 
@@ -181,6 +181,8 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
 | `ACP_GLM_MAX_TOKENS` | No | `32768` | Cap on `max_tokens` for each completion |
 | `ACP_GLM_MAX_TURNS` | No | `100` | Max model/tool turns per prompt (also settable via `--max-turns`) |
+| `ACP_GLM_COMMAND_TIMEOUT_MS` | No | `120000` | Deadline for each `run_command`, in milliseconds. Invalid values fall back to the default with a stderr warning. |
+| `ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES` | No | `65536` | Maximum combined bytes captured from each `run_command` stdout and stderr. Further output is drained and reported as truncated. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_THINKING` | No | auto-detected | Force thinking mode `true` / `false` |
 | `ACP_GLM_STREAM_THINKING` | No | `true` | Forward reasoning tokens to the client as `agent_thought_chunk`; set `false` to keep reasoning off the wire (the model still thinks — only the client-side stream is silenced) |
 | `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |
@@ -295,7 +297,7 @@ npm run dev        # tsc --watch
 #### 1. Prerequisites
 
 - A recent build of [Zed](https://zed.dev/download) that supports the `agent_servers` setting
-- Node.js 20 or later on your `PATH` (`node --version`)
+- Node.js 20.19.0+, 22.13.0+, or 24+ on your `PATH` (`node --version`)
 - A Z.AI API key — create one at <https://z.ai/manage-apikey/apikey-list>
 
 #### 2. Install the agent

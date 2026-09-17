@@ -14,9 +14,12 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch",
-    "test": "npm run build && node --test dist/tests/*.test.js",
-    "lint": "eslint src/**",
+    "test": "npm run build && node scripts/run-tests.mjs",
+    "lint": "eslint src",
     "version": "npm run build --silent && node dist/registry/sync-manifest.js"
+  },
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24"
   },
   "keywords": [
     "acp",

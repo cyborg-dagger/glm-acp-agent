@@ -13,7 +13,10 @@ process.env["ACP_GLM_SESSION_DIR"] = mkdtempSync(
 
 // Slash-command discovery scans `~/.claude`; isolate HOME so the developer's
 // own commands can't appear in the advertised snapshot asserted on below.
-process.env["HOME"] = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-integration-home-"));
+const isolatedHome = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-integration-home-"));
+process.env["HOME"] = isolatedHome;
+// os.homedir() uses USERPROFILE on Windows, where HOME is not authoritative.
+process.env["USERPROFILE"] = isolatedHome;
 import {
   AgentSideConnection,
   ClientSideConnection,

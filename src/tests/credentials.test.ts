@@ -21,11 +21,12 @@ function withTmp<T>(fn: (dir: string) => T): T {
 
 test("credentialsPath honours XDG_CONFIG_HOME", () => {
   const old = process.env["XDG_CONFIG_HOME"];
+  const configuredRoot = join(tmpdir(), "custom", "xdg");
   try {
-    process.env["XDG_CONFIG_HOME"] = "/custom/xdg";
+    process.env["XDG_CONFIG_HOME"] = configuredRoot;
     assert.equal(
       credentialsPath(),
-      "/custom/xdg/glm-acp-agent/credentials.json"
+      join(configuredRoot, "glm-acp-agent", "credentials.json")
     );
   } finally {
     if (old === undefined) delete process.env["XDG_CONFIG_HOME"];
