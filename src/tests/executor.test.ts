@@ -392,6 +392,27 @@ test("read_file offset beyond EOF returns an EOF result without clamping or a hi
   }
 });
 
+test("read_file labels a bounded partial line without reporting an impossible range", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-partial-line-"));
+  const path = join(dir, "partial.txt");
+  writeFileSync(path, "abc\ndefgh", "utf8");
+  const conn = createConnectionStub();
+  const limits: ResourceLimits = {
+    toolResultBytes: 262_144, fileReadBytes: 5, listEntries: 2000, listBytes: 262_144,
+    fsConcurrency: 16,
+  };
+  const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir, () => "default", () => undefined, limits);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path, offset: 2, limit: 1 }));
+    assert.match(result.content, /showing complete lines none/);
+    assert.match(result.content, /line 2 is incomplete/);
+    assert.doesNotMatch(result.content, /complete lines 2-1/);
+    assert.match(result.content, /^d\n/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("read_file elides the client content channel while the tool result stays full", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-elide-content-"));
   const path = join(dir, "long.txt");

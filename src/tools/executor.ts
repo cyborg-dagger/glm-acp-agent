@@ -200,7 +200,9 @@ export class ToolExecutor {
       }
 
       let content = page.text;
-      const shown = `${page.firstLine}-${page.lastCompleteLine}`;
+      const shown = page.lastCompleteLine >= page.firstLine
+        ? `${page.firstLine}-${page.lastCompleteLine}`
+        : "none";
       if (page.incompleteLine !== undefined) {
         content += `${content ? "\n" : ""}[showing complete lines ${shown}; line ${page.incompleteLine} is incomplete because the ${this.resourceLimits.fileReadBytes}-byte scan limit was reached. Narrow the input or use an explicitly bounded command for byte-level inspection.]`;
       } else if (page.truncated) {
