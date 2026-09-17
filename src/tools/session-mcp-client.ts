@@ -274,14 +274,16 @@ class HttpMcpClient implements ConnectedMcpClient {
   }
 
   private async sendNotification(body: JsonRpcRequest): Promise<void> {
-    const response = await this.fetchWithLifecycle({
+    await this.fetchWithLifecycle({
       method: "POST",
       headers: this.headers("notifications/initialized"),
       body: JSON.stringify(body),
+    }, async response => {
+      if (!response.ok) {
+        throw new Error(`MCP ${this.server.name} notifications/initialized failed: HTTP ${response.status}: ${await response.text()}`);
+      }
+      await response.body?.cancel();
     });
-    if (!response.ok) {
-      throw new Error(`MCP ${this.server.name} notifications/initialized failed: HTTP ${response.status}: ${await response.text()}`);
-    }
   }
 
   private async fetchJsonRpc(
@@ -291,33 +293,39 @@ class HttpMcpClient implements ConnectedMcpClient {
     signal?: AbortSignal,
     mcpName?: string
   ): Promise<{ body: JsonRpcResponse; sessionId?: string }> {
-    const response = await this.fetchWithLifecycle({
+    return this.fetchWithLifecycle({
       method: "POST",
       headers: this.headers(mcpMethod, mcpName),
       body: JSON.stringify(body),
+    }, async response => {
+      const text = await response.text();
+      if (!response.ok) {
+        throw new Error(`MCP ${this.server.name} ${stage} failed: HTTP ${response.status}: ${text}`);
+      }
+      const parsed = parseMcpResponse(text, response.headers.get("Content-Type") ?? "");
+      if (parsed.error) {
+        throw new Error(`MCP ${this.server.name} ${stage} failed: ${JSON.stringify(parsed.error)}`);
+      }
+      return {
+        body: parsed,
+        sessionId: response.headers.get("MCP-Session-Id") ?? undefined,
+      };
     }, signal);
-    const text = await response.text();
-    if (!response.ok) {
-      throw new Error(`MCP ${this.server.name} ${stage} failed: HTTP ${response.status}: ${text}`);
-    }
-    const parsed = parseMcpResponse(text, response.headers.get("Content-Type") ?? "");
-    if (parsed.error) {
-      throw new Error(`MCP ${this.server.name} ${stage} failed: ${JSON.stringify(parsed.error)}`);
-    }
-    return {
-      body: parsed,
-      sessionId: response.headers.get("MCP-Session-Id") ?? undefined,
-    };
   }
 
-  private async fetchWithLifecycle(init: RequestInit, signal?: AbortSignal): Promise<Response> {
+  private async fetchWithLifecycle<T>(
+    init: RequestInit, consume: (response: Response) => Promise<T>, signal?: AbortSignal,
+  ): Promise<T> {
+    if (this.disposed) throw new Error(`MCP ${this.server.name} client disposed`);
     const controller = new AbortController();
     this.activeRequests.add(controller);
     const onAbort = () => controller.abort();
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) controller.abort();
     try {
-      return await fetch(this.server.url, { ...init, signal: controller.signal });
+      const response = await fetch(this.server.url, { ...init, signal: controller.signal });
+      // Keep cancellation and disposal ownership until body consumption ends.
+      return await consume(response);
     } finally {
       signal?.removeEventListener("abort", onAbort);
       this.activeRequests.delete(controller);

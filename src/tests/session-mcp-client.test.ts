@@ -69,6 +69,54 @@ function stdioServer(overrides: Partial<McpServerStdio> = {}): McpServerStdio {
 
 const tick = () => new Promise((r) => setImmediate(r));
 
+for (const operation of ["cancel", "dispose"]) {
+  test(`HTTP ${operation} still aborts after response headers while body is pending`, async () => {
+    const originalFetch = globalThis.fetch;
+    let bodyStarted!: () => void;
+    const started = new Promise<void>(resolve => { bodyStarted = resolve; });
+    let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    globalThis.fetch = (async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      if (body.method === "tools/call") {
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            bodyController = controller;
+            init?.signal?.addEventListener("abort", () => controller.error(new Error("body aborted")), { once: true });
+            bodyStarted();
+            return new Promise<void>(() => {});
+          },
+        }, { highWaterMark: 0 }), { headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id,
+        result: body.method === "tools/list" ? { tools: [{ name: "read" }] } : {},
+      }), { headers: { "Content-Type": "application/json" } });
+    }) as typeof fetch;
+    let tools: SessionMcpTools | undefined;
+    let call: Promise<unknown> | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      tools = await connectSessionMcpServers([{ type: "http", name: "fixture", url: "https://fixture.invalid", headers: [] }]);
+      const controller = new AbortController();
+      call = tools.callTool("read", {}, controller.signal);
+      void call.catch(() => {});
+      await started;
+      if (operation === "cancel") controller.abort();
+      else await tools.dispose();
+      const watchdog = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("pending body was not interrupted")), 200);
+      });
+      await assert.rejects(Promise.race([call, watchdog]), /body aborted/);
+    } finally {
+      if (timer) clearTimeout(timer);
+      bodyController?.error(new Error("fixture cleanup"));
+      await call?.catch(() => {});
+      await tools?.dispose();
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
 /** Drive a fake child through initialize + tools/list so the client is ready for tools/call. */
 async function completeHandshake(
   written: string[],
