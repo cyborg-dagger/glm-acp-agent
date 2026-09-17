@@ -242,6 +242,8 @@ The endpoint validates `reasoning_effort` against `none | minimal | low | medium
 
 `ACP_GLM_PROMPT_IMAGES=false` still hides the image-attachment capability at session startup. With that flag set, clients should not offer image attachments at all.
 
+Switching to a text-only model is rejected while retained conversation history contains native images. Keep an image-capable model or start a text-only session with a textual description; images are never silently discarded or analyzed as part of a model switch. During an active prompt on a native-image model, wait for the turn to finish before switching to text-only capability. Other compatible selections affect subsequent model calls, while an in-flight call keeps its captured model and reasoning level. Restored histories receive the same compatibility check before a provider request.
+
 ### Vision MCP
 
 For `glm-5.3-flash` (built-in) and `glm-5v-turbo` (opt-in via `ACP_GLM_AVAILABLE_MODELS`), pasted ACP image blocks with `image/jpeg`, `image/jpg`, or `image/png` are sent directly to chat completions as `image_url` content parts. HTTPS image URLs are forwarded as URLs; inline base64 data is sent as a `data:<mime>;base64,...` URI. Unsupported image MIME types are rejected client-side with an inline `<image_unsupported_format>` annotation so the prompt can continue without a provider 4xx.

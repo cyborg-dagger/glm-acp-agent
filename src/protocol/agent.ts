@@ -56,6 +56,7 @@ import { ToolExecutor, type TodoItem } from "../tools/executor.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
+import { checkModelTransition } from "./model-transition.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import {
   discoverSlashCommands,
@@ -483,6 +484,14 @@ export class GlmAcpAgent implements Agent {
     session: SessionState,
     modelId: string
   ): Promise<void> {
+    if (session.closing || session.closed) throw new Error(`Session is closing: ${sessionId}`);
+    const compatibility = checkModelTransition(session.messages, modelId);
+    if (!compatibility.ok) throw new Error(compatibility.message);
+    // A native-image prompt may still be preprocessing and not yet appear in
+    // history. Keep its selected input capability fixed through that turn.
+    if (session.promptPromise && isVisionNativeModel(session.model) && !isVisionNativeModel(modelId)) {
+      throw new Error("Cannot switch away from an image-capable model during an active prompt. Wait for the prompt to finish and try again.");
+    }
     const available = getAvailableModels();
     const known = available.find((m) => m.modelId === modelId);
     if (!known) {
@@ -1293,6 +1302,8 @@ export class GlmAcpAgent implements Agent {
 
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal.aborted) return { stopReason: "cancelled", usage: totalUsage };
+      const compatibility = checkModelTransition(session.messages, session.model);
+      if (!compatibility.ok) throw new Error(compatibility.message);
 
       // Proactive compaction: check if history exceeds 90% of context window.
       const window = getContextWindow(session.model);
