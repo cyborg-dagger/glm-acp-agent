@@ -368,6 +368,41 @@ test("read_file treats editor line pagination as pagination, not byte truncation
     );
     assert.match(result.content, /showing lines 1-2 \(total unknown\); pass offset=3/);
     assert.doesNotMatch(result.content, /scan stopped at .*byte read limit/);
+
+    const next = await exec.execute(
+      "tc2",
+      "read_file",
+      JSON.stringify({ path, offset: 3, limit: 2 }),
+    );
+    assert.match(next.content, /^line-3\nline-4(?:\n|$)/);
+    assert.doesNotMatch(next.content, /line-1|line-2/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file paginates a legacy editor full buffer for a short offset page", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-legacy-page-"));
+  const path = join(dir, "paged.txt");
+  writeFileSync(path, "line-1\nline-2\nline-3", "utf8");
+  const updates: Array<Record<string, unknown>> = [];
+  const conn = {
+    async sessionUpdate(payload: Record<string, unknown>) { updates.push(payload); },
+    // Older ACP clients ignore both line and limit and return the full buffer.
+    async readTextFile() {
+      return { content: "line-1\nline-2\nline-3" };
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "read_file",
+      JSON.stringify({ path, offset: 2, limit: 2 }),
+    );
+    assert.match(result.content, /^line-2\nline-3\n/);
+    assert.doesNotMatch(result.content, /^line-1\n/);
+    assert.match(result.content, /showing lines 2-3 .*end of file/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

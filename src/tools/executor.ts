@@ -434,16 +434,32 @@ export class ToolExecutor {
       // ACP's line/limit form makes the editor responsible for paging. One
       // lookahead line tells us whether to advertise another request; no page
       // is misrepresented as a whole-buffer line count.
-      const response = await this.connection.readTextFile({
-        sessionId: this.sessionId, path, line: offset, limit: limit + 1,
-      } as never);
-      const lines = response.content.split("\n");
-      if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+      const readEditorLines = async (line: number, pageLimit: number): Promise<string[]> => {
+        const response = await this.connection.readTextFile({
+          sessionId: this.sessionId, path, line, limit: pageLimit,
+        } as never);
+        const lines = response.content.split("\n");
+        if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+        return lines;
+      };
+      let lines = await readEditorLines(offset, limit + 1);
+      let legacyFullBuffer = false;
+      if (offset > 1 && lines.length > 0 && lines.length <= limit + 1) {
+        // A few older ACP clients ignore line/limit and return a short full
+        // buffer. A three-line file is indistinguishable from a conforming
+        // two-line page plus lookahead, so probe line 1 with limit 1 before
+        // deciding which line numbers the response represents.
+        const probe = await readEditorLines(1, 1);
+        if (probe.length > 1) {
+          lines = probe;
+          legacyFullBuffer = true;
+        }
+      }
       // Older ACP clients ignore line/limit and return the complete buffer.
       // Retain their correct local pagination instead of treating the first
       // lines as the requested offset; conforming clients stay on the bounded
       // lookahead path below.
-      if (lines.length > limit + 1) {
+      if (legacyFullBuffer || lines.length > limit + 1) {
         const totalLines = lines.length;
         if (offset > totalLines) return { text: "", firstLine: offset, lastCompleteLine: totalLines, totalLines, truncated: false };
         const visible = lines.slice(offset - 1, offset - 1 + limit);
