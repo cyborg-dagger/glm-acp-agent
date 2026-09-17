@@ -1436,7 +1436,13 @@ export class GlmAcpAgent implements Agent {
       // Execute tool calls in declaration order and feed each result back.
       let cancellationObserved = false;
       const toolResults: GlmMessage[] = [];
+      let toolFailure: Error | undefined;
       for (const tc of toolCalls) {
+        if (toolFailure) {
+          toolResults.push({ role: "tool", tool_call_id: tc.id,
+            content: "Tool call not started because an earlier tool's outcome is unknown." });
+          continue;
+        }
         if (signal.aborted) {
           toolResults.push(cancelledToolResult(tc.id));
           cancellationObserved = true;
@@ -1446,9 +1452,12 @@ export class GlmAcpAgent implements Agent {
         let result: { content: string };
         try {
           result = await executor.execute(tc.id, tc.name, tc.arguments);
-        } catch {
+        } catch (cause) {
+          result = {
+            content: "Error: tool execution failed unexpectedly; its outcome may be unknown. Inspect the current state before repeating any side effect.",
+          };
           if (signal.aborted) {
-            toolResults.push(cancelledToolResult(tc.id));
+            toolResults.push({ role: "tool", tool_call_id: tc.id, content: result.content });
             cancellationObserved = true;
             continue;
           }
@@ -1456,9 +1465,7 @@ export class GlmAcpAgent implements Agent {
           // while publishing a client notification). Do not replay it; give
           // the model one terminal result and state that its side effect is
           // uncertain so the provider history remains structurally valid.
-          result = {
-            content: "Error: tool execution failed unexpectedly; its outcome may be unknown.",
-          };
+          toolFailure = new Error(result.content, { cause });
         }
         debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} contentLength=${result.content.length}`);
 
@@ -1471,6 +1478,7 @@ export class GlmAcpAgent implements Agent {
       }
 
       session.messages.push(assistantToolMessage!, ...toolResults);
+      if (toolFailure) throw toolFailure;
 
       if (cancellationObserved || signal.aborted) {
         return { stopReason: "cancelled", usage: totalUsage };

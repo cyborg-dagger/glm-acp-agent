@@ -361,7 +361,7 @@ test("a malformed tool argument result is paired in history before the model and
   }
 });
 
-test("an unexpected executor failure has a matching uncertain tool result before the model continues", async () => {
+test("an unexpected executor failure settles history and stops until a user follow-up", async () => {
   const conn = connection();
   const sessionUpdate = conn.sessionUpdate.bind(conn);
   let failFailedNotification = true;
@@ -390,13 +390,50 @@ test("an unexpected executor failure has a matching uncertain tool result before
   };
   const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
   const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
-  assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "write it" }] })).stopReason, "end_turn");
+  await assert.rejects(agent.prompt({ sessionId, prompt: [{ type: "text", text: "write it" }] }), /outcome.*unknown/i);
+  assert.equal(calls, 1, "unexpected failure must not automatically continue the model");
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "inspect what happened" }] });
   assert.equal(calls, 2);
-  assert.deepEqual(modelInputs[1]!.at(-1), {
-    role: "tool",
-    tool_call_id: "interrupted",
-    content: "Error: tool execution failed unexpectedly; its outcome may be unknown.",
-  });
+  const tool = modelInputs[1]!.find(message => message.tool_call_id === "interrupted");
+  assert.match(String(tool?.content), /outcome.*unknown/i);
+});
+
+test("an error after the first write stops remaining tools and records uncertain versus unstarted outcomes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "glm-tool-uncertain-"));
+  const conn = connection();
+  const update = conn.sessionUpdate.bind(conn);
+  conn.sessionUpdate = async params => {
+    const event = params["update"] as { toolCallId?: string; status?: string };
+    if (event.toolCallId === "first" && ["completed", "failed"].includes(event.status ?? "")) {
+      throw new Error("fixture notification failed after write");
+    }
+    await update(params);
+  };
+  const store = new SessionStore(join(cwd, "sessions"));
+  let calls = 0;
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: store, glm: {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      calls++;
+      for (const id of ["first", "second"]) yield { toolCall: { id, name: "write_file", arguments: JSON.stringify({ path: join(cwd, id), content: "written" }) } };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  } });
+  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+  try {
+    await agent.setSessionMode({ sessionId, modeId: "accept_edits" });
+    await assert.rejects(agent.prompt({ sessionId, prompt: [{ type: "text", text: "write both" }] }), /outcome.*unknown/i);
+    assert.equal(calls, 1);
+    assert.equal(existsSync(join(cwd, "first")), true);
+    assert.equal(existsSync(join(cwd, "second")), false);
+    await agent.closeSession({ sessionId });
+    const tools = store.load(sessionId)?.messages.filter(message => message.role === "tool");
+    assert.equal(tools?.length, 2);
+    assert.match(String(tools?.[0]?.content), /outcome.*unknown/i);
+    assert.match(String(tools?.[1]?.content), /not started/i);
+  } finally {
+    await agent.closeSession({ sessionId });
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("queued prompts form a chain so only the newest prompt can reach the model", async () => {
