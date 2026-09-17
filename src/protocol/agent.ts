@@ -1273,7 +1273,15 @@ export class GlmAcpAgent implements Agent {
 
   private isDrainingOriginal(sessionId: string, session: SessionState): boolean {
     const record = this.transitions.get(sessionId);
-    return record?.original === session && record.lifecycle.phase === "restoring";
+    if (record?.original === session && record.lifecycle.phase === "restoring") return true;
+    // A normal close aborts the prompt and waits for it before persisting. The
+    // closing generation must still finish its canonical history (without UI
+    // notifications), otherwise already-received text or an in-flight tool
+    // result disappears from the final checkpoint.
+    return this.sessions.get(sessionId) === session
+      && record?.lifecycle === session.lifecycle
+      && record.lifecycle.phase === "closing"
+      && !session.closed;
   }
 
   private ownedPromptConnection(ownsPrompt: () => boolean): AgentSideConnection {

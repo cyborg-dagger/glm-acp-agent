@@ -770,6 +770,98 @@ test("restore suppresses late tool updates while retaining an active tool result
   }
 });
 
+test("close persists assistant text received before the stream is aborted", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-close-stream-history-"));
+  const store = new SessionStore(storeRoot);
+  let partialReceived!: () => void;
+  const partialReady = new Promise<void>((resolve) => { partialReceived = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { text: "partial before close" };
+      partialReceived();
+      await blocked;
+      yield { text: "late after close" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] });
+    await partialReady;
+    const close = agent.closeSession({ sessionId });
+    release();
+    assert.equal((await prompt).stopReason, "cancelled");
+    await close;
+    const persisted = store.load(sessionId);
+    assert.ok(persisted?.messages.some(
+      (message) => message.role === "assistant" && message.content === "partial before close"
+    ));
+    assert.ok(!conn.updates.some((update) => JSON.stringify(update).includes("late after close")));
+  } finally {
+    release();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("close persists an in-flight tool result without late tool updates", async () => {
+  const updates: Array<Record<string, unknown>> = [];
+  let readStarted!: () => void;
+  const readReady = new Promise<void>((resolve) => { readStarted = resolve; });
+  let releaseRead!: () => void;
+  const readDone = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate(params: Record<string, unknown>) { updates.push(params); },
+    async readTextFile() {
+      readStarted();
+      await readDone;
+      return { content: "contents before close" };
+    },
+    async writeTextFile() {},
+    async requestPermission() {
+      return { outcome: { outcome: "selected", optionId: "allow" } };
+    },
+  };
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-close-tool-history-"));
+  const store = new SessionStore(storeRoot);
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { toolCall: { id: "read-close", name: "read_file", arguments: JSON.stringify({ path: "a.txt" }) } };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  await agent.initialize({
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+  } as never);
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read" }] });
+    await readReady;
+    const close = agent.closeSession({ sessionId });
+    releaseRead();
+    assert.equal((await prompt).stopReason, "cancelled");
+    await close;
+    const persisted = store.load(sessionId);
+    assert.ok(persisted?.messages.some(
+      (message) => message.role === "tool" && message.tool_call_id === "read-close" &&
+        message.content === "contents before close"
+    ));
+    assert.equal(updates.filter((update) => {
+      const body = update.update as { sessionUpdate?: string; toolCallId?: string };
+      return body.sessionUpdate === "tool_call_update" && body.toolCallId === "read-close";
+    }).length, 0);
+  } finally {
+    releaseRead();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
 test("restore completes a streamed tool batch with cancelled tool results", async () => {
   const conn = connection();
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-tool-batch-"));
