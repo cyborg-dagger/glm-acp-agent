@@ -8,6 +8,7 @@ import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeCredentials } from "../llm/credentials.js";
 import { ToolExecutor, isProcessGroupAlive } from "../tools/executor.js";
+import type { ResourceLimits } from "../tools/resource-limits.js";
 import type { VisionMcpClient } from "../tools/vision-mcp-client.js";
 
 interface StubTerminal {
@@ -411,6 +412,27 @@ test("read_file elides the client content channel while the tool result stays fu
     const text = completed.update.content[0]?.content.text ?? "";
     assert.match(text, /chars\]$/);
     assert.ok(text.length < 300);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file bounds a real large local result before it can enter model history", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-bounded-result-"));
+  const path = join(dir, "large.txt");
+  writeFileSync(path, "🙂".repeat(150_000), "utf8");
+  const conn = createConnectionStub();
+  const limits: ResourceLimits = {
+    toolResultBytes: 128, fileReadBytes: 8 * 1024 * 1024, listEntries: 2000, listBytes: 262_144,
+    fsConcurrency: 16, mcpTimeoutMs: 120_000, mcpBodyBytes: 262_144, mcpFrameBytes: 262_144,
+    discoveryPages: 20, discoveryTools: 500, discoverySchemaBytes: 262_144,
+  };
+  const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir, () => "default", () => undefined, limits);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    assert.ok(Buffer.byteLength(result.content, "utf8") <= limits.toolResultBytes);
+    assert.match(result.content, /bytes omitted/);
+    assert.ok(!result.content.includes("\uFFFD"));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
