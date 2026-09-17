@@ -842,6 +842,50 @@ test("shutdown is idempotent and stops new session admission", async () => {
   await assert.rejects(agent.newSession({ cwd: "/tmp", mcpServers: [] }), /shutting down/);
 });
 
+test("shutdown disposes a provisional MCP setup that completes after admission closes", async () => {
+  const conn = createConnectionStub();
+  let resolveSetup!: (tools: unknown) => void;
+  const setup = new Promise<unknown>((resolve) => { resolveSetup = resolve; });
+  let disposals = 0;
+  const tools = { async dispose() { disposals += 1; } };
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: null,
+    mcpConnector: async () => setup as never,
+  });
+  const creating = agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  const stopping = agent.shutdown("disconnect");
+  resolveSetup(tools);
+  await assert.rejects(creating, /shutting down/);
+  await stopping;
+  assert.equal(disposals, 1);
+});
+
+test("shutdown joins an in-progress close instead of disposing its MCP tools twice", async () => {
+  const conn = createConnectionStub();
+  let releaseDispose!: () => void;
+  const disposeReleased = new Promise<void>((resolve) => { releaseDispose = resolve; });
+  let resolveDisposeStarted!: () => void;
+  const disposeStarted = new Promise<void>((resolve) => { resolveDisposeStarted = resolve; });
+  let disposals = 0;
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: null,
+    mcpConnector: async () => ({
+      async dispose() {
+        disposals += 1;
+        resolveDisposeStarted();
+        await disposeReleased;
+      },
+    }) as never,
+  });
+  const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  const closing = agent.closeSession({ sessionId });
+  await disposeStarted;
+  const stopping = agent.shutdown("sigterm");
+  releaseDispose();
+  await Promise.all([closing, stopping]);
+  assert.equal(disposals, 1);
+});
+
 test("authenticate is a no-op", async () => {
   const conn = createConnectionStub();
   const agent = new GlmAcpAgent(conn as never, { sessionStore: null });

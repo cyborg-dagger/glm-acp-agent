@@ -18,6 +18,7 @@ export interface AgentRuntime {
   connection: AgentSideConnection;
   shutdown: (reason: "disconnect" | "sigterm" | "sigint" | "fatal") => Promise<void>;
   forceShutdown: () => Promise<void>;
+  closeTransport: () => void;
 }
 
 /**
@@ -43,10 +44,16 @@ export function startAgentRuntime(
   const shutdown = (reason: "disconnect" | "sigterm" | "sigint" | "fatal") =>
     agent?.shutdown(reason) ?? Promise.resolve();
   const forceShutdown = () => agent?.forceShutdown() ?? Promise.resolve();
+  const closeTransport = () => {
+    process.stdin.destroy();
+  };
 
   // There is exactly one connection-close hook. `GlmAcpAgent.shutdown` is
   // memoized, so this composes safely with a simultaneous signal handler.
-  void connection.closed.then(() => shutdown("disconnect")).catch(() => shutdown("fatal"));
+  void connection.closed.then(
+    () => { void shutdown("disconnect").catch(() => undefined); },
+    () => { void shutdown("fatal").catch(() => undefined); }
+  );
 
-  return { connection, shutdown, forceShutdown };
+  return { connection, shutdown, forceShutdown, closeTransport };
 }

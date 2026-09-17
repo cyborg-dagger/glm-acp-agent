@@ -58,6 +58,9 @@ export class ProcessSupervisor {
 class TrackedProcess implements ManagedProcess {
   private released = false;
   private termination: Promise<void> | null = null;
+  private forceTermination: Promise<void> | null = null;
+  /** On Windows, only a successful taskkill /t /f is tree-level evidence. */
+  private windowsTreeKillConfirmed = process.platform !== "win32";
   private resolveCleanup!: () => void;
   readonly cleanup = new Promise<void>((resolve) => {
     this.resolveCleanup = resolve;
@@ -77,9 +80,14 @@ class TrackedProcess implements ManagedProcess {
 
   async forceTerminate(): Promise<void> {
     if (this.released) return;
-    if (this.termination) return this.termination;
-    this.termination = this.terminateWithEscalation(true);
-    return this.termination;
+    if (this.forceTermination) return this.forceTermination;
+    const attempt = this.terminateWithEscalation(true);
+    this.forceTermination = attempt;
+    void attempt.then(
+      () => { if (this.forceTermination === attempt) this.forceTermination = null; },
+      () => { if (this.forceTermination === attempt) this.forceTermination = null; }
+    );
+    return attempt;
   }
 
   releaseAfterNormalExit(): void {
@@ -90,16 +98,20 @@ class TrackedProcess implements ManagedProcess {
   }
 
   isActive(): boolean {
-    return !this.released && isOwnedProcessAlive(this.child);
+    return !this.released && isOwnedProcessAlive(this.child, this.windowsTreeKillConfirmed);
   }
 
   private async terminateWithEscalation(force: boolean): Promise<void> {
     if (!force) {
-      await terminateOwnedProcess(this.child, false);
+      const treeKillConfirmed = await terminateOwnedProcess(this.child, false);
+      if (process.platform === "win32" && treeKillConfirmed) this.windowsTreeKillConfirmed = true;
       await delay(TERM_GRACE_MS);
     }
-    if (isOwnedProcessAlive(this.child)) await terminateOwnedProcess(this.child, true);
-    const stopped = await waitForStopped(this.child, KILL_SETTLE_MS);
+    if (isOwnedProcessAlive(this.child, this.windowsTreeKillConfirmed)) {
+      const treeKillConfirmed = await terminateOwnedProcess(this.child, true);
+      if (process.platform === "win32" && treeKillConfirmed) this.windowsTreeKillConfirmed = true;
+    }
+    const stopped = await waitForStopped(this.child, KILL_SETTLE_MS, this.windowsTreeKillConfirmed);
     if (stopped) {
       this.released = true;
       this.remove();
@@ -112,23 +124,25 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForStopped(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+async function waitForStopped(child: ChildProcess, timeoutMs: number, windowsTreeKillConfirmed: boolean): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  while (isOwnedProcessAlive(child)) {
+  while (isOwnedProcessAlive(child, windowsTreeKillConfirmed)) {
     if (Date.now() >= deadline) return false;
     await delay(PROBE_INTERVAL_MS);
   }
   return true;
 }
 
-function isOwnedProcessAlive(child: ChildProcess): boolean {
+function isOwnedProcessAlive(child: ChildProcess, windowsTreeKillConfirmed = process.platform !== "win32"): boolean {
   if (!child.pid) return false;
   if (process.platform === "win32") {
     try {
       process.kill(child.pid, 0);
       return true;
     } catch (error) {
-      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+      // A vanished root alone cannot establish that descendants are gone after
+      // a failed taskkill. Keep ownership until taskkill /t /f has succeeded.
+      return (error as NodeJS.ErrnoException).code !== "ESRCH" || !windowsTreeKillConfirmed;
     }
   }
   try {
@@ -139,12 +153,12 @@ function isOwnedProcessAlive(child: ChildProcess): boolean {
   }
 }
 
-async function terminateOwnedProcess(child: ChildProcess, force: boolean): Promise<void> {
-  if (!child.pid) return;
+async function terminateOwnedProcess(child: ChildProcess, force: boolean): Promise<boolean> {
+  if (!child.pid) return false;
   const signal: NodeJS.Signals = force ? "SIGKILL" : "SIGTERM";
   if (process.platform === "win32") {
     const killed = await taskkill(child.pid);
-    if (killed) return;
+    if (killed) return true;
   }
   try {
     if (process.platform === "win32") child.kill(signal);
@@ -156,6 +170,7 @@ async function terminateOwnedProcess(child: ChildProcess, force: boolean): Promi
       // The child exited between the liveness probe and signal delivery.
     }
   }
+  return false;
 }
 
 function taskkill(pid: number): Promise<boolean> {

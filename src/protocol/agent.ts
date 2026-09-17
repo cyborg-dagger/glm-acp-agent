@@ -153,6 +153,8 @@ interface SessionState {
   closed: boolean;
   /** De-duplicates concurrent closeSession calls. */
   closePromise: Promise<void> | null;
+  /** De-duplicates MCP cleanup between closeSession and agent shutdown. */
+  disposePromise: Promise<void> | null;
   title: string | null;
   updatedAt: string;
   /** Active model for this session (clients can change via `session/set_model`). */
@@ -215,6 +217,8 @@ export interface GlmAcpAgentOptions {
    * on first use.
    */
   visionClient?: VisionMcpClient | null;
+  /** Override session MCP setup for lifecycle tests and alternate transports. */
+  mcpConnector?: (servers: Parameters<typeof connectSessionMcpServers>[0]) => Promise<SessionMcpTools>;
 }
 
 /**
@@ -260,6 +264,8 @@ export class GlmAcpAgent implements Agent {
   private sessionStore: SessionStore | null;
   private _visionClient: VisionMcpClient | null;
   private visionClientExplicit: boolean;
+  private readonly mcpConnector: NonNullable<GlmAcpAgentOptions["mcpConnector"]>;
+  private readonly pendingSetups = new Set<Promise<SessionMcpTools>>();
   private readonly processSupervisor = new ProcessSupervisor();
   private shuttingDown = false;
   private shutdownPromise: Promise<void> | null = null;
@@ -279,6 +285,7 @@ export class GlmAcpAgent implements Agent {
         : (options.sessionStore ?? new SessionStore());
     this.visionClientExplicit = "visionClient" in options;
     this._visionClient = options.visionClient ?? null;
+    this.mcpConnector = options.mcpConnector ?? connectSessionMcpServers;
     this.streamThinking = process.env["ACP_GLM_STREAM_THINKING"]?.toLowerCase() !== "false";
   }
 
@@ -388,7 +395,7 @@ export class GlmAcpAgent implements Agent {
     if (this.shuttingDown) throw new Error("Agent is shutting down");
     const sessionId = randomUUID();
     debug(`newSession: id=${sessionId} cwd=${params.cwd} model=${getDefaultModel()}`);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers);
+    const mcpTools = await this.connectMcpForSession(params.mcpServers);
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const systemPrompt: GlmMessage = {
@@ -414,6 +421,7 @@ export class GlmAcpAgent implements Agent {
       closing: false,
       closed: false,
       closePromise: null,
+      disposePromise: null,
       title: null,
       updatedAt: new Date().toISOString(),
       model,
@@ -918,7 +926,7 @@ export class GlmAcpAgent implements Agent {
       // pick the conversation back up. closeSession only releases in-memory
       // resources; the on-disk record is intentionally retained.
       this.persistSession(params.sessionId, session);
-      await session.mcpTools?.dispose();
+      await this.disposeSessionTools(session);
       this.sessions.delete(params.sessionId);
       // Session is gone from memory; its task list must not linger in the map.
       this.sessionTodos.delete(params.sessionId);
@@ -947,13 +955,17 @@ export class GlmAcpAgent implements Agent {
       const prompts = sessions
         .map(([, session]) => session.promptPromise)
         .filter((prompt): prompt is Promise<void> => prompt !== null);
-      const drained = await settlesWithin(Promise.allSettled(prompts), 4_000);
+      const closes = sessions
+        .map(([, session]) => session.closePromise)
+        .filter((close): close is Promise<void> => close !== null);
+      const setups = [...this.pendingSetups];
+      const drained = await settlesWithin(Promise.allSettled([...prompts, ...closes, ...setups]), 4_000);
 
       for (const [sessionId, session] of sessions) {
         session.closed = true;
         this.persistSession(sessionId, session);
       }
-      await Promise.allSettled(sessions.map(([, session]) => session.mcpTools?.dispose()));
+      await Promise.allSettled(sessions.map(([, session]) => this.disposeSessionTools(session)));
       this.sessions.clear();
       this.sessionTodos.clear();
       await this._visionClient?.dispose();
@@ -1031,10 +1043,15 @@ export class GlmAcpAgent implements Agent {
   // ---------------------------------------------------------------------------
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    if (this.shuttingDown) throw new Error("Agent is shutting down");
     const persisted = this.requirePersisted(params.sessionId);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers);
+    const mcpTools = await this.connectMcpForSession(params.mcpServers);
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
     await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
+    if (this.shuttingDown) {
+      await mcpTools.dispose();
+      throw new Error("Agent is shutting down");
+    }
     const restoredMessages = rebuildRestoredMessages(
       persisted.messages,
       params.cwd,
@@ -1051,6 +1068,7 @@ export class GlmAcpAgent implements Agent {
       closing: false,
       closed: false,
       closePromise: null,
+      disposePromise: null,
       title: persisted.title,
       updatedAt: persisted.updatedAt,
       model: persisted.model,
@@ -1092,11 +1110,12 @@ export class GlmAcpAgent implements Agent {
   async unstable_forkSession(
     params: ForkSessionRequest
   ): Promise<ForkSessionResponse> {
+    if (this.shuttingDown) throw new Error("Agent is shutting down");
     const source = this.sessions.get(params.sessionId);
     const persisted = source
       ? this.snapshot(params.sessionId, source)
       : this.requirePersisted(params.sessionId);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers ?? []);
+    const mcpTools = await this.connectMcpForSession(params.mcpServers ?? []);
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const newSessionId = randomUUID();
@@ -1116,6 +1135,7 @@ export class GlmAcpAgent implements Agent {
       closing: false,
       closed: false,
       closePromise: null,
+      disposePromise: null,
       title: forkedTitle,
       updatedAt: new Date().toISOString(),
       model: persisted.model,
@@ -1154,10 +1174,15 @@ export class GlmAcpAgent implements Agent {
   async resumeSession(
     params: ResumeSessionRequest
   ): Promise<ResumeSessionResponse> {
+    if (this.shuttingDown) throw new Error("Agent is shutting down");
     const persisted = this.requirePersisted(params.sessionId);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers ?? []);
+    const mcpTools = await this.connectMcpForSession(params.mcpServers ?? []);
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
     await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
+    if (this.shuttingDown) {
+      await mcpTools.dispose();
+      throw new Error("Agent is shutting down");
+    }
     const restoredMessages = rebuildRestoredMessages(
       persisted.messages,
       params.cwd,
@@ -1172,6 +1197,7 @@ export class GlmAcpAgent implements Agent {
       closing: false,
       closed: false,
       closePromise: null,
+      disposePromise: null,
       title: persisted.title,
       updatedAt: persisted.updatedAt,
       model: persisted.model,
@@ -1206,6 +1232,33 @@ export class GlmAcpAgent implements Agent {
   // ---------------------------------------------------------------------------
   // Persistence helpers
   // ---------------------------------------------------------------------------
+
+  /** Track MCP setup until it either installs into a session or is disposed. */
+  private connectMcpForSession(
+    servers: Parameters<typeof connectSessionMcpServers>[0]
+  ): Promise<SessionMcpTools> {
+    if (this.shuttingDown) return Promise.reject(new Error("Agent is shutting down"));
+    const setup = this.mcpConnector(servers).then(async (mcpTools) => {
+      if (this.shuttingDown) {
+        await mcpTools.dispose();
+        throw new Error("Agent is shutting down");
+      }
+      return mcpTools;
+    });
+    this.pendingSetups.add(setup);
+    void setup.then(
+      () => this.pendingSetups.delete(setup),
+      () => this.pendingSetups.delete(setup)
+    );
+    return setup;
+  }
+
+  private disposeSessionTools(session: SessionState): Promise<void> {
+    if (!session.disposePromise) {
+      session.disposePromise = session.mcpTools?.dispose() ?? Promise.resolve();
+    }
+    return session.disposePromise;
+  }
 
   private snapshot(sessionId: string, session: SessionState): PersistedSession {
     const displayText = serializeDisplayText(session.messages, session.displayText);

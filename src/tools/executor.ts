@@ -1335,12 +1335,12 @@ function runShellCommand(
       managed?.releaseAfterNormalExit();
       reject(err);
     });
-    child.on("exit", () => {
+    child.on("exit", (_exitCode, exitSignal) => {
       // The shell is the command's foreground process. Once it exits normally,
       // only inherited pipes from intentionally backgrounded work may remain;
       // do not let the deadline kill that work during the short drain grace.
       clearTimeout(timeoutTimer);
-      if (!abortRequested && !timedOut) managed?.releaseAfterNormalExit();
+      if (!abortRequested && !timedOut && exitSignal === null) managed?.releaseAfterNormalExit();
       // The shell exited. Normal commands will close their streams immediately,
       // firing "close" within milliseconds. For daemons that inherit stdio and
       // keep pipes open, forcefully destroy the streams after a brief grace

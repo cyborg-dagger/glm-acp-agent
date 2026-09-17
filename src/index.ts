@@ -66,6 +66,7 @@ if (args.includes("--setup")) {
     finishing = (async () => {
       const clean = await settlesWithin(runtime.shutdown(reason), 5_000);
       if (clean) {
+        runtime.closeTransport();
         process.exitCode = successCode;
         return;
       }

@@ -50,7 +50,7 @@ async function startMockLlm(command: string) {
   return { server, baseUrl: `http://127.0.0.1:${address.port}/v1` };
 }
 
-async function runCliUntilCommand(command: string, cwd: string): Promise<{ child: ChildProcess; started: Promise<void>; close: () => void }> {
+async function runCliUntilCommand(command: string, cwd: string): Promise<{ child: ChildProcess; started: Promise<void>; close: () => void; closeServer: () => void }> {
   const { server, baseUrl } = await startMockLlm(command);
   const child = spawn(process.execPath, [AGENT_ENTRY], {
     cwd,
@@ -90,6 +90,7 @@ async function runCliUntilCommand(command: string, cwd: string): Promise<{ child
       child.stdin?.end();
       server.close();
     },
+    closeServer: () => server.close(),
   };
 }
 
@@ -117,6 +118,32 @@ test("CLI stdin close waits for SIGTERM-resistant command cleanup", { skip: proc
     await wait(900);
     assert.equal(existsSync(marker), false);
   } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("CLI SIGTERM closes its stdin transport after cleanup even when the client keeps stdin open", { skip: process.platform === "win32", timeout: 10_000 }, async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "glm-cli-sigterm-"));
+  const ready = join(cwd, "ready");
+  const marker = join(cwd, "marker");
+  const code = [
+    'const fs=require("node:fs");',
+    'process.on("SIGTERM",()=>{});',
+    `fs.writeFileSync(${JSON.stringify(ready)}, "ready");`,
+    `setTimeout(()=>fs.writeFileSync(${JSON.stringify(marker)}, "survived"),700);`,
+  ].join("");
+  const { child, started, closeServer } = await runCliUntilCommand(`${shellQuote(process.execPath)} -e ${shellQuote(code)}`, cwd);
+  try {
+    await started;
+    while (!existsSync(ready)) await wait(10);
+    child.kill("SIGTERM");
+    const [exitCode] = await once(child, "exit");
+    assert.equal(exitCode, 143);
+    await wait(900);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    closeServer();
     if (child.exitCode === null) child.kill("SIGKILL");
     rmSync(cwd, { recursive: true, force: true });
   }
