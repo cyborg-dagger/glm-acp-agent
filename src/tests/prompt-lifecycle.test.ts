@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
 import { preprocessImageBlocks } from "../protocol/image-preprocessor.js";
 import { SessionStore } from "../protocol/session-store.js";
+import { SessionMcpTools } from "../tools/session-mcp-client.js";
 import type { GlmStreamChunk } from "../llm/glm-client.js";
 import type { VisionMcpClient } from "../tools/vision-mcp-client.js";
 
@@ -434,6 +435,10 @@ test("a restore drain timeout leaves the original session usable after its promp
       agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] }),
       /timed out/i,
     );
+    await assert.rejects(
+      agent.prompt({ sessionId, prompt: [{ type: "text", text: "too-early" }] }),
+      /transition in progress/i,
+    );
     release();
     await first;
     assert.equal(
@@ -560,6 +565,200 @@ test("failed replacement setup keeps the original session available", async () =
     );
   } finally {
     globalThis.fetch = previousFetch;
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("close is retained while an unloaded resume is setting up replacement resources", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-unloaded-close-"));
+  const store = new SessionStore(storeRoot);
+  const sessionId = "44444444-4444-4444-4444-444444444444";
+  store.save({
+    sessionId,
+    cwd: "/tmp",
+    messages: [{ role: "system", content: "system" }],
+    title: null,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    model: "glm-5.3",
+    mode: "default",
+  });
+  let setupStarted!: () => void;
+  const setupReady = new Promise<void>((resolve) => { setupStarted = resolve; });
+  let releaseSetup!: () => void;
+  const setupDone = new Promise<void>((resolve) => { releaseSetup = resolve; });
+  let disposed = 0;
+  const replacement = new SessionMcpTools([]);
+  replacement.dispose = async () => { disposed += 1; };
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: store,
+    connectSessionMcpServers: async () => {
+      setupStarted();
+      await setupDone;
+      return replacement;
+    },
+  });
+  try {
+    const resume = agent.resumeSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+    await setupReady;
+    const close = agent.closeSession({ sessionId });
+    releaseSetup();
+    await assert.rejects(resume, /cancelled/i);
+    await close;
+    assert.equal(disposed, 1);
+    await assert.rejects(
+      agent.prompt({ sessionId, prompt: [{ type: "text", text: "late" }] }),
+      /Session not found/i,
+    );
+  } finally {
+    releaseSetup();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("a load replay failure disposes provisional resources and keeps the live original", async () => {
+  const updates: Array<Record<string, unknown>> = [];
+  let failReplay = false;
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate(params: Record<string, unknown>) {
+      if (failReplay) throw new Error("synthetic replay failure");
+      updates.push(params);
+    },
+    async requestPermission() {
+      return { outcome: { outcome: "selected", optionId: "allow" } };
+    },
+  };
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-replay-rollback-"));
+  const store = new SessionStore(storeRoot);
+  let replacementDisposed = 0;
+  const replacement = new SessionMcpTools([]);
+  replacement.dispose = async () => { replacementDisposed += 1; };
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: store,
+    glm: textGlm(),
+    connectSessionMcpServers: async () => replacement,
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "original" }] });
+    failReplay = true;
+    await assert.rejects(
+      agent.loadSession({ sessionId, cwd: tmpdir(), mcpServers: [] }),
+      /synthetic replay failure/i,
+    );
+    failReplay = false;
+    assert.equal(replacementDisposed, 1);
+    assert.equal(
+      (await agent.prompt({ sessionId, prompt: [{ type: "text", text: "still-original" }] })).stopReason,
+      "end_turn",
+    );
+  } finally {
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("restore snapshots assistant text already received before it aborts the draining stream", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-partial-assistant-"));
+  const store = new SessionStore(storeRoot);
+  let receivedPartial!: () => void;
+  const partialReady = new Promise<void>((resolve) => { receivedPartial = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  let restoredHistory: Array<{ role?: string; content?: unknown }> = [];
+  const glm = {
+    async *streamChat(messages: Array<{ role?: string; content?: unknown }>): AsyncGenerator<GlmStreamChunk> {
+      calls += 1;
+      if (calls === 1) {
+        yield { text: "partial assistant" };
+        receivedPartial();
+        await blocked;
+        yield { text: "late assistant" };
+      } else {
+        restoredHistory = structuredClone(messages);
+        yield { text: "continued" };
+      }
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const first = agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
+    await partialReady;
+    const resume = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    release();
+    assert.equal((await first).stopReason, "cancelled");
+    await resume;
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] });
+    assert.ok(restoredHistory.some((message) => message.role === "assistant" && message.content === "partial assistant"));
+    assert.ok(!conn.updates.some((update) => JSON.stringify(update).includes("late assistant")));
+  } finally {
+    release();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("restore suppresses late tool updates and tool history from the draining generation", async () => {
+  const updates: Array<Record<string, unknown>> = [];
+  let readStarted!: () => void;
+  const readReady = new Promise<void>((resolve) => { readStarted = resolve; });
+  let releaseRead!: () => void;
+  const readDone = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate(params: Record<string, unknown>) { updates.push(params); },
+    async readTextFile() {
+      readStarted();
+      await readDone;
+      return { content: "contents" };
+    },
+    async writeTextFile() {},
+    async requestPermission() {
+      return { outcome: { outcome: "selected", optionId: "allow" } };
+    },
+  };
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-tool-"));
+  const store = new SessionStore(storeRoot);
+  let calls = 0;
+  let restoredHistory: Array<{ role?: string; tool_call_id?: string }> = [];
+  const glm = {
+    async *streamChat(messages: Array<{ role?: string; tool_call_id?: string }>): AsyncGenerator<GlmStreamChunk> {
+      calls += 1;
+      if (calls === 1) {
+        yield { toolCall: { id: "read-1", name: "read_file", arguments: JSON.stringify({ path: "a.txt" }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      } else {
+        restoredHistory = structuredClone(messages);
+        yield { text: "continued" };
+        yield { done: true, stopReason: "stop" };
+      }
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  await agent.initialize({
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+  } as never);
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const first = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read" }] });
+    await readReady;
+    const resume = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    releaseRead();
+    assert.equal((await first).stopReason, "cancelled");
+    await resume;
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] });
+    assert.ok(!restoredHistory.some((message) => message.role === "tool" && message.tool_call_id === "read-1"));
+    const lateUpdates = updates.filter((update) => {
+      const body = update.update as { sessionUpdate?: string; toolCallId?: string };
+      return body.sessionUpdate === "tool_call_update" && body.toolCallId === "read-1";
+    });
+    assert.equal(lateUpdates.length, 0);
+  } finally {
+    releaseRead();
     await rm(storeRoot, { recursive: true, force: true });
   }
 });
