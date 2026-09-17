@@ -1125,7 +1125,7 @@ export class GlmAcpAgent implements Agent {
           const drained = await this.drainPrompt(original);
           if (!drained) {
             deferLeaseRelease = true;
-            this.releaseAfterPromptDrain(original, lifecycle, lease);
+            this.releaseAfterPromptDrain(original, lifecycle, lease, record);
             throw new Error(`Session restore timed out waiting for prompt cleanup: ${lease.generation}`);
           }
           this.assertRestoreOwner(lifecycle, lease);
@@ -1215,7 +1215,7 @@ export class GlmAcpAgent implements Agent {
       return await transition;
     } finally {
       if (record.promise === transition) record.promise = null;
-      if (record.original === original) record.original = null;
+      if (!deferLeaseRelease && record.original === original) record.original = null;
     }
   }
 
@@ -1238,10 +1238,12 @@ export class GlmAcpAgent implements Agent {
   private releaseAfterPromptDrain(
     session: SessionState,
     lifecycle: SessionLifecycle,
-    lease: TransitionLease
+    lease: TransitionLease,
+    record: SessionTransition
   ): void {
     void session.promptPromise?.then(() => {
       if (!lifecycle.closeRequested) lease.release();
+      if (record.original === session) record.original = null;
     });
   }
 
@@ -1572,7 +1574,7 @@ export class GlmAcpAgent implements Agent {
       }
 
       if (cancelledDuringStream || signal.aborted) {
-        if (ownsPrompt()) {
+        if (ownsPrompt() || retainDrainedHistory) {
           for (const tc of toolCalls) cancelledToolResult(tc.id);
         }
         return { stopReason: "cancelled", usage: totalUsage };
@@ -1587,7 +1589,7 @@ export class GlmAcpAgent implements Agent {
       let cancellationObserved = false;
       for (const tc of toolCalls) {
         if (signal.aborted || !ownsPrompt()) {
-          if (ownsPrompt()) cancelledToolResult(tc.id);
+          if (ownsPrompt() || preservesDrainingHistory()) cancelledToolResult(tc.id);
           cancellationObserved = true;
           continue;
         }
@@ -1596,14 +1598,15 @@ export class GlmAcpAgent implements Agent {
         try {
           result = await executor.execute(tc.id, tc.name, tc.arguments);
         } catch (err) {
-          if (!signal.aborted) throw err;
-          if (ownsPrompt()) cancelledToolResult(tc.id);
+          if (!signal.aborted && !preservesDrainingHistory()) throw err;
+          if (ownsPrompt() || preservesDrainingHistory()) cancelledToolResult(tc.id);
           cancellationObserved = true;
           continue;
         }
         debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} contentLength=${result.content.length}`);
 
-        if (!ownsPrompt()) {
+        const retainToolResult = preservesDrainingHistory();
+        if (!ownsPrompt() && !retainToolResult) {
           cancellationObserved = true;
           continue;
         }

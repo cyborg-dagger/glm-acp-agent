@@ -411,12 +411,16 @@ test("a restore drain timeout leaves the original session usable after its promp
   let release!: () => void;
   const blocked = new Promise<void>((resolve) => { release = resolve; });
   let calls = 0;
+  let postTimeoutHistory: Array<{ role?: string; content?: unknown }> = [];
   const glm = {
-    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+    async *streamChat(messages: Array<{ role?: string; content?: unknown }>): AsyncGenerator<GlmStreamChunk> {
       calls += 1;
       if (calls === 1) {
+        yield { text: "partial before timeout" };
         started();
         await blocked;
+      } else {
+        postTimeoutHistory = structuredClone(messages);
       }
       yield { text: "ok" };
       yield { done: true, stopReason: "stop" };
@@ -445,6 +449,9 @@ test("a restore drain timeout leaves the original session usable after its promp
       (await agent.prompt({ sessionId, prompt: [{ type: "text", text: "after-timeout" }] })).stopReason,
       "end_turn",
     );
+    assert.ok(postTimeoutHistory.some(
+      (message) => message.role === "assistant" && message.content === "partial before timeout"
+    ));
   } finally {
     release();
     await rm(storeRoot, { recursive: true, force: true });
@@ -701,7 +708,7 @@ test("restore snapshots assistant text already received before it aborts the dra
   }
 });
 
-test("restore suppresses late tool updates and tool history from the draining generation", async () => {
+test("restore suppresses late tool updates while retaining an active tool result in history", async () => {
   const updates: Array<Record<string, unknown>> = [];
   let readStarted!: () => void;
   const readReady = new Promise<void>((resolve) => { readStarted = resolve; });
@@ -751,7 +758,7 @@ test("restore suppresses late tool updates and tool history from the draining ge
     assert.equal((await first).stopReason, "cancelled");
     await resume;
     await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] });
-    assert.ok(!restoredHistory.some((message) => message.role === "tool" && message.tool_call_id === "read-1"));
+    assert.ok(restoredHistory.some((message) => message.role === "tool" && message.tool_call_id === "read-1"));
     const lateUpdates = updates.filter((update) => {
       const body = update.update as { sessionUpdate?: string; toolCallId?: string };
       return body.sessionUpdate === "tool_call_update" && body.toolCallId === "read-1";
@@ -759,6 +766,50 @@ test("restore suppresses late tool updates and tool history from the draining ge
     assert.equal(lateUpdates.length, 0);
   } finally {
     releaseRead();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("restore completes a streamed tool batch with cancelled tool results", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-tool-batch-"));
+  const store = new SessionStore(storeRoot);
+  let batchReceived!: () => void;
+  const batchReady = new Promise<void>((resolve) => { batchReceived = resolve; });
+  let releaseStream!: () => void;
+  const streamDone = new Promise<void>((resolve) => { releaseStream = resolve; });
+  let calls = 0;
+  let restoredHistory: Array<{ role?: string; tool_call_id?: string; content?: unknown }> = [];
+  const glm = {
+    async *streamChat(messages: Array<{ role?: string; tool_call_id?: string; content?: unknown }>): AsyncGenerator<GlmStreamChunk> {
+      calls += 1;
+      if (calls === 1) {
+        yield { toolCall: { id: "read-1", name: "read_file", arguments: JSON.stringify({ path: "a.txt" }) } };
+        yield { toolCall: { id: "read-2", name: "read_file", arguments: JSON.stringify({ path: "b.txt" }) } };
+        batchReceived();
+        await streamDone;
+      } else {
+        restoredHistory = structuredClone(messages);
+        yield { text: "continued" };
+      }
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const first = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read both" }] });
+    await batchReady;
+    const resume = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    releaseStream();
+    assert.equal((await first).stopReason, "cancelled");
+    await resume;
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] });
+    const toolResults = restoredHistory.filter((message) => message.role === "tool");
+    assert.deepEqual(toolResults.map((message) => message.tool_call_id), ["read-1", "read-2"]);
+    assert.ok(toolResults.every((message) => String(message.content).includes("cancelled before execution")));
+  } finally {
+    releaseStream();
     await rm(storeRoot, { recursive: true, force: true });
   }
 });
