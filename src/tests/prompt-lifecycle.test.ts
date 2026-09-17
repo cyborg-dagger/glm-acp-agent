@@ -345,3 +345,221 @@ test("queued prompts form a chain so only the newest prompt can reach the model"
   assert.deepEqual(results.map((r) => r.stopReason), ["cancelled", "cancelled", "end_turn"]);
   assert.deepEqual(calls, ["one", "three"]);
 });
+
+for (const restoreKind of ["load", "resume"] as const) {
+test(`live ${restoreKind} drains the reserved prompt chain before replacing its history`, async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-live-resume-"));
+  const store = new SessionStore(storeRoot);
+  let secondStarted!: () => void;
+  const secondReady = new Promise<void>((resolve) => { secondStarted = resolve; });
+  let releaseSecond!: () => void;
+  const secondDone = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  let call = 0;
+  let thirdHistory: unknown[] = [];
+  const glm = {
+    async *streamChat(messages: Array<{ content?: unknown }>): AsyncGenerator<GlmStreamChunk> {
+      call += 1;
+      if (call === 2) {
+        secondStarted();
+        await secondDone;
+      }
+      if (call === 3) thirdHistory = structuredClone(messages);
+      yield { text: `reply-${call}` };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
+    const second = agent.prompt({ sessionId, prompt: [{ type: "text", text: "second" }] });
+    await secondReady;
+
+    const restoreParams = { sessionId, cwd: tmpdir(), mcpServers: [] };
+    const restoring = restoreKind === "load"
+      ? agent.loadSession(restoreParams)
+      : agent.resumeSession(restoreParams);
+    await assert.rejects(
+      agent.prompt({ sessionId, prompt: [{ type: "text", text: "third" }] }),
+      /transition in progress/i,
+    );
+    releaseSecond();
+    assert.equal((await second).stopReason, "cancelled");
+    await restoring;
+
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "third" }] });
+    const userTurns = thirdHistory
+      .filter((message): message is { role?: string; content?: unknown } => typeof message === "object" && message !== null)
+      .filter((message) => message.role === "user")
+      .map((message) => String(message.content));
+    assert.deepEqual(userTurns, ["first", "second", "third"]);
+  } finally {
+    releaseSecond();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+}
+
+test("a restore drain timeout leaves the original session usable after its prompt unwinds", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-resume-timeout-"));
+  const store = new SessionStore(storeRoot);
+  let started!: () => void;
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      calls += 1;
+      if (calls === 1) {
+        started();
+        await blocked;
+      }
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, {
+    glm,
+    sessionStore: store,
+    sessionDrainTimeoutMs: 0,
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const first = agent.prompt({ sessionId, prompt: [{ type: "text", text: "blocked" }] });
+    await ready;
+    await assert.rejects(
+      agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] }),
+      /timed out/i,
+    );
+    release();
+    await first;
+    assert.equal(
+      (await agent.prompt({ sessionId, prompt: [{ type: "text", text: "after-timeout" }] })).stopReason,
+      "end_turn",
+    );
+  } finally {
+    release();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("a mode change remains responsive and survives a live restore drain", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-resume-mode-"));
+  const store = new SessionStore(storeRoot);
+  let secondStarted!: () => void;
+  const secondReady = new Promise<void>((resolve) => { secondStarted = resolve; });
+  let releaseSecond!: () => void;
+  const secondDone = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  let calls = 0;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      calls += 1;
+      if (calls === 2) {
+        secondStarted();
+        await secondDone;
+      }
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
+    const second = agent.prompt({ sessionId, prompt: [{ type: "text", text: "second" }] });
+    await secondReady;
+    const resume = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await agent.setSessionMode({ sessionId, modeId: "bypass_permissions" });
+    releaseSecond();
+    await second;
+    assert.equal((await resume).modes?.currentModeId, "bypass_permissions");
+  } finally {
+    releaseSecond();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("close during restore cancels replacement and leaves no in-memory session", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-close-restore-"));
+  const store = new SessionStore(storeRoot);
+  let started!: () => void;
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      calls += 1;
+      if (calls === 2) {
+        started();
+        await blocked;
+      }
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
+    const second = agent.prompt({ sessionId, prompt: [{ type: "text", text: "second" }] });
+    await ready;
+    const resume = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    const closing = agent.closeSession({ sessionId });
+    release();
+    await second;
+    await assert.rejects(resume, /cancelled/i);
+    await closing;
+    await assert.rejects(
+      agent.prompt({ sessionId, prompt: [{ type: "text", text: "after-close" }] }),
+      /Session not found/i,
+    );
+  } finally {
+    release();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("failed replacement setup keeps the original session available", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-setup-failure-"));
+  const store = new SessionStore(storeRoot);
+  let calls = 0;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      calls += 1;
+      yield { text: `reply-${calls}` };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const previousFetch = globalThis.fetch;
+  try {
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
+    globalThis.fetch = (async () => {
+      throw new Error("synthetic MCP setup failure");
+    }) as typeof fetch;
+    await assert.rejects(
+      agent.resumeSession({
+        sessionId,
+        cwd: tmpdir(),
+        mcpServers: [{ type: "http", name: "broken", url: "https://mcp.example.test/broken", headers: [] }],
+      }),
+      /synthetic MCP setup failure/i,
+    );
+    globalThis.fetch = previousFetch;
+    assert.equal(
+      (await agent.prompt({ sessionId, prompt: [{ type: "text", text: "after-failure" }] })).stopReason,
+      "end_turn",
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
