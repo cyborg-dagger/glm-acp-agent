@@ -226,6 +226,8 @@ export interface GlmAcpAgentOptions {
   visionClient?: VisionMcpClient | null;
   /** Override session MCP setup for lifecycle tests and alternate transports. */
   mcpConnector?: (servers: Parameters<typeof connectSessionMcpServers>[0]) => Promise<SessionMcpTools>;
+  /** Test-only override for the bounded shutdown prompt-drain deadline. */
+  shutdownDrainTimeoutMs?: number;
 }
 
 /**
@@ -276,6 +278,7 @@ export class GlmAcpAgent implements Agent {
   private readonly processSupervisor = new ProcessSupervisor();
   private shuttingDown = false;
   private shutdownPromise: Promise<void> | null = null;
+  private readonly shutdownDrainTimeoutMs: number;
 
   constructor(
     private connection: AgentSideConnection,
@@ -293,6 +296,7 @@ export class GlmAcpAgent implements Agent {
     this.visionClientExplicit = "visionClient" in options;
     this._visionClient = options.visionClient ?? null;
     this.mcpConnector = options.mcpConnector ?? connectSessionMcpServers;
+    this.shutdownDrainTimeoutMs = options.shutdownDrainTimeoutMs ?? 4_000;
     this.streamThinking = process.env["ACP_GLM_STREAM_THINKING"]?.toLowerCase() !== "false";
   }
 
@@ -967,19 +971,28 @@ export class GlmAcpAgent implements Agent {
       }
 
       await this.processSupervisor.terminateAll();
-      const prompts = sessions
-        .map(([, session]) => session.promptPromise)
-        .filter((prompt): prompt is Promise<void> => prompt !== null);
+      const deadlineMs = this.shutdownDrainTimeoutMs;
+      // Race each session's active prompt individually: a global allSettled
+      // race cannot tell which prompt settled once the deadline passes.
+      const promptsSettled = await Promise.all(sessions.map(([, session]) =>
+        session.promptPromise
+          ? settlesWithin(session.promptPromise, deadlineMs)
+          : Promise.resolve(true),
+      ));
       const closes = sessions
         .map(([, session]) => session.closePromise)
         .filter((close): close is Promise<void> => close !== null);
       const setups = [...this.pendingSetups].map((setup) => setup.dispose());
-      const drained = await settlesWithin(Promise.allSettled([...prompts, ...closes, ...setups]), 4_000);
+      const auxDrained = await settlesWithin(Promise.allSettled([...closes, ...setups]), deadlineMs);
 
-      for (const [sessionId, session] of sessions) {
+      sessions.forEach(([sessionId, session], index) => {
         session.closed = true;
-        this.persistSession(sessionId, session);
-      }
+        // A prompt that ignored the drain deadline may still be mid-exchange;
+        // checkpointing it now could persist an assistant tool call whose
+        // matching result never landed. Keep the last valid on-disk
+        // checkpoint instead of saving provider-invalid history.
+        if (promptsSettled[index] === true) this.persistSession(sessionId, session);
+      });
       await Promise.allSettled(sessions.map(([, session]) => this.disposeSessionTools(session)));
       this.sessions.clear();
       this.sessionTodos.clear();
@@ -991,7 +1004,9 @@ export class GlmAcpAgent implements Agent {
       if (this.processSupervisor.hasActiveProcesses()) {
         throw new Error("Agent shutdown left active command processes");
       }
-      if (!drained) throw new Error("Agent shutdown timed out waiting for prompt cleanup");
+      if (!auxDrained || promptsSettled.some((settled) => !settled)) {
+        throw new Error("Agent shutdown timed out waiting for prompt cleanup");
+      }
     })();
     return this.shutdownPromise;
   }

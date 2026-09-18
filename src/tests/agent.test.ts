@@ -842,6 +842,51 @@ test("shutdown is idempotent and stops new session admission", async () => {
   await assert.rejects(agent.newSession({ cwd: "/tmp", mcpServers: [] }), /shutting down/);
 });
 
+test("shutdown keeps the last valid checkpoint when a prompt exceeds the drain deadline", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => { streamStarted = resolve; });
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        yield {
+          toolCall: {
+            id: "stuck-tool",
+            name: "list_files",
+            arguments: JSON.stringify({ path: "." }),
+          },
+        };
+        streamStarted();
+        // Ignores cancellation: never yields again and never returns, so the
+        // prompt cannot finalize its history within the drain deadline.
+        await new Promise<void>(() => {});
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, {
+      glm,
+      sessionStore: store,
+      shutdownDrainTimeoutMs: 20,
+    });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    void agent.prompt({ sessionId, prompt: [{ type: "text", text: "stuck" }] }).catch(() => undefined);
+    await started;
+    await assert.rejects(agent.shutdown("sigterm"), /timed out waiting for prompt cleanup/);
+
+    const persisted = store.load(sessionId);
+    assert.ok(
+      !persisted?.messages.some(
+        (message) => message.role === "assistant" && (message as { tool_calls?: unknown[] }).tool_calls?.length,
+      ),
+      "a prompt that missed the drain deadline must not be checkpointed with an unmatched tool call",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test("shutdown persists partial streamed assistant text without late UI updates", async () => {
   const { store, cleanup } = makeTempStore();
   try {
