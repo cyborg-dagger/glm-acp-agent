@@ -215,6 +215,10 @@ class HttpMcpClient implements ConnectedMcpClient {
       // A server may not support DELETE, and shutdown must remain bounded.
     } finally {
       clearTimeout(timer);
+      // The DELETE response body is never consumed. Aborting here also closes
+      // it when the fetch settled before the deadline, so an idle-but-open
+      // stream cannot hold socket resources after disposal returns.
+      controller.abort();
     }
   }
 

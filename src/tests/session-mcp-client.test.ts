@@ -671,3 +671,62 @@ test("StdioMcpClient does not resurrect a disposed server", async () => {
   await assert.rejects(() => client.callTool("search", {}), /disposed/i);
   assert.equal(spawnCount, 0);
 });
+
+test("HTTP dispose aborts its DELETE request once disposal returns", async () => {
+  const originalFetch = globalThis.fetch;
+  // A server can return DELETE headers while leaving the body pending. The
+  // fetch promise settles on headers, so the only observable contract of the
+  // fix is that the request signal is aborted by the time dispose() returns.
+  let deleteSignal: AbortSignal | undefined;
+  globalThis.fetch = (async (_url, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    if (body.method === "initialize") {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: {} }), {
+        headers: { "Content-Type": "application/json", "MCP-Session-Id": "session-delete" },
+      });
+    }
+    if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (init?.method === "DELETE") {
+      deleteSignal = init.signal ?? undefined;
+      return new Response(new ReadableStream<Uint8Array>({
+        pull() { return new Promise<void>(() => {}); },
+      }, { highWaterMark: 0 }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id,
+      result: body.method === "tools/list" ? { tools: [{ name: "read" }] } : {},
+    }), { headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    const tools = await connectSessionMcpServers([{ type: "http", name: "fixture", url: "https://fixture.invalid", headers: [] }]);
+    await tools.dispose();
+    assert.ok(deleteSignal, "a DELETE request was made");
+    assert.equal(deleteSignal.aborted, true, "dispose must abort the DELETE request so its body cannot hold resources");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+for (const scenario of ["within a page", "across pages"] as const) {
+  test(`HTTP discovery rejects duplicate tool names ${scenario}`, async () => {
+    const savedFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async (_url, init) => {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+        const page = scenario === "within a page"
+          ? { tools: [{ name: "dup" }, { name: "dup" }] }
+          : { tools: [{ name: "dup" }], nextCursor: "page2" };
+        if (body.method === "tools/list" && body.params?.cursor === "page2") {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "dup" }] } }),
+            { headers: { "Content-Type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: page }),
+          { headers: { "Content-Type": "application/json" } });
+      }) as typeof fetch;
+      await assert.rejects(
+        connectSessionMcpServers([{ type: "http", name: "fixture", url: "https://fixture.invalid", headers: [] }]),
+        /duplicate tool name/i,
+      );
+    } finally { globalThis.fetch = savedFetch; }
+  });
+}

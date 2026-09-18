@@ -497,3 +497,18 @@ test("ZaiMcpClient retries once on -32602 arg-validation error and re-discovers 
     arguments: { search_query: "test" },
   });
 });
+
+test("ZaiMcpClient rejects a discovered catalog with duplicate tool names", async () => {
+  const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+  const { fetchStub } = createFetchStub([
+    jsonResponse({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } }, { sessionId: "zai-dup" }),
+    new Response(null, { status: 202 }),
+    jsonResponse({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "webSearchPrime" }, { name: "webSearchPrime" }] } }),
+  ]);
+
+  const client = new ZaiMcpClient(fetchStub as typeof fetch);
+  await assert.rejects(
+    client.callTool({ endpoint, toolName: "webSearchPrime", arguments: { query: "test" }, apiKey: "test-key" }),
+    /duplicate tool name/i,
+  );
+});
