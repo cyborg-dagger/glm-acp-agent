@@ -220,6 +220,7 @@ test("invalid roots and write/edit arguments fail before permissions or filesyst
     ["write_file", JSON.stringify({ path, content: null })],
     ["edit_file", JSON.stringify({ path, old_text: "remove this" })],
     ["edit_file", JSON.stringify({ path, old_text: "remove this", new_text: null })],
+    ["edit_file", JSON.stringify({ path, old_text: "   ", new_text: "replacement" })],
   ] as const;
   try {
     for (const [toolName, rawArguments] of cases) {

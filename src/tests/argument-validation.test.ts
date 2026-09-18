@@ -46,6 +46,8 @@ test("write and edit constraints reject absent, null, or blank destructive input
     ["edit_file", '{"path":"out.txt","old_text":"x"}', /new_text.*required/i],
     ["edit_file", '{"path":"out.txt","old_text":"x","new_text":null}', /new_text.*string/i],
     ["edit_file", '{"path":"out.txt","old_text":"","new_text":"x"}', /old_text.*non-empty/i],
+    ["edit_file", '{"path":"out.txt","old_text":"   ","new_text":"x"}', /old_text.*non-empty/i],
+    ["edit_file", '{"path":"out.txt","old_text":"\\n\\t","new_text":"x"}', /old_text.*non-empty/i],
     ["run_command", '{"command":"   "}', /command.*non-empty/i],
   ] as const;
 
