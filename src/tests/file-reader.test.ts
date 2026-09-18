@@ -45,8 +45,16 @@ test("local reader does not emit a replacement character when the scan stops in 
   }
 });
 
-test("local reader discloses a scan ending after a complete line", async () => {
+test("local reader discloses a scan ending after a complete line without a dead-end offset", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-file-reader-")); const path = join(dir, "cap.txt");
   writeFileSync(path, "a\nb\nc\n");
-  try { const page = await readLocalTextPage(path, 1, 20, 4); assert.equal(page.truncated, true); assert.equal(page.nextLine, 3); } finally { rmSync(dir, { recursive: true, force: true }); }
+  try {
+    const page = await readLocalTextPage(path, 1, 20, 4);
+    assert.equal(page.truncated, true);
+    // The scan restarts from byte zero, so no offset beyond this prefix can
+    // ever be served; advertising one would dead-end the next request.
+    assert.equal(page.nextLine, undefined);
+    const followUp = await readLocalTextPage(path, page.lastCompleteLine + 1, 20, 4);
+    assert.equal(followUp.text, "", "following a budget-bound boundary must not re-serve old lines");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

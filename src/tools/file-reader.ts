@@ -58,13 +58,16 @@ export async function readLocalTextPage(
     const currentLine = completeLines.length + 1;
     const pageEndsAtKnownPartial = !eof && hasPartial && safeOffset <= currentLine && safeOffset + safeLimit - 1 >= currentLine;
     const pageEndsAtBudget = !eof && (hasPartial || bytes.length === maxReadBytes);
-    const canContinueAfterCompleteBoundary = !eof && !hasPartial && safeOffset <= completeLines.length;
     return {
       text: selected.join("\n") + (pageEndsAtKnownPartial && selected.length === 0 ? decodeUtf8Safely(bytes.subarray(lineStart)) : ""),
       firstLine: safeOffset,
       lastCompleteLine: safeOffset + selected.length - 1,
       ...(totalLines === undefined ? {} : { totalLines }),
-      ...(totalLines !== undefined && end < totalLines ? { nextLine: end + 1 } : canContinueAfterCompleteBoundary ? { nextLine: completeLines.length + 1 } : {}),
+      // Advertise a next line only when the whole file is known (eof): the
+      // scan always restarts from byte zero, so a budget-bound page can never
+      // serve lines beyond its own prefix — following such an offset would
+      // dead-end on an empty result.
+      ...(totalLines !== undefined && end < totalLines ? { nextLine: end + 1 } : {}),
       truncated: pageEndsAtBudget,
       ...(pageEndsAtKnownPartial ? { incompleteLine: currentLine } : {}),
     };

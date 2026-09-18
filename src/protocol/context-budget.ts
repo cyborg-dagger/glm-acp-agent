@@ -68,23 +68,11 @@ export function compactToBudget(
   const currentMessages = () => [...(system ? [system] : []), ...currentTurns.flat()];
   let estimate = estimateMessagesTokens(currentMessages());
 
-  // When the live exchange itself is the issue, retain its assistant calls and
-  // reasoning verbatim, but shorten only old tool-result bodies in it.
-  const activeIndex = currentTurns.length - 1;
-  if (estimate > desired) {
-    const active = currentTurns[activeIndex]!;
-    currentTurns[activeIndex] = active.map(message => {
-      if (message.role !== "tool" || typeof message.content !== "string" || Buffer.byteLength(message.content, "utf8") <= ACTIVE_TOOL_RESULT_BYTES) return message;
-      reducedToolResults += 1;
-      return { ...message, content: boundToolResult(message.content, ACTIVE_TOOL_RESULT_BYTES) } as GlmMessage;
-    });
-    estimate = estimateMessagesTokens(currentMessages());
-  }
-
   // A single user request can span many assistant/tool rounds. Remove only
   // complete oldest batches, retaining the current user message, retained
   // arguments/reasoning, and the newest completed batch when it fits.
   while (estimate > desired) {
+    const activeIndex = currentTurns.length - 1;
     const active = currentTurns[activeIndex]!;
     const batches = completeToolBatches(active);
     if (batches.length <= 1) break;
@@ -102,6 +90,21 @@ export function compactToBudget(
   while (estimate > desired && currentTurns.length > minimumTurns) {
     currentTurns.shift();
     removedExchanges += 1;
+    estimate = estimateMessagesTokens(currentMessages());
+  }
+
+  // Last resort within the still-live request: retain assistant calls and
+  // reasoning verbatim and shorten oversized tool-result bodies — but only
+  // after every older exchange and batch has already been removed, so a
+  // freshly returned result is never truncated while older history remains.
+  if (estimate > desired) {
+    const activeIndex = currentTurns.length - 1;
+    const active = currentTurns[activeIndex]!;
+    currentTurns[activeIndex] = active.map(message => {
+      if (message.role !== "tool" || typeof message.content !== "string" || Buffer.byteLength(message.content, "utf8") <= ACTIVE_TOOL_RESULT_BYTES) return message;
+      reducedToolResults += 1;
+      return { ...message, content: boundToolResult(message.content, ACTIVE_TOOL_RESULT_BYTES) } as GlmMessage;
+    });
     estimate = estimateMessagesTokens(currentMessages());
   }
 

@@ -44,3 +44,19 @@ test("compaction evicts old complete tool batches within one live user turn", ()
   assert.ok(!result.messages.some(message => message.role === "tool" && message.tool_call_id === "old"));
   assert.ok(result.messages.some(message => message.role === "assistant" && message.tool_calls?.some(call => call.id === "new")));
 });
+
+test("compaction removes older history before shortening fresh results", () => {
+  const messages: GlmMessage[] = [{ role: "system", content: "rules" }];
+  messages.push({ role: "user", content: "old request" });
+  messages.push({ role: "assistant", content: null, tool_calls: [{ id: "old", type: "function", function: { name: "read_file", arguments: "{}" } }] });
+  messages.push({ role: "tool", tool_call_id: "old", content: "x".repeat(40_000) });
+  messages.push({ role: "user", content: "current request" });
+  messages.push({ role: "assistant", content: null, tool_calls: [{ id: "new", type: "function", function: { name: "read_file", arguments: "{}" } }] });
+  messages.push({ role: "tool", tool_call_id: "new", content: "y".repeat(10_000) });
+  const result = compactToBudget(messages, budget, true);
+  assert.ok(result.removedExchanges >= 1);
+  assert.equal(result.reducedToolResults, 0, "a fresh result must not be shortened while older history can go");
+  assert.ok(!result.messages.some(message => message.role === "tool" && message.tool_call_id === "old"));
+  const fresh = result.messages.find(message => message.role === "tool" && message.tool_call_id === "new");
+  assert.equal(fresh?.content, "y".repeat(10_000), "the just-returned result stays verbatim");
+});
