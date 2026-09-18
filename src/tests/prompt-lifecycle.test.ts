@@ -951,3 +951,85 @@ test("close after swap disposes the current replacement rather than the stale or
     await rm(storeRoot, { recursive: true, force: true });
   }
 });
+
+test("a configuration change during load replay is carried into the replacement", async () => {
+  let replayArmed = false;
+  let gateUsed = false;
+  let blockReplay!: () => void;
+  const replayBlocked = new Promise<void>((resolve) => { blockReplay = resolve; });
+  let releaseReplay!: () => void;
+  const replayGate = new Promise<void>((resolve) => { releaseReplay = resolve; });
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate(params: Record<string, unknown>) {
+      // Block exactly once on a replayed message (armed only once the load
+      // starts), so a configuration change can land inside the replay window.
+      if (
+        replayArmed && !gateUsed &&
+        String((params as { update?: { sessionUpdate?: string } }).update?.sessionUpdate) === "agent_message_chunk"
+      ) {
+        gateUsed = true;
+        blockReplay();
+        await replayGate;
+      }
+    },
+    async requestPermission() {
+      return { outcome: { outcome: "selected", optionId: "allow" } };
+    },
+  };
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-replay-config-"));
+  const store = new SessionStore(storeRoot);
+  const agent = new GlmAcpAgent(conn as never, { glm: textGlm(), sessionStore: store });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
+    replayArmed = true;
+    const loading = agent.loadSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await replayBlocked;
+    await agent.setSessionMode({ sessionId, modeId: "bypass_permissions" });
+    releaseReplay();
+    const loaded = await loading;
+    assert.equal(loaded.modes?.currentModeId, "bypass_permissions");
+    assert.equal(store.load(sessionId)?.mode, "bypass_permissions");
+  } finally {
+    releaseReplay();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("a live restore checkpoints its merged history at the swap", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-checkpoint-"));
+  const store = new SessionStore(storeRoot);
+  let receivedPartial!: () => void;
+  const partialReady = new Promise<void>((resolve) => { receivedPartial = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { text: "partial assistant" };
+      receivedPartial();
+      await blocked;
+      yield { text: "late assistant" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const first = agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
+    await partialReady;
+    const resume = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    release();
+    assert.equal((await first).stopReason, "cancelled");
+    await resume;
+    // No further prompt or close: the swap itself must have written the
+    // retained partial turn to disk.
+    assert.ok(store.load(sessionId)?.messages.some(
+      (message) => message.role === "assistant" && message.content === "partial assistant"
+    ));
+  } finally {
+    release();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});

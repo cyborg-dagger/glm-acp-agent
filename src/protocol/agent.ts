@@ -1122,10 +1122,10 @@ export class GlmAcpAgent implements Agent {
         let persisted: PersistedSession;
         if (original) {
           original.abortController?.abort();
-          const drained = await this.drainPrompt(original);
+          const { drained, pending } = await this.drainPrompt(original);
           if (!drained) {
             deferLeaseRelease = true;
-            this.releaseAfterPromptDrain(original, lifecycle, lease, record);
+            this.releaseAfterPromptDrain(pending, original, lifecycle, lease, record);
             throw new Error(`Session restore timed out waiting for prompt cleanup: ${lease.generation}`);
           }
           this.assertRestoreOwner(lifecycle, lease);
@@ -1185,9 +1185,22 @@ export class GlmAcpAgent implements Agent {
         if (lifecycle.closeRequested) {
           throw new Error(`Session restore cancelled: ${params.sessionId}`);
         }
+        if (original && this.sessions.get(params.sessionId) === original) {
+          // Configuration setters stay responsive while a load replays, and
+          // they mutate the still-installed original. Carry those latest
+          // values into the replacement instead of installing the values
+          // captured before replay started.
+          restored.model = original.model;
+          restored.mode = original.mode;
+          restored.thoughtLevel = original.thoughtLevel;
+        }
         this.sessions.set(params.sessionId, restored);
         this.sessionTodos.delete(params.sessionId);
         swapped = true;
+        // Checkpoint the merged state immediately: it can retain a partially
+        // received turn from the drained prompt, which otherwise exists only
+        // in memory until the next prompt or close.
+        this.persistSession(params.sessionId, restored);
         // Ownership transfers only after the replacement is installed. The
         // old resources are released afterwards, so setup and replay failures
         // still retain a valid original session.
@@ -1219,9 +1232,11 @@ export class GlmAcpAgent implements Agent {
     }
   }
 
-  private async drainPrompt(session: SessionState): Promise<boolean> {
+  private async drainPrompt(
+    session: SessionState
+  ): Promise<{ drained: boolean; pending: Promise<void> | null }> {
     const pending = session.promptPromise;
-    if (!pending) return true;
+    if (!pending) return { drained: true, pending: null };
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<"timeout">((resolve) => {
       if (this.sessionDrainTimeoutMs <= 0) queueMicrotask(() => resolve("timeout"));
@@ -1232,16 +1247,21 @@ export class GlmAcpAgent implements Agent {
       timeout,
     ]);
     if (timer) clearTimeout(timer);
-    return outcome === "drained";
+    return { drained: outcome === "drained", pending };
   }
 
   private releaseAfterPromptDrain(
+    pending: Promise<void> | null,
     session: SessionState,
     lifecycle: SessionLifecycle,
     lease: TransitionLease,
     record: SessionTransition
   ): void {
-    void session.promptPromise?.then(() => {
+    // The promise captured when the drain started must be the one observed
+    // here: the prompt's cleanup can null `session.promptPromise` right after
+    // the timeout resolves, and re-reading the field would never attach the
+    // release callback, leaving the lease stuck in `restoring` forever.
+    void pending?.then(() => {
       if (!lifecycle.closeRequested) lease.release();
       if (record.original === session) record.original = null;
     });
