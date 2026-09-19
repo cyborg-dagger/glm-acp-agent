@@ -4,7 +4,7 @@ import type { ModelInfo, Usage } from "@agentclientprotocol/sdk";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { resolveApiKey } from "./credentials.js";
 import { debug, error } from "./logger.js";
-import { validateStreamCompletion } from "./stream-state.js";
+import { IncompleteModelStreamError, validateStreamCompletion } from "./stream-state.js";
 
 /**
  * Reasoning effort levels exposed to ACP clients via the `thought_level`
@@ -355,8 +355,14 @@ export class GlmClient {
     > = new Map();
 
     let lastFinishReason: string | undefined;
+    let terminalChoiceSeen = false;
 
     for await (const chunk of stream) {
+      if (terminalChoiceSeen && chunk.choices.length > 0) {
+        throw new IncompleteModelStreamError(
+          "Incomplete model stream: received a model frame after terminal completion."
+        );
+      }
       const choice = chunk.choices[0];
 
       if (choice) {
@@ -398,6 +404,7 @@ export class GlmClient {
 
         if (choice.finish_reason) {
           lastFinishReason = choice.finish_reason;
+          terminalChoiceSeen = true;
         }
       }
 
