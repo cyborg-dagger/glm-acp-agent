@@ -133,14 +133,7 @@ function validateBuiltinConstraints(toolName: string, value: Record<string, unkn
     const error = requiredNonBlank(value, nonBlankProperty);
     if (error) return error;
   }
-  if (
-    toolName === "edit_file" &&
-    typeof value["old_text"] === "string" &&
-    value["old_text"].trim().length === 0
-  ) {
-    // The replacement target must be findable and unambiguous; a blank
-    // snippet is model error, unlike blank `new_text` (an intentional
-    // deletion) which stays valid.
+  if (toolName === "edit_file" && value["old_text"] === "") {
     return "arguments.old_text must be a non-empty string.";
   }
   if (toolName === "todowrite" && Array.isArray(value["todos"]) && value["todos"].length === 0) {

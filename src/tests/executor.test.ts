@@ -220,7 +220,7 @@ test("invalid roots and write/edit arguments fail before permissions or filesyst
     ["write_file", JSON.stringify({ path, content: null })],
     ["edit_file", JSON.stringify({ path, old_text: "remove this" })],
     ["edit_file", JSON.stringify({ path, old_text: "remove this", new_text: null })],
-    ["edit_file", JSON.stringify({ path, old_text: "   ", new_text: "replacement" })],
+    ["edit_file", JSON.stringify({ path, old_text: "", new_text: "replacement" })],
   ] as const;
   try {
     for (const [toolName, rawArguments] of cases) {
@@ -614,6 +614,27 @@ test("edit_file replaces a unique snippet and goes through the permission flow",
       { type: "tool_call_update", status: "in_progress" },
       { type: "tool_call_update", status: "completed" },
     ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("edit_file replaces a unique blank-line snippet through the permission flow", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-blank-lines-"));
+  const path = join(dir, "code.txt");
+  writeFileSync(path, "before\n\nafter\n", "utf8");
+  const conn = createConnectionStub({ permission: "allow" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "edit_file",
+      JSON.stringify({ path, old_text: "\n\n", new_text: "\ninserted\n" })
+    );
+
+    assert.match(result.content, /edited successfully/);
+    assert.equal(readFileSync(path, "utf8"), "before\ninserted\nafter\n");
+    assert.equal(conn.permissionRequests.length, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -39,15 +39,13 @@ test("built-in validation keeps compatible unknown fields and explicit empty wri
   });
 });
 
-test("write and edit constraints reject absent, null, or blank destructive inputs", () => {
+test("write and edit constraints reject absent, null, or empty destructive inputs", () => {
   const cases = [
     ["write_file", '{"path":"out.txt"}', /content.*required/i],
     ["write_file", '{"path":"out.txt","content":null}', /content.*string/i],
     ["edit_file", '{"path":"out.txt","old_text":"x"}', /new_text.*required/i],
     ["edit_file", '{"path":"out.txt","old_text":"x","new_text":null}', /new_text.*string/i],
     ["edit_file", '{"path":"out.txt","old_text":"","new_text":"x"}', /old_text.*non-empty/i],
-    ["edit_file", '{"path":"out.txt","old_text":"   ","new_text":"x"}', /old_text.*non-empty/i],
-    ["edit_file", '{"path":"out.txt","old_text":"\\n\\t","new_text":"x"}', /old_text.*non-empty/i],
     ["run_command", '{"command":"   "}', /command.*non-empty/i],
   ] as const;
 
@@ -56,4 +54,16 @@ test("write and edit constraints reject absent, null, or blank destructive input
     assert.equal(result.ok, false, `${toolName}: ${rawArguments}`);
     if (!result.ok) assert.match(result.message, expected);
   }
+});
+
+test("edit_file accepts non-empty whitespace-only exact-match targets", () => {
+  const result = validateToolArguments(
+    "edit_file",
+    '{"path":"out.txt","old_text":"\\n\\n","new_text":"replacement"}'
+  );
+
+  assert.deepEqual(result, {
+    ok: true,
+    value: { path: "out.txt", old_text: "\n\n", new_text: "replacement" },
+  });
 });
