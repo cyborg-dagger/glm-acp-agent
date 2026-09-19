@@ -674,13 +674,15 @@ export class ToolExecutor {
         return `${type}\t${info.size}\t${entry.name}`;
       });
       const outputLines = [`Listing for ${path} (${absolutePath})`];
-      let byteLimitReached = false;
-      for (const line of lines) {
-        if (Buffer.byteLength([...outputLines, line].join("\n"), "utf8") > this.resourceLimits.listBytes) {
-          byteLimitReached = true;
-          break;
+      let byteLimitReached = Buffer.byteLength(outputLines[0]!, "utf8") > this.resourceLimits.listBytes;
+      if (!byteLimitReached) {
+        for (const line of lines) {
+          if (Buffer.byteLength([...outputLines, line].join("\n"), "utf8") > this.resourceLimits.listBytes) {
+            byteLimitReached = true;
+            break;
+          }
+          outputLines.push(line);
         }
-        outputLines.push(line);
       }
       const marker = `[listing truncated: returned a subset; entries=${this.resourceLimits.listEntries}, bytes=${this.resourceLimits.listBytes}]`;
       const listingTruncated = entryLimitReached || byteLimitReached;

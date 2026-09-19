@@ -55,13 +55,16 @@ export async function readLocalTextPage(
     }
     const end = Math.min(completeLines.length, safeOffset - 1 + safeLimit);
     const selected = completeLines.slice(safeOffset - 1, end).map(line => decodeUtf8Safely(line));
+    const lastCompleteLine = !eof && safeOffset > completeLines.length
+      ? completeLines.length
+      : safeOffset + selected.length - 1;
     const currentLine = completeLines.length + 1;
     const pageEndsAtKnownPartial = !eof && hasPartial && safeOffset <= currentLine && safeOffset + safeLimit - 1 >= currentLine;
     const pageEndsAtBudget = !eof && (hasPartial || bytes.length === maxReadBytes);
     return {
       text: selected.join("\n") + (pageEndsAtKnownPartial && selected.length === 0 ? decodeUtf8Safely(bytes.subarray(lineStart)) : ""),
       firstLine: safeOffset,
-      lastCompleteLine: safeOffset + selected.length - 1,
+      lastCompleteLine,
       ...(totalLines === undefined ? {} : { totalLines }),
       // Advertise a next line only when the whole file is known (eof): the
       // scan always restarts from byte zero, so a budget-bound page can never

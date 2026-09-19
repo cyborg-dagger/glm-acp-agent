@@ -1482,6 +1482,23 @@ test("list_files rejects empty path", async () => {
   assert.match(result.content, /non-empty string/);
 });
 
+test("list_files caps an oversized empty-directory header and marks it truncated", async () => {
+  const dir = mkdtempSync(join(tmpdir(), `glm-executor-list-header-${"x".repeat(90)}-`));
+  const conn = createConnectionStub();
+  const limits: ResourceLimits = {
+    toolResultBytes: 262_144, fileReadBytes: 8 * 1024 * 1024, listEntries: 2000, listBytes: 128,
+    fsConcurrency: 16,
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir, () => "default", () => undefined, limits);
+  try {
+    const result = await exec.execute("tc1", "list_files", JSON.stringify({ path: "." }));
+    assert.ok(Buffer.byteLength(result.content, "utf8") <= limits.listBytes);
+    assert.match(result.content, /\[listing truncated:/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // web_search / web_reader via Z.AI Coding Plan MCP
 // ---------------------------------------------------------------------------

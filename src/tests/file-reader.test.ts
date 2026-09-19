@@ -58,3 +58,20 @@ test("local reader discloses a scan ending after a complete line without a dead-
     assert.equal(followUp.text, "", "following a budget-bound boundary must not re-serve old lines");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("local reader reports only observed complete lines beyond a truncated scan", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-file-reader-"));
+  const path = join(dir, "cap.txt");
+  writeFileSync(path, "a\nb\nc\n");
+  try {
+    const page = await readLocalTextPage(path, 100, 20, 4);
+    assert.deepEqual(page, {
+      text: "",
+      firstLine: 100,
+      lastCompleteLine: 2,
+      truncated: true,
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

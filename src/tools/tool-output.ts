@@ -39,14 +39,24 @@ export function takeUtf8Prefix(text: string, maxBytes: number): string {
 
 export function takeUtf8Suffix(text: string, maxBytes: number): string {
   let used = 0;
-  const characters = Array.from(text);
-  const suffix: string[] = [];
-  for (let index = characters.length - 1; index >= 0; index--) {
-    const character = characters[index]!;
+  let start = text.length;
+  while (start > 0) {
+    let characterStart = start - 1;
+    const codeUnit = text.charCodeAt(characterStart);
+    if (
+      codeUnit >= 0xdc00 &&
+      codeUnit <= 0xdfff &&
+      characterStart > 0 &&
+      text.charCodeAt(characterStart - 1) >= 0xd800 &&
+      text.charCodeAt(characterStart - 1) <= 0xdbff
+    ) {
+      characterStart -= 1;
+    }
+    const character = text.slice(characterStart, start);
     const bytes = Buffer.byteLength(character, "utf8");
     if (used + bytes > maxBytes) break;
     used += bytes;
-    suffix.push(character);
+    start = characterStart;
   }
-  return suffix.reverse().join("");
+  return text.slice(start);
 }
