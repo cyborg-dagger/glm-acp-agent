@@ -1392,7 +1392,10 @@ test(
       const command = `${shellNodeCommand()} -e 'setTimeout(() => require("node:fs").writeFileSync(${shellFixturePath(marker, "background-finished")}, "done"), 250)' >/dev/null 2>&1 & echo started`;
       const result = await exec.execute("tc1", "run_command", JSON.stringify({ command }));
       assert.match(result.content, /Exit code: 0/);
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      const deadline = Date.now() + 2_500;
+      while (!existsSync(marker) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
       assert.equal(readFileSync(marker, "utf8"), "done");
     } finally {
       await removeTestDirectory(dir);
