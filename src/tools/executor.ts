@@ -471,7 +471,9 @@ export class ToolExecutor {
       }
       const hasNext = lines.length > limit;
       const visible = lines.slice(0, limit);
+      const totalLines = hasNext ? undefined : offset - 1 + visible.length;
       return { text: visible.join("\n"), firstLine: offset, lastCompleteLine: offset + visible.length - 1,
+        ...(totalLines === undefined ? {} : { totalLines }),
         ...(hasNext ? { nextLine: offset + visible.length } : {}), truncated: false };
     }
     return readLocalTextPage(path, offset, limit, this.resourceLimits.fileReadBytes, this.signal);

@@ -59,6 +59,18 @@ test("local reader discloses a scan ending after a complete line without a dead-
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("local reader advertises a next page when the requested page ends inside the scanned prefix", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-file-reader-")); const path = join(dir, "cap.txt");
+  writeFileSync(path, "a\nb\nc\n");
+  try {
+    const page = await readLocalTextPage(path, 1, 1, 4);
+    assert.equal(page.text, "a");
+    assert.equal(page.lastCompleteLine, 1);
+    assert.equal(page.nextLine, 2);
+    assert.equal(page.truncated, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("local reader reports only observed complete lines beyond a truncated scan", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-file-reader-"));
   const path = join(dir, "cap.txt");
