@@ -993,6 +993,138 @@ test("fork waits for an active tool and clones a complete assistant/tool batch",
   }
 });
 
+test("fork checkpoints a drained second tool turn so its parent survives restart", async () => {
+  let readStarted!: () => void;
+  const readReady = new Promise<void>((resolve) => { readStarted = resolve; });
+  let releaseRead!: () => void;
+  const readDone = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate() {},
+    async readTextFile() {
+      readStarted();
+      await readDone;
+      return { content: "second turn contents" };
+    },
+    async writeTextFile() {},
+    async requestPermission() {
+      return { outcome: { outcome: "selected", optionId: "allow" } };
+    },
+  };
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-parent-restart-"));
+  const store = new SessionStore(storeRoot);
+  let calls = 0;
+  const agent = new GlmAcpAgent(conn as never, {
+    glm: {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        calls += 1;
+        if (calls === 1) {
+          yield { text: "first turn" };
+        } else {
+          yield { toolCall: { id: "second-read", name: "read_file", arguments: JSON.stringify({ path: "second.txt" }) } };
+        }
+        yield { done: true, stopReason: calls === 1 ? "stop" : "tool_calls" };
+      },
+    },
+    sessionStore: store,
+    connectSessionMcpServers: async () => new SessionMcpTools([]),
+  });
+  await agent.initialize({
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+  } as never);
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
+    const second = agent.prompt({ sessionId, prompt: [{ type: "text", text: "second" }] });
+    await readReady;
+    const fork = agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    releaseRead();
+    assert.equal((await second).stopReason, "cancelled");
+    await fork;
+
+    const persisted = store.load(sessionId);
+    assert.ok(persisted?.messages.some(
+      (message) => message.role === "tool" && message.tool_call_id === "second-read" &&
+        message.content === "second turn contents"
+    ));
+
+    const restarted = new GlmAcpAgent(connection() as never, {
+      sessionStore: store,
+      connectSessionMcpServers: async () => new SessionMcpTools([]),
+    });
+    await restarted.loadSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await restarted.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+  } finally {
+    releaseRead();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("fork checkpoints a settled parent after configuration persists during drain", async () => {
+  let readStarted!: () => void;
+  const readReady = new Promise<void>((resolve) => { readStarted = resolve; });
+  let releaseRead!: () => void;
+  const readDone = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate() {},
+    async readTextFile() {
+      readStarted();
+      await readDone;
+      return { content: "racing contents" };
+    },
+    async writeTextFile() {},
+    async requestPermission() {
+      return { outcome: { outcome: "selected", optionId: "allow" } };
+    },
+  };
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-config-race-"));
+  const store = new SessionStore(storeRoot);
+  const agent = new GlmAcpAgent(conn as never, {
+    glm: {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        yield { toolCall: { id: "racing-read", name: "read_file", arguments: JSON.stringify({ path: "race.txt" }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    },
+    sessionStore: store,
+    connectSessionMcpServers: async () => new SessionMcpTools([]),
+  });
+  await agent.initialize({
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+  } as never);
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read" }] });
+    await readReady;
+    const fork = agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    await agent.setSessionMode({ sessionId, modeId: "bypass_permissions" });
+    releaseRead();
+    assert.equal((await prompt).stopReason, "cancelled");
+    await fork;
+
+    const persisted = store.load(sessionId);
+    assert.equal(persisted?.mode, "bypass_permissions");
+    assert.ok(persisted?.messages.some(
+      (message) => message.role === "tool" && message.tool_call_id === "racing-read" &&
+        message.content === "racing contents"
+    ));
+
+    const restarted = new GlmAcpAgent(connection() as never, {
+      sessionStore: store,
+      connectSessionMcpServers: async () => new SessionMcpTools([]),
+    });
+    await restarted.loadSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await restarted.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+  } finally {
+    releaseRead();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
 test("a timed-out fork creates no child resources and reopens after the prompt drains", async () => {
   const conn = connection();
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-timeout-"));

@@ -1069,6 +1069,11 @@ export class GlmAcpAgent implements Agent {
           ? this.snapshot(params.sessionId, source)
           : this.requirePersisted(params.sessionId);
         assertSettledToolHistory(persisted.messages);
+        // A draining prompt deliberately suppresses its normal final save:
+        // the fork owns its lifecycle while it settles. Checkpoint the exact
+        // settled parent snapshot before any child setup, so a restart cannot
+        // recover the older (and possibly unmatched) tool-call history.
+        if (source) this.persistSession(params.sessionId, source, persisted);
         provisional = await this.connectMcpServers(params.mcpServers ?? []);
         if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
           throw new Error(`Session fork cancelled: ${params.sessionId}`);
@@ -1433,11 +1438,15 @@ export class GlmAcpAgent implements Agent {
     };
   }
 
-  private persistSession(sessionId: string, session: SessionState): void {
+  private persistSession(
+    sessionId: string,
+    session: SessionState,
+    persisted = this.snapshot(sessionId, session),
+  ): void {
     if (this.sessions.get(sessionId) !== session) return;
     if (!this.sessionStore) return;
     try {
-      this.sessionStore.save(this.snapshot(sessionId, session));
+      this.sessionStore.save(persisted);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(
