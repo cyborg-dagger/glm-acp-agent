@@ -1085,18 +1085,26 @@ export class GlmAcpAgent implements Agent {
         deadlineMs,
       );
 
+      const resourceDisposals: Promise<void>[] = [];
       for (let index = 0; index < sessions.length; index += 1) {
         const [sessionId, session] = sessions[index]!;
         session.closed = true;
         // A prompt that missed the drain deadline may still hold an unmatched
         // assistant tool call. Leave the last valid on-disk checkpoint intact.
         if (promptsSettled[index] === true) this.persistSession(sessionId, session);
-        await this.disposeSessionTools(session).catch(() => undefined);
+        resourceDisposals.push(this.disposeSessionTools(session).catch(() => undefined));
         if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
         this.sessionTodos.delete(sessionId);
       }
       this.transitions.clear();
-      await this._visionClient?.dispose();
+      if (this._visionClient) resourceDisposals.push(this._visionClient.dispose());
+      let resourceCleanupError: unknown;
+      const resourcesDrained = await settlesWithin(
+        Promise.all(resourceDisposals).catch((error) => {
+          resourceCleanupError = error;
+        }),
+        deadlineMs,
+      );
 
       if (this.processSupervisor.hasActiveProcesses()) {
         await this.processSupervisor.forceTerminateAll();
@@ -1104,6 +1112,10 @@ export class GlmAcpAgent implements Agent {
       if (this.processSupervisor.hasActiveProcesses()) {
         throw new Error("Agent shutdown left active command processes");
       }
+      if (!resourcesDrained) {
+        throw new Error("Agent shutdown timed out waiting for resource cleanup");
+      }
+      if (resourceCleanupError) throw resourceCleanupError;
       if (!auxDrained || promptsSettled.some((settled) => !settled)) {
         throw new Error("Agent shutdown timed out waiting for prompt cleanup");
       }

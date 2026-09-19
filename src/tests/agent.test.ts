@@ -842,6 +842,51 @@ test("shutdown is idempotent and stops new session admission", async () => {
   await assert.rejects(agent.newSession({ cwd: "/tmp", mcpServers: [] }), /shutting down/);
 });
 
+for (const resource of ["session MCP", "vision MCP"] as const) {
+  test(`shutdown bounds a stalled ${resource} disposal`, async () => {
+    const never = new Promise<void>(() => {});
+    const options = resource === "session MCP"
+      ? {
+          sessionStore: null,
+          shutdownDrainTimeoutMs: 20,
+          mcpConnector: async () => ({
+            toolDefinitions: [],
+            async dispose() { await never; },
+          }) as never,
+        }
+      : {
+          sessionStore: null,
+          shutdownDrainTimeoutMs: 20,
+          visionClient: {
+            async callTool() { return {}; },
+            async dispose() { await never; },
+          },
+        };
+    const agent = new GlmAcpAgent(createConnectionStub() as never, options);
+    if (resource === "session MCP") {
+      await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    }
+
+    const watchdog = new Promise<Error>((resolve) => {
+      const timer = setTimeout(
+        () => resolve(new Error(`watchdog: shutdown waited indefinitely for ${resource}`)),
+        200,
+      );
+      timer.unref();
+    });
+    const outcome = await Promise.race([
+      agent.shutdown("disconnect").then(
+        () => new Error("shutdown unexpectedly resolved"),
+        (error: unknown) => error instanceof Error ? error : new Error(String(error)),
+      ),
+      watchdog,
+    ]);
+
+    assert.doesNotMatch(outcome.message, /watchdog|unexpectedly resolved/);
+    assert.match(outcome.message, /timed out waiting for resource cleanup/);
+  });
+}
+
 test("shutdown keeps the last valid checkpoint when a prompt exceeds the drain deadline", async () => {
   const { store, cleanup } = makeTempStore();
   try {
