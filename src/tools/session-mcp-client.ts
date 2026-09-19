@@ -22,6 +22,8 @@ const CMD_METACHARACTERS = /[&|<>^"%!\r\n\0]/;
 const SECRET_ENV_NAME = /key|token|secret|password|passwd|pwd|credential|auth|cookie/i;
 /** Exact names that match SECRET_ENV_NAME but are never credentials — exempt these, not the substring. */
 const NON_SECRET_ENV_NAMES = new Set(["PWD", "OLDPWD"]);
+const CHILD_TERM_GRACE_MS = 250;
+const CHILD_KILL_SETTLE_MS = 500;
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -99,12 +101,24 @@ export class SessionMcpTools {
     if (!this.disposePromise) {
       this.disposePromise = (async () => {
         const clients = Array.from(this.clients);
-        await Promise.all(clients.map((client) => client.dispose().catch(() => undefined)));
+        const results = await Promise.allSettled(clients.map((client) => client.dispose()));
         this.clients.clear();
         this.bindings.clear();
+        const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        if (failure) throw failure.reason;
       })();
     }
     await this.disposePromise;
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function closeChildPipes(child: ChildProcessWithoutNullStreams): void {
+  for (const stream of [child.stdin, child.stdout, child.stderr]) {
+    try { stream.destroy(); } catch { /* already closed */ }
   }
 }
 
@@ -493,7 +507,7 @@ export class StdioMcpClient implements ConnectedMcpClient {
     this.initializingChild = null;
     this.exited = true;
     this.exitReason = "client disposed";
-    if (child) this.terminateChild(child);
+    if (child) await this.terminateChildAndWait(child);
     this.rejectAllPending(new Error("cancelled (client disposed)"));
   }
 
@@ -726,20 +740,55 @@ export class StdioMcpClient implements ConnectedMcpClient {
   }
 
   private terminateChild(child: ChildProcessWithoutNullStreams): void {
+    void this.terminateChildAndWait(child).catch(() => undefined);
+  }
+
+  private async terminateChildAndWait(child: ChildProcessWithoutNullStreams): Promise<void> {
+    if (child.exitCode !== null) {
+      closeChildPipes(child);
+      return;
+    }
+    let settled = false;
+    let resolveExit!: () => void;
+    const exited = new Promise<void>((resolve) => { resolveExit = resolve; });
+    const onExit = () => {
+      if (settled) return;
+      settled = true;
+      resolveExit();
+    };
+    child.once("exit", onExit);
+    child.once("close", onExit);
+    child.once("error", onExit);
+    closeChildPipes(child);
+    if (this.sendChildSignal(child, "SIGTERM")) settled = true;
+    await Promise.race([exited, delay(CHILD_TERM_GRACE_MS)]);
+    if (!settled) {
+      this.sendChildSignal(child, "SIGKILL");
+      await Promise.race([exited, delay(CHILD_KILL_SETTLE_MS)]);
+    }
+    child.removeListener("exit", onExit);
+    child.removeListener("close", onExit);
+    child.removeListener("error", onExit);
+    closeChildPipes(child);
+    if (!settled) throw new Error("MCP child process did not exit after termination");
+  }
+
+  private sendChildSignal(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): boolean {
     const platform = this.opts.platform ?? process.platform;
     // `child.kill()` only reaches cmd.exe, orphaning the npx -> node tree underneath it.
     if (platform === "win32" && child.pid && child.exitCode === null) {
       try {
-        if (this.killProcessTree(child.pid)) return;
+        if (this.killProcessTree(child.pid)) return true;
       } catch {
         // fall back to the direct child below
       }
     }
     try {
-      child.kill();
+      child.kill(signal);
     } catch {
       // ignore
     }
+    return false;
   }
 
   private handleStderr(chunk: string): void {

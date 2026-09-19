@@ -11,6 +11,8 @@ import {
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_INITIALIZATION_TIMEOUT_MS = 30_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+const CHILD_TERM_GRACE_MS = 250;
+const CHILD_KILL_SETTLE_MS = 500;
 const STDERR_TAIL_LIMIT = 16_384;
 
 export interface VisionMcpClient {
@@ -43,6 +45,16 @@ interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
   method: string;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function closeChildPipes(child: ChildProcessWithoutNullStreams): void {
+  for (const stream of [child.stdin, child.stdout, child.stderr]) {
+    try { stream.destroy(); } catch { /* already closed */ }
+  }
 }
 
 export class StdioVisionMcpClient implements VisionMcpClient {
@@ -134,7 +146,7 @@ export class StdioVisionMcpClient implements VisionMcpClient {
     this.exited = true;
     this.exitReason = "client disposed";
     if (child) {
-      this.terminateChild(child);
+      await this.terminateChildAndWait(child);
     }
     this.rejectAllPending(new Error("cancelled (client disposed)"));
   }
@@ -294,25 +306,60 @@ export class StdioVisionMcpClient implements VisionMcpClient {
   }
 
   private terminateChild(child: ChildProcessWithoutNullStreams): void {
+    void this.terminateChildAndWait(child).catch(() => undefined);
+  }
+
+  private async terminateChildAndWait(child: ChildProcessWithoutNullStreams): Promise<void> {
+    if (child.exitCode !== null) {
+      closeChildPipes(child);
+      return;
+    }
+    let settled = false;
+    let resolveExit!: () => void;
+    const exited = new Promise<void>((resolve) => { resolveExit = resolve; });
+    const onExit = () => {
+      if (settled) return;
+      settled = true;
+      resolveExit();
+    };
+    child.once("exit", onExit);
+    child.once("close", onExit);
+    child.once("error", onExit);
+    closeChildPipes(child);
+    if (this.sendChildSignal(child, "SIGTERM")) settled = true;
+    await Promise.race([exited, delay(CHILD_TERM_GRACE_MS)]);
+    if (!settled) {
+      this.sendChildSignal(child, "SIGKILL");
+      await Promise.race([exited, delay(CHILD_KILL_SETTLE_MS)]);
+    }
+    child.removeListener("exit", onExit);
+    child.removeListener("close", onExit);
+    child.removeListener("error", onExit);
+    closeChildPipes(child);
+    if (!settled) throw new Error("Vision MCP child process did not exit after termination");
+  }
+
+  private sendChildSignal(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): boolean {
     const platform = this.opts.platform ?? process.platform;
     if (platform === "win32" && child.pid && child.exitCode === null && (!this.opts.spawn || this.opts.killProcessTree)) {
       try {
         const killed = this.opts.killProcessTree
-          ? this.opts.killProcessTree(child.pid)
-          : nodeSpawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
-              stdio: "ignore",
-              windowsHide: true,
-            }).status === 0;
-        if (killed) return;
+            ? this.opts.killProcessTree(child.pid)
+            : nodeSpawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+                stdio: "ignore",
+                windowsHide: true,
+              }).status === 0;
+        if (killed) return true;
       } catch {
         // fall back to the direct child below
       }
     }
     try {
-      child.kill();
+      child.kill(signal);
     } catch {
       // ignore
     }
+    return false;
   }
 
   private handleStderr(chunk: string): void {

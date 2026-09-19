@@ -38,6 +38,8 @@ function makeFakeChild(): {
     exitCode: null,
     kill: () => {
       killCount += 1;
+      child.exitCode = 137;
+      queueMicrotask(() => child.emit("exit", 137, "SIGTERM"));
       return true;
     },
   }) as FakeChild;
@@ -286,6 +288,41 @@ test("StdioVisionMcpClient terminates the Windows process tree on dispose", asyn
   await assert.rejects(callPromise, /client disposed/i);
   assert.equal(terminatedPid, 4242);
   assert.equal(getKillCount(), 0);
+});
+
+test("StdioVisionMcpClient disposal escalates a stubborn child and waits for exit", async () => {
+  const { child } = makeFakeChild();
+  const signals: string[] = [];
+  child.kill = (signal?: string) => {
+    signals.push(signal ?? "default");
+    if (signals.length === 2) {
+      child.exitCode = 137;
+      child.emit("exit", 137, "SIGKILL");
+    }
+    return true;
+  };
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  (client as unknown as { child: FakeChild }).child = child;
+  let disposeResolved = false;
+  const disposing = client.dispose().then(() => { disposeResolved = true; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(disposeResolved, false);
+  await disposing;
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(child.stdin.destroyed, true);
+  assert.equal(child.stdout.destroyed, true);
+  assert.equal(child.stderr.destroyed, true);
+});
+
+test("StdioVisionMcpClient disposal rejects when KILL cannot prove child exit", async () => {
+  const { child } = makeFakeChild();
+  child.kill = () => true;
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  (client as unknown as { child: FakeChild }).child = child;
+  await assert.rejects(client.dispose(), /did not exit after termination/i);
+  assert.equal(child.stdin.destroyed, true);
+  assert.equal(child.stdout.destroyed, true);
+  assert.equal(child.stderr.destroyed, true);
 });
 
 test("StdioVisionMcpClient drains and redacts stderr on failure", async () => {

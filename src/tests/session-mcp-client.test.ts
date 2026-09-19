@@ -46,6 +46,8 @@ function makeFakeChild(): {
     exitCode: null,
     kill: () => {
       killCount += 1;
+      child.exitCode = 137;
+      queueMicrotask(() => child.emit("exit", 137, "SIGTERM"));
       return true;
     },
   }) as FakeChild;
@@ -494,6 +496,41 @@ test("StdioMcpClient times out an individual tools/call and terminates the child
   await assert.rejects(() => client.callTool("search", { q: "x" }), /timed out after \d+ms/i);
   assert.equal(getKillCount(), 1);
   await client.dispose();
+});
+
+test("StdioMcpClient disposal escalates a stubborn child and waits for exit", async () => {
+  const { child } = makeFakeChild();
+  let disposeResolved = false;
+  child.kill = (signal?: string) => {
+    assert.equal(signal, "SIGTERM");
+    child.kill = (nextSignal?: string) => {
+      assert.equal(nextSignal, "SIGKILL");
+      child.exitCode = 137;
+      child.emit("exit", 137, "SIGKILL");
+      return true;
+    };
+    return true;
+  };
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+  (client as unknown as { child: FakeChild }).child = child;
+  const disposing = client.dispose().then(() => { disposeResolved = true; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(disposeResolved, false);
+  await disposing;
+  assert.equal(child.stdin.destroyed, true);
+  assert.equal(child.stdout.destroyed, true);
+  assert.equal(child.stderr.destroyed, true);
+});
+
+test("StdioMcpClient disposal rejects when KILL cannot prove child exit", async () => {
+  const { child } = makeFakeChild();
+  child.kill = () => true;
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+  (client as unknown as { child: FakeChild }).child = child;
+  await assert.rejects(client.dispose(), /did not exit after termination/i);
+  assert.equal(child.stdin.destroyed, true);
+  assert.equal(child.stdout.destroyed, true);
+  assert.equal(child.stderr.destroyed, true);
 });
 
 test("StdioMcpClient launches npx through cmd.exe on Windows", async () => {
