@@ -623,6 +623,64 @@ test("close is retained while an unloaded resume is setting up replacement resou
   }
 });
 
+test("close aborts stalled restore MCP setup and disposes a late replacement once", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-abort-restore-setup-"));
+  const store = new SessionStore(storeRoot);
+  const sessionId = "55555555-5555-5555-5555-555555555555";
+  store.save({
+    sessionId,
+    cwd: "/tmp",
+    messages: [{ role: "system", content: "system" }],
+    title: null,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    model: "glm-5.3",
+    mode: "default",
+  });
+  let setupStarted!: () => void;
+  const setupReady = new Promise<void>((resolve) => { setupStarted = resolve; });
+  let releaseLateResult!: () => void;
+  const lateResult = new Promise<void>((resolve) => { releaseLateResult = resolve; });
+  let abortObserved = false;
+  let disposed = 0;
+  const replacement = new SessionMcpTools([]);
+  replacement.dispose = async () => { disposed += 1; };
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: store,
+    connectSessionMcpServers: async (_servers, signal) => {
+      setupStarted();
+      await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+      abortObserved = signal?.aborted === true;
+      await lateResult;
+      return replacement;
+    },
+  });
+  try {
+    const resume = agent.resumeSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+    await setupReady;
+    const close = agent.closeSession({ sessionId });
+    await Promise.race([
+      close,
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("close waited for stalled MCP setup")), 50);
+      }),
+    ]);
+    assert.equal(abortObserved, true, "close must abort the restore connector");
+    await assert.rejects(resume, /cancelled/i);
+    assert.equal(disposed, 0, "a late replacement is not available to dispose yet");
+    releaseLateResult();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(disposed, 1, "a late replacement is disposed exactly once");
+    await assert.rejects(
+      agent.prompt({ sessionId, prompt: [{ type: "text", text: "late" }] }),
+      /Session not found/i,
+    );
+  } finally {
+    releaseLateResult();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
 test("a load replay failure disposes provisional resources and keeps the live original", async () => {
   const updates: Array<Record<string, unknown>> = [];
   let failReplay = false;
