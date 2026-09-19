@@ -36,41 +36,48 @@ export async function readLocalTextPage(
       consumed += bytesRead;
     }
     const bytes = Buffer.concat(chunks, consumed);
-    const completeLines: Buffer[] = [];
+    const safeOffset = Math.max(1, Math.floor(offset));
+    const safeLimit = Math.max(1, Math.floor(limit));
+    const selectedLines: Buffer[] = [];
+    let completeLineCount = 0;
     let lineStart = 0;
     for (let i = 0; i < bytes.length; i++) {
       if (bytes[i] === 0x0a) {
-        completeLines.push(bytes.subarray(lineStart, i));
+        completeLineCount += 1;
+        if (completeLineCount >= safeOffset && completeLineCount < safeOffset + safeLimit) {
+          selectedLines.push(bytes.subarray(lineStart, i));
+        }
         lineStart = i + 1;
       }
     }
     const hasPartial = lineStart < bytes.length;
-    if (eof && !hasPartial && completeLines.length === 0 && bytes.length > 0) completeLines.push(bytes);
-    if (eof && hasPartial) completeLines.push(bytes.subarray(lineStart));
-    const totalLines = eof ? completeLines.length : undefined;
-    const safeOffset = Math.max(1, Math.floor(offset));
-    const safeLimit = Math.max(1, Math.floor(limit));
+    if (eof && hasPartial) {
+      completeLineCount += 1;
+      if (completeLineCount >= safeOffset && completeLineCount < safeOffset + safeLimit) {
+        selectedLines.push(bytes.subarray(lineStart));
+      }
+    }
+    const totalLines = eof ? completeLineCount : undefined;
     if (totalLines !== undefined && safeOffset > totalLines) {
       return { text: "", firstLine: safeOffset, lastCompleteLine: totalLines, totalLines, truncated: false };
     }
-    const end = Math.min(completeLines.length, safeOffset - 1 + safeLimit);
-    const selected = completeLines.slice(safeOffset - 1, end).map(line => decodeUtf8Safely(line));
-    const lastCompleteLine = !eof && safeOffset > completeLines.length
-      ? completeLines.length
+    const selected = selectedLines.map(line => decodeUtf8Safely(line));
+    const lastCompleteLine = !eof && safeOffset > completeLineCount
+      ? completeLineCount
       : safeOffset + selected.length - 1;
-    const currentLine = completeLines.length + 1;
+    const currentLine = completeLineCount + 1;
     const pageEndsAtKnownPartial = !eof && hasPartial && safeOffset <= currentLine && safeOffset + safeLimit - 1 >= currentLine;
     const pageEndsAtBudget = !eof && (hasPartial || bytes.length === maxReadBytes);
+    const pageEnd = safeOffset + selected.length - 1;
+    const nextLine = !pageEndsAtKnownPartial && selected.length === safeLimit && pageEnd < completeLineCount
+      ? pageEnd + 1
+      : undefined;
     return {
       text: selected.join("\n") + (pageEndsAtKnownPartial && selected.length === 0 ? decodeUtf8Safely(bytes.subarray(lineStart)) : ""),
       firstLine: safeOffset,
       lastCompleteLine,
       ...(totalLines === undefined ? {} : { totalLines }),
-      // Advertise a next line only when the whole file is known (eof): the
-      // scan always restarts from byte zero, so a budget-bound page can never
-      // serve lines beyond its own prefix — following such an offset would
-      // dead-end on an empty result.
-      ...(totalLines !== undefined && end < totalLines ? { nextLine: end + 1 } : {}),
+      ...(nextLine === undefined ? {} : { nextLine }),
       truncated: pageEndsAtBudget,
       ...(pageEndsAtKnownPartial ? { incompleteLine: currentLine } : {}),
     };

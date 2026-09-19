@@ -1594,8 +1594,10 @@ export class GlmAcpAgent implements Agent {
     const messages = result.messages.map((message, index) => {
       if (index !== lastUser) return message;
       const replacement = appendCompactionNote(message, result.removedExchanges, result.reducedToolResults);
-      const display = session.displayText.get(message);
-      if (display !== undefined) session.displayText.set(replacement, display);
+      // Compaction notes are model-facing metadata. Keep the original
+      // user-visible rendering for replay even when the message had no
+      // pre-existing display sidecar.
+      session.displayText.set(replacement, session.displayText.get(message) ?? stringifyUserMessage(message.content));
       return replacement;
     });
     assertValidHistory(messages);

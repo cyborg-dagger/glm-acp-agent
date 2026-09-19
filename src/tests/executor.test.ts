@@ -441,6 +441,28 @@ test("read_file treats editor line pagination as pagination, not byte truncation
   }
 });
 
+test("read_file renders EOF for a conforming editor at a short or empty offset", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-eof-"));
+  const path = join(dir, "paged.txt");
+  writeFileSync(path, "line-1\nline-2", "utf8");
+  const conn = {
+    async sessionUpdate() {},
+    async readTextFile(params: { line?: number; limit?: number }) {
+      const lines = ["line-1", "line-2"];
+      const line = params.line ?? 1;
+      const limit = params.limit ?? lines.length;
+      return { content: lines.slice(line - 1, line - 1 + limit).join("\n") };
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  try {
+    const short = await exec.execute("tc1", "read_file", JSON.stringify({ path, offset: 1, limit: 4 }));
+    assert.equal(short.content, "line-1\nline-2");
+    const empty = await exec.execute("tc2", "read_file", JSON.stringify({ path, offset: 3, limit: 2 }));
+    assert.match(empty.content, /offset 3 is beyond the last line of .* \(2 lines\)/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("read_file paginates a legacy editor full buffer for a short offset page", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-legacy-page-"));
   const path = join(dir, "paged.txt");
