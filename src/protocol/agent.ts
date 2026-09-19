@@ -1237,6 +1237,7 @@ export class GlmAcpAgent implements Agent {
           restored.model = original.model;
           restored.mode = original.mode;
           restored.thoughtLevel = original.thoughtLevel;
+          restored.updatedAt = original.updatedAt;
         }
         this.sessions.set(params.sessionId, restored);
         this.sessionTodos.delete(params.sessionId);

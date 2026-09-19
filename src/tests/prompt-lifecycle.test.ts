@@ -1169,11 +1169,18 @@ test("a configuration change during load replay is carried into the replacement"
     replayArmed = true;
     const loading = agent.loadSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
     await replayBlocked;
+    const timestampBeforeChange = store.load(sessionId)!.updatedAt;
+    while (Date.now() <= Date.parse(timestampBeforeChange)) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     await agent.setSessionMode({ sessionId, modeId: "bypass_permissions" });
+    const timestampAfterChange = store.load(sessionId)!.updatedAt;
+    assert.notEqual(timestampAfterChange, timestampBeforeChange);
     releaseReplay();
     const loaded = await loading;
     assert.equal(loaded.modes?.currentModeId, "bypass_permissions");
     assert.equal(store.load(sessionId)?.mode, "bypass_permissions");
+    assert.equal(store.load(sessionId)?.updatedAt, timestampAfterChange);
   } finally {
     releaseReplay();
     await rm(storeRoot, { recursive: true, force: true });
