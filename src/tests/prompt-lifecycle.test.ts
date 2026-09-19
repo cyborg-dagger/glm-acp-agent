@@ -1296,6 +1296,58 @@ test("a timed-out fork creates no child resources and reopens after the prompt d
   }
 });
 
+test("close cancels stalled fork MCP setup and disposes its late result once", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-close-fork-setup-"));
+  const store = new SessionStore(storeRoot);
+  let setupStarted!: () => void;
+  const setupReady = new Promise<void>((resolve) => { setupStarted = resolve; });
+  let releaseLateResult!: () => void;
+  const lateResult = new Promise<void>((resolve) => { releaseLateResult = resolve; });
+  let setupSignal: AbortSignal | undefined;
+  let connections = 0;
+  let disposed = 0;
+  const replacement = new SessionMcpTools([]);
+  replacement.dispose = async () => { disposed += 1; };
+  const agent = new GlmAcpAgent(conn as never, {
+    glm: textGlm(),
+    sessionStore: store,
+    connectSessionMcpServers: async (_servers, signal) => {
+      connections += 1;
+      if (connections === 1) return new SessionMcpTools([]);
+      setupSignal = signal;
+      setupStarted();
+      await lateResult;
+      return replacement;
+    },
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  let fork: Promise<unknown> | undefined;
+  let forkRejected: Promise<void> | undefined;
+  let closing: Promise<void> | undefined;
+  try {
+    fork = agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    forkRejected = assert.rejects(fork, /fork cancelled/i);
+    await setupReady;
+    closing = agent.closeSession({ sessionId });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(setupSignal?.aborted, true, "close must abort the fork connector");
+    await forkRejected;
+    const watchdog = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("close waited for stalled fork MCP setup")), 100).unref();
+    });
+    await Promise.race([closing, watchdog]);
+    assert.equal(disposed, 0, "the late setup result is not available yet");
+    releaseLateResult();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(disposed, 1, "a late setup result is disposed exactly once");
+  } finally {
+    releaseLateResult();
+    await Promise.allSettled([fork, closing].filter((value): value is Promise<unknown> => value !== undefined));
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
 test("an unloaded fork cannot race a restore of the same persisted session", async () => {
   const conn = connection();
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-unloaded-race-"));

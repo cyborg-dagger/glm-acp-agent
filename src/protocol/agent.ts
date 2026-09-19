@@ -1059,9 +1059,16 @@ export class GlmAcpAgent implements Agent {
     const lifecycle = record.lifecycle;
     const lease = lifecycle.begin("snapshotting");
     record.original = source ?? null;
+    const forkAbortController = new AbortController();
+    record.restoreAbortController = forkAbortController;
     let deferLeaseRelease = false;
     const transition = Promise.resolve().then(async (): Promise<ForkSessionResponse> => {
       let provisional: SessionMcpTools | null = null;
+      let provisionalDisposal: Promise<void> | null = null;
+      const disposeProvisional = (tools: SessionMcpTools): Promise<void> => {
+        if (!provisionalDisposal) provisionalDisposal = tools.dispose();
+        return provisionalDisposal;
+      };
       try {
         if (source) {
           source.abortController?.abort();
@@ -1084,7 +1091,20 @@ export class GlmAcpAgent implements Agent {
         // settled parent snapshot before any child setup, so a restart cannot
         // recover the older (and possibly unmatched) tool-call history.
         if (source) this.persistSession(params.sessionId, source, persisted);
-        provisional = await this.connectMcpServers(params.mcpServers ?? []);
+        const setup = this.connectMcpServers(params.mcpServers ?? [], forkAbortController.signal);
+        void setup.then(
+          (tools) => {
+            if (forkAbortController.signal.aborted) {
+              void disposeProvisional(tools).catch(() => undefined);
+            }
+          },
+          () => undefined
+        );
+        provisional = await waitForAbort(
+          setup,
+          forkAbortController.signal,
+          `Session fork cancelled: ${params.sessionId}`
+        );
         if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
           throw new Error(`Session fork cancelled: ${params.sessionId}`);
         }
@@ -1092,7 +1112,7 @@ export class GlmAcpAgent implements Agent {
         provisional = null;
         return response;
       } finally {
-        await provisional?.dispose();
+        if (provisional) await disposeProvisional(provisional);
         if (!deferLeaseRelease) lease.release();
       }
     });
@@ -1102,6 +1122,9 @@ export class GlmAcpAgent implements Agent {
     } finally {
       if (record.promise === transition) record.promise = null;
       if (!deferLeaseRelease && record.original === (source ?? null)) record.original = null;
+      if (record.restoreAbortController === forkAbortController) {
+        record.restoreAbortController = null;
+      }
     }
   }
 
