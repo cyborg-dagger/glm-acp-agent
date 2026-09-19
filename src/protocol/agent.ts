@@ -153,8 +153,6 @@ interface SessionState {
   closing: boolean;
   /** True after closeSession has disposed and removed this session. */
   closed: boolean;
-  /** De-duplicates concurrent closeSession calls. */
-  closePromise: Promise<void> | null;
   title: string | null;
   updatedAt: string;
   /** Active model for this session (clients can change via `session/set_model`). */
@@ -438,7 +436,6 @@ export class GlmAcpAgent implements Agent {
       promptPromise: null,
       closing: false,
       closed: false,
-      closePromise: null,
       title: null,
       updatedAt: new Date().toISOString(),
       model,
@@ -1054,10 +1051,85 @@ export class GlmAcpAgent implements Agent {
     params: ForkSessionRequest
   ): Promise<ForkSessionResponse> {
     const source = this.sessions.get(params.sessionId);
-    const persisted = source
-      ? this.snapshot(params.sessionId, source)
-      : this.requirePersisted(params.sessionId);
-    const mcpTools = await this.connectMcpServers(params.mcpServers ?? []);
+    const record = this.transitions.get(params.sessionId)
+      ?? this.registerTransition(params.sessionId, source?.lifecycle ?? new SessionLifecycle());
+    const lifecycle = record.lifecycle;
+    const lease = lifecycle.begin("snapshotting");
+    record.original = source ?? null;
+    const forkAbortController = new AbortController();
+    record.restoreAbortController = forkAbortController;
+    let deferLeaseRelease = false;
+    const transition = Promise.resolve().then(async (): Promise<ForkSessionResponse> => {
+      let provisional: SessionMcpTools | null = null;
+      let provisionalDisposal: Promise<void> | null = null;
+      const disposeProvisional = (tools: SessionMcpTools): Promise<void> => {
+        if (!provisionalDisposal) provisionalDisposal = tools.dispose();
+        return provisionalDisposal;
+      };
+      try {
+        if (source) {
+          source.abortController?.abort();
+          const { drained, pending } = await this.drainPrompt(source);
+          if (!drained) {
+            deferLeaseRelease = true;
+            this.releaseAfterPromptDrain(params.sessionId, pending, source, lifecycle, lease, record);
+            throw new Error(`Session fork timed out waiting for prompt cleanup: ${lease.generation}`);
+          }
+        }
+        if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
+          throw new Error(`Session fork cancelled: ${params.sessionId}`);
+        }
+        const persisted = source
+          ? this.snapshot(params.sessionId, source)
+          : this.requirePersisted(params.sessionId);
+        assertSettledToolHistory(persisted.messages);
+        // A draining prompt deliberately suppresses its normal final save:
+        // the fork owns its lifecycle while it settles. Checkpoint the exact
+        // settled parent snapshot before any child setup, so a restart cannot
+        // recover the older (and possibly unmatched) tool-call history.
+        if (source) this.persistSession(params.sessionId, source, persisted);
+        const setup = this.connectMcpServers(params.mcpServers ?? [], forkAbortController.signal);
+        void setup.then(
+          (tools) => {
+            if (forkAbortController.signal.aborted) {
+              void disposeProvisional(tools).catch(() => undefined);
+            }
+          },
+          () => undefined
+        );
+        provisional = await waitForAbort(
+          setup,
+          forkAbortController.signal,
+          `Session fork cancelled: ${params.sessionId}`
+        );
+        if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
+          throw new Error(`Session fork cancelled: ${params.sessionId}`);
+        }
+        const response = this.createFork(params, persisted, provisional);
+        provisional = null;
+        return response;
+      } finally {
+        if (provisional) await disposeProvisional(provisional);
+        if (!deferLeaseRelease) lease.release();
+      }
+    });
+    record.promise = transition;
+    try {
+      return await transition;
+    } finally {
+      if (record.promise === transition) record.promise = null;
+      if (!deferLeaseRelease && record.original === (source ?? null)) record.original = null;
+      if (record.restoreAbortController === forkAbortController) {
+        record.restoreAbortController = null;
+      }
+    }
+  }
+
+  private createFork(
+    params: ForkSessionRequest,
+    persisted: PersistedSession,
+    mcpTools: SessionMcpTools,
+  ): ForkSessionResponse {
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const newSessionId = randomUUID();
@@ -1077,7 +1149,6 @@ export class GlmAcpAgent implements Agent {
       promptPromise: null,
       closing: false,
       closed: false,
-      closePromise: null,
       title: forkedTitle,
       updatedAt: new Date().toISOString(),
       model: persisted.model,
@@ -1156,7 +1227,7 @@ export class GlmAcpAgent implements Agent {
           const { drained, pending } = await this.drainPrompt(original);
           if (!drained) {
             deferLeaseRelease = true;
-            this.releaseAfterPromptDrain(pending, original, lifecycle, lease, record);
+            this.releaseAfterPromptDrain(params.sessionId, pending, original, lifecycle, lease, record);
             throw new Error(`Session restore timed out waiting for prompt cleanup: ${lease.generation}`);
           }
           this.assertRestoreOwner(lifecycle, lease);
@@ -1203,7 +1274,6 @@ export class GlmAcpAgent implements Agent {
           promptPromise: null,
           closing: false,
           closed: false,
-          closePromise: null,
           title: restoreSource.title,
           updatedAt: restoreSource.updatedAt,
           model: restoreSource.model,
@@ -1224,7 +1294,12 @@ export class GlmAcpAgent implements Agent {
         // client rejects a replay notification, leave the live original in
         // place and dispose the provisional resources below.
         if (replay) {
-          await this.replayMessages(params.sessionId, restoredMessages, restored.displayText);
+          await this.replayMessages(
+            params.sessionId,
+            restoredMessages,
+            restored.displayText,
+            restoreAbortController.signal,
+          );
         }
         if (lifecycle.closeRequested) {
           throw new Error(`Session restore cancelled: ${params.sessionId}`);
@@ -1260,6 +1335,9 @@ export class GlmAcpAgent implements Agent {
           configOptions: this.configOptionsState(restored.model, restored.thoughtLevel, restored.mode),
         };
       } catch (err) {
+        if (!swapped && original) {
+          this.persistOriginalIfOwned(params.sessionId, original, lifecycle, lease, record);
+        }
         if (!swapped) {
           if (provisional) await disposeProvisional(provisional);
         }
@@ -1276,6 +1354,14 @@ export class GlmAcpAgent implements Agent {
       if (!deferLeaseRelease && record.original === original) record.original = null;
       if (record.restoreAbortController === restoreAbortController) {
         record.restoreAbortController = null;
+      }
+      if (
+        this.transitions.get(params.sessionId) === record &&
+        !record.closePromise &&
+        !record.promise &&
+        !this.sessions.has(params.sessionId)
+      ) {
+        this.transitions.delete(params.sessionId);
       }
     }
   }
@@ -1299,6 +1385,7 @@ export class GlmAcpAgent implements Agent {
   }
 
   private releaseAfterPromptDrain(
+    sessionId: string,
     pending: Promise<void> | null,
     session: SessionState,
     lifecycle: SessionLifecycle,
@@ -1310,9 +1397,23 @@ export class GlmAcpAgent implements Agent {
     // the timeout resolves, and re-reading the field would never attach the
     // release callback, leaving the lease stuck in `restoring` forever.
     void pending?.then(() => {
+      this.persistOriginalIfOwned(sessionId, session, lifecycle, lease, record);
       if (!lifecycle.closeRequested) lease.release();
       if (record.original === session) record.original = null;
     });
+  }
+
+  private persistOriginalIfOwned(
+    sessionId: string,
+    session: SessionState,
+    lifecycle: SessionLifecycle,
+    lease: TransitionLease,
+    record: SessionTransition,
+  ): void {
+    if (!lifecycle.owns(lease)) return;
+    if (record.original !== session) return;
+    if (this.sessions.get(sessionId) !== session) return;
+    this.persistSession(sessionId, session);
   }
 
   private registerTransition(sessionId: string, lifecycle: SessionLifecycle): SessionTransition {
@@ -1347,7 +1448,8 @@ export class GlmAcpAgent implements Agent {
 
   private isDrainingOriginal(sessionId: string, session: SessionState): boolean {
     const record = this.transitions.get(sessionId);
-    if (record?.original === session && record.lifecycle.phase === "restoring") return true;
+    if (record?.original === session &&
+        (record.lifecycle.phase === "restoring" || record.lifecycle.phase === "snapshotting")) return true;
     // A normal close aborts the prompt and waits for it before persisting. The
     // closing generation must still finish its canonical history (without UI
     // notifications), otherwise already-received text or an in-flight tool
@@ -1396,11 +1498,15 @@ export class GlmAcpAgent implements Agent {
     };
   }
 
-  private persistSession(sessionId: string, session: SessionState): void {
+  private persistSession(
+    sessionId: string,
+    session: SessionState,
+    persisted = this.snapshot(sessionId, session),
+  ): void {
     if (this.sessions.get(sessionId) !== session) return;
     if (!this.sessionStore) return;
     try {
-      this.sessionStore.save(this.snapshot(sessionId, session));
+      this.sessionStore.save(persisted);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(
@@ -1423,13 +1529,18 @@ export class GlmAcpAgent implements Agent {
   private async replayMessages(
     sessionId: string,
     messages: GlmMessage[],
-    displayText: SessionState["displayText"]
+    displayText: SessionState["displayText"],
+    signal?: AbortSignal,
   ): Promise<void> {
+    const replayUpdate = (update: Parameters<AgentSideConnection["sessionUpdate"]>[0]) =>
+      signal
+        ? waitForAbort(this.connection.sessionUpdate(update), signal, `Session replay cancelled: ${sessionId}`)
+        : this.connection.sessionUpdate(update);
     for (const msg of messages) {
       if (msg.role === "user") {
         const text = displayText.get(msg) ?? stringifyUserMessage(msg.content);
         if (text.length === 0) continue;
-        await this.connection.sessionUpdate({
+        await replayUpdate({
           sessionId,
           update: {
             sessionUpdate: "user_message_chunk",
@@ -1454,7 +1565,7 @@ export class GlmAcpAgent implements Agent {
                   .join("")
               : "";
         if (text.length === 0) continue;
-        await this.connection.sessionUpdate({
+        await replayUpdate({
           sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
@@ -2231,6 +2342,34 @@ function estimateTokens(messages: GlmMessage[]): number {
  * is sacred — it carries the live user message, and a request without it is not
  * a retry of anything.
  */
+/** Reject a fork source whose assistant/tool suffix is not provider-ready. */
+function assertSettledToolHistory(messages: readonly GlmMessage[]): void {
+  let pending: Set<string> | null = null;
+  for (const message of messages) {
+    if (pending) {
+      if (message.role !== "tool" || !pending.has(message.tool_call_id)) {
+        throw new Error(`Cannot fork session: missing tool result for ${[...pending].join(", ")}`);
+      }
+      pending.delete(message.tool_call_id);
+      if (pending.size === 0) pending = null;
+      continue;
+    }
+    if (message.role === "tool") {
+      throw new Error(`Cannot fork session: orphan tool result ${message.tool_call_id}`);
+    }
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      const ids = message.tool_calls.map((call) => call.id);
+      if (new Set(ids).size !== ids.length) {
+        throw new Error("Cannot fork session: duplicate tool call ids");
+      }
+      pending = new Set(ids);
+    }
+  }
+  if (pending) {
+    throw new Error(`Cannot fork session: missing tool result for ${[...pending].join(", ")}`);
+  }
+}
+
 function compactMessages(
   messages: GlmMessage[],
   targetTokens: number,

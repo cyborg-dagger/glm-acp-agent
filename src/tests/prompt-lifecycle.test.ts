@@ -1045,6 +1045,383 @@ test("close persists an in-flight tool result without late tool updates", async 
   }
 });
 
+test("fork waits for an active tool and clones a complete assistant/tool batch", async () => {
+  const updates: Array<Record<string, unknown>> = [];
+  let readStarted!: () => void;
+  const readReady = new Promise<void>((resolve) => { readStarted = resolve; });
+  let releaseRead!: () => void;
+  const readDone = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate(params: Record<string, unknown>) { updates.push(params); },
+    async readTextFile() {
+      readStarted();
+      await readDone;
+      return { content: "forked contents" };
+    },
+    async writeTextFile() {},
+    async requestPermission() {
+      return { outcome: { outcome: "selected", optionId: "allow" } };
+    },
+  };
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-tool-history-"));
+  const store = new SessionStore(storeRoot);
+  let connections = 0;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { toolCall: { id: "fork-read", name: "read_file", arguments: JSON.stringify({ path: "a.txt" }) } };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, {
+    glm,
+    sessionStore: store,
+    connectSessionMcpServers: async () => {
+      connections += 1;
+      return new SessionMcpTools([]);
+    },
+  });
+  await agent.initialize({
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+  } as never);
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read" }] });
+    await readReady;
+    const fork = agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(connections, 1, "child resources must not be created before the parent drains");
+    releaseRead();
+    assert.equal((await prompt).stopReason, "cancelled");
+    const forked = await fork;
+    const persisted = store.load(forked.sessionId);
+    const assistant = persisted?.messages.find(
+      (message) => message.role === "assistant" && message.tool_calls?.some((call) => call.id === "fork-read")
+    );
+    const result = persisted?.messages.find(
+      (message) => message.role === "tool" && message.tool_call_id === "fork-read"
+    );
+    assert.ok(assistant);
+    assert.equal(result?.content, "forked contents");
+    assert.equal(connections, 2);
+    assert.equal(updates.filter((update) => {
+      const body = update.update as { sessionUpdate?: string; toolCallId?: string };
+      return body.sessionUpdate === "tool_call_update" && body.toolCallId === "fork-read";
+    }).length, 0);
+  } finally {
+    releaseRead();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("fork checkpoints a drained second tool turn so its parent survives restart", async () => {
+  let readStarted!: () => void;
+  const readReady = new Promise<void>((resolve) => { readStarted = resolve; });
+  let releaseRead!: () => void;
+  const readDone = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate() {},
+    async readTextFile() {
+      readStarted();
+      await readDone;
+      return { content: "second turn contents" };
+    },
+    async writeTextFile() {},
+    async requestPermission() {
+      return { outcome: { outcome: "selected", optionId: "allow" } };
+    },
+  };
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-parent-restart-"));
+  const store = new SessionStore(storeRoot);
+  let calls = 0;
+  const agent = new GlmAcpAgent(conn as never, {
+    glm: {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        calls += 1;
+        if (calls === 1) {
+          yield { text: "first turn" };
+        } else {
+          yield { toolCall: { id: "second-read", name: "read_file", arguments: JSON.stringify({ path: "second.txt" }) } };
+        }
+        yield { done: true, stopReason: calls === 1 ? "stop" : "tool_calls" };
+      },
+    },
+    sessionStore: store,
+    connectSessionMcpServers: async () => new SessionMcpTools([]),
+  });
+  await agent.initialize({
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+  } as never);
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
+    const second = agent.prompt({ sessionId, prompt: [{ type: "text", text: "second" }] });
+    await readReady;
+    const fork = agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    releaseRead();
+    assert.equal((await second).stopReason, "cancelled");
+    await fork;
+
+    const persisted = store.load(sessionId);
+    assert.ok(persisted?.messages.some(
+      (message) => message.role === "tool" && message.tool_call_id === "second-read" &&
+        message.content === "second turn contents"
+    ));
+
+    const restarted = new GlmAcpAgent(connection() as never, {
+      sessionStore: store,
+      connectSessionMcpServers: async () => new SessionMcpTools([]),
+    });
+    await restarted.loadSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await restarted.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+  } finally {
+    releaseRead();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("fork checkpoints a settled parent after configuration persists during drain", async () => {
+  let readStarted!: () => void;
+  const readReady = new Promise<void>((resolve) => { readStarted = resolve; });
+  let releaseRead!: () => void;
+  const readDone = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate() {},
+    async readTextFile() {
+      readStarted();
+      await readDone;
+      return { content: "racing contents" };
+    },
+    async writeTextFile() {},
+    async requestPermission() {
+      return { outcome: { outcome: "selected", optionId: "allow" } };
+    },
+  };
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-config-race-"));
+  const store = new SessionStore(storeRoot);
+  const agent = new GlmAcpAgent(conn as never, {
+    glm: {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        yield { toolCall: { id: "racing-read", name: "read_file", arguments: JSON.stringify({ path: "race.txt" }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    },
+    sessionStore: store,
+    connectSessionMcpServers: async () => new SessionMcpTools([]),
+  });
+  await agent.initialize({
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+  } as never);
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read" }] });
+    await readReady;
+    const fork = agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+    await agent.setSessionMode({ sessionId, modeId: "bypass_permissions" });
+    releaseRead();
+    assert.equal((await prompt).stopReason, "cancelled");
+    await fork;
+
+    const persisted = store.load(sessionId);
+    assert.equal(persisted?.mode, "bypass_permissions");
+    assert.ok(persisted?.messages.some(
+      (message) => message.role === "tool" && message.tool_call_id === "racing-read" &&
+        message.content === "racing contents"
+    ));
+
+    const restarted = new GlmAcpAgent(connection() as never, {
+      sessionStore: store,
+      connectSessionMcpServers: async () => new SessionMcpTools([]),
+    });
+    await restarted.loadSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await restarted.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+  } finally {
+    releaseRead();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("a timed-out fork creates no child resources and reopens after the prompt drains", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-timeout-"));
+  const store = new SessionStore(storeRoot);
+  let started!: () => void;
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  let connections = 0;
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      calls += 1;
+      if (calls === 1) {
+        started();
+        await blocked;
+      }
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, {
+    glm,
+    sessionStore: store,
+    sessionDrainTimeoutMs: 0,
+    connectSessionMcpServers: async () => {
+      connections += 1;
+      return new SessionMcpTools([]);
+    },
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "blocked" }] });
+    await ready;
+    await assert.rejects(
+      agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] }),
+      /fork timed out/i,
+    );
+    assert.equal(connections, 1);
+    release();
+    await prompt;
+    await new Promise((resolve) => setImmediate(resolve));
+    const persisted = store.load(sessionId);
+    assert.ok(
+      persisted?.messages.some((message) => message.role === "user" && message.content === "blocked"),
+      "the deferred fork rollback must checkpoint the drained turn before another prompt",
+    );
+    assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "again" }] })).stopReason, "end_turn");
+  } finally {
+    release();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("close cancels stalled fork MCP setup and disposes its late result once", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-close-fork-setup-"));
+  const store = new SessionStore(storeRoot);
+  let setupStarted!: () => void;
+  const setupReady = new Promise<void>((resolve) => { setupStarted = resolve; });
+  let releaseLateResult!: () => void;
+  const lateResult = new Promise<void>((resolve) => { releaseLateResult = resolve; });
+  let setupSignal: AbortSignal | undefined;
+  let connections = 0;
+  let disposed = 0;
+  const replacement = new SessionMcpTools([]);
+  replacement.dispose = async () => { disposed += 1; };
+  const agent = new GlmAcpAgent(conn as never, {
+    glm: textGlm(),
+    sessionStore: store,
+    connectSessionMcpServers: async (_servers, signal) => {
+      connections += 1;
+      if (connections === 1) return new SessionMcpTools([]);
+      setupSignal = signal;
+      setupStarted();
+      await lateResult;
+      return replacement;
+    },
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  let fork: Promise<unknown> | undefined;
+  let forkRejected: Promise<void> | undefined;
+  let closing: Promise<void> | undefined;
+  try {
+    fork = agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    forkRejected = assert.rejects(fork, /fork cancelled/i);
+    await setupReady;
+    closing = agent.closeSession({ sessionId });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(setupSignal?.aborted, true, "close must abort the fork connector");
+    await forkRejected;
+    const watchdog = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("close waited for stalled fork MCP setup")), 100).unref();
+    });
+    await Promise.race([closing, watchdog]);
+    assert.equal(disposed, 0, "the late setup result is not available yet");
+    releaseLateResult();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(disposed, 1, "a late setup result is disposed exactly once");
+  } finally {
+    releaseLateResult();
+    await Promise.allSettled([fork, closing].filter((value): value is Promise<unknown> => value !== undefined));
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("an unloaded fork cannot race a restore of the same persisted session", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-unloaded-race-"));
+  const store = new SessionStore(storeRoot);
+  let restoreSetupStarted!: () => void;
+  const restoreSetupReady = new Promise<void>((resolve) => { restoreSetupStarted = resolve; });
+  let releaseRestoreSetup!: () => void;
+  const restoreSetupDone = new Promise<void>((resolve) => { releaseRestoreSetup = resolve; });
+  let connections = 0;
+  const agent = new GlmAcpAgent(conn as never, {
+    glm: textGlm(),
+    sessionStore: store,
+    connectSessionMcpServers: async () => {
+      connections += 1;
+      if (connections === 2) {
+        restoreSetupStarted();
+        await restoreSetupDone;
+      }
+      return new SessionMcpTools([]);
+    },
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    await agent.closeSession({ sessionId });
+    const resume = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await restoreSetupReady;
+    await assert.rejects(
+      agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] }),
+      /transition in progress/i,
+    );
+    releaseRestoreSetup();
+    await resume;
+  } finally {
+    releaseRestoreSetup();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("fork rejects persisted history with an unmatched assistant tool call", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-invalid-history-"));
+  const store = new SessionStore(storeRoot);
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  store.save({
+    sessionId,
+    cwd: tmpdir(),
+    messages: [
+      { role: "system", content: "rules" },
+      { role: "user", content: "read" },
+      { role: "assistant", content: null, tool_calls: [
+        { id: "missing-result", type: "function", function: { name: "read_file", arguments: "{}" } },
+      ] },
+    ],
+    title: null,
+    updatedAt: new Date().toISOString(),
+    model: "glm-4.7",
+    mode: "default",
+  });
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+  try {
+    await assert.rejects(
+      agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] }),
+      /missing tool result.*missing-result/i,
+    );
+  } finally {
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
 test("restore completes a streamed tool batch with cancelled tool results", async () => {
   const conn = connection();
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-tool-batch-"));
@@ -1131,6 +1508,158 @@ test("close after swap disposes the current replacement rather than the stale or
     );
   } finally {
     releaseOldDispose();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("a restore timeout checkpoints the settled original after the prompt unwinds", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-timeout-checkpoint-"));
+  const store = new SessionStore(storeRoot);
+  let partialReceived!: () => void;
+  const partialReady = new Promise<void>((resolve) => { partialReceived = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: store,
+    sessionDrainTimeoutMs: 5,
+    glm: {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        yield { text: "retained before timeout" };
+        partialReceived();
+        await blocked;
+        yield { text: "late" };
+        yield { done: true, stopReason: "stop" };
+      },
+    },
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] });
+    await partialReady;
+    await assert.rejects(agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] }), /timed out/i);
+    release();
+    await prompt;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(store.load(sessionId)?.messages.some(
+      (message) => message.role === "assistant" && message.content === "retained before timeout",
+    ));
+  } finally {
+    release();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("a failed restore checkpoints drained history before leaving the original usable", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-failure-checkpoint-"));
+  const store = new SessionStore(storeRoot);
+  let partialReceived!: () => void;
+  const partialReady = new Promise<void>((resolve) => { partialReceived = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: store,
+    glm: {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        calls += 1;
+        if (calls === 1) {
+          yield { text: "retained before setup failure" };
+          partialReceived();
+          await blocked;
+        }
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      },
+    },
+    connectSessionMcpServers: async (servers) => {
+      if (servers.length > 0) throw new Error("setup failed");
+      return new SessionMcpTools([]);
+    },
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] });
+    await partialReady;
+    const restore = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [{ type: "http", name: "broken", url: "https://mcp.example.test", headers: [] }] });
+    release();
+    await prompt;
+    await assert.rejects(restore, /setup failed/i);
+    assert.ok(store.load(sessionId)?.messages.some(
+      (message) => message.role === "assistant" && message.content === "retained before setup failure",
+    ));
+    assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "after" }] })).stopReason, "end_turn");
+  } finally {
+    release();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("close interrupts a stalled unloaded restore replay", async () => {
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-close-replay-"));
+  const store = new SessionStore(storeRoot);
+  const sessionId = "66666666-6666-6666-6666-666666666666";
+  store.save({
+    sessionId,
+    cwd: "/tmp",
+    messages: [
+      { role: "system", content: "system" },
+      { role: "user", content: "replay me" },
+    ],
+    title: null,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    model: "glm-5.3",
+    mode: "default",
+  });
+  let replayStarted!: () => void;
+  const replayReady = new Promise<void>((resolve) => { replayStarted = resolve; });
+  let releaseReplay!: () => void;
+  const replayDone = new Promise<void>((resolve) => { releaseReplay = resolve; });
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate() {
+      replayStarted();
+      await replayDone;
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+  try {
+    const load = agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+    await replayReady;
+    const close = agent.closeSession({ sessionId });
+    await Promise.race([
+      close,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("close waited for replay")), 50)),
+    ]);
+    await assert.rejects(load, /cancelled/i);
+  } finally {
+    releaseReplay();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("a failed unloaded restore removes its transition record", async () => {
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-unloaded-failure-record-"));
+  const store = new SessionStore(storeRoot);
+  const sessionId = "77777777-7777-7777-7777-777777777777";
+  store.save({
+    sessionId,
+    cwd: "/tmp",
+    messages: [{ role: "system", content: "system" }],
+    title: null,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    model: "glm-5.3",
+    mode: "default",
+  });
+  const agent = new GlmAcpAgent(connection() as never, {
+    sessionStore: store,
+    connectSessionMcpServers: async () => { throw new Error("setup failed"); },
+  });
+  try {
+    await assert.rejects(agent.resumeSession({ sessionId, cwd: "/tmp", mcpServers: [] }), /setup failed/i);
+    assert.equal((agent as unknown as { transitions: Map<string, unknown> }).transitions.size, 0);
+  } finally {
     await rm(storeRoot, { recursive: true, force: true });
   }
 });
