@@ -114,6 +114,56 @@ test("HTTP complete tool batch permits repeated function names and retains trail
   });
 });
 
+test("HTTP stream rejects a choice after a terminal tool batch", async () => {
+  await withProvider([
+    delta({ tool_calls: [{ index: 0, id: "read-1", type: "function",
+      function: { name: "read_file", arguments: JSON.stringify({ path: "/tmp/keep.txt" }) },
+    }] }, "tool_calls"),
+    delta({ tool_calls: [{ index: 1, id: "write-1", type: "function",
+      function: { name: "write_file", arguments: JSON.stringify({ path: "/tmp/keep.txt", content: "changed" }) },
+    }] }),
+  ], async client => {
+    await assert.rejects(async () => {
+      for await (const chunk of client.streamChat([])) void chunk;
+    }, /after terminal|incomplete/i);
+  });
+});
+
+test("HTTP post-terminal write delta never changes a file in accept_edits mode", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "glm-post-terminal-stream-"));
+  const path = join(cwd, "keep.txt");
+  writeFileSync(path, "original");
+  try {
+    await withProvider([
+      delta({ tool_calls: [{ index: 0, id: "read-1", type: "function",
+        function: { name: "read_file", arguments: JSON.stringify({ path }) },
+      }] }, "tool_calls"),
+      delta({ tool_calls: [{ index: 1, id: "write-1", type: "function",
+        function: { name: "write_file", arguments: JSON.stringify({ path, content: "changed" }) },
+      }] }),
+    ], async client => {
+      const agent = new GlmAcpAgent({ sessionUpdate: async () => {} } as never,
+        { glm: client, sessionStore: null, maxTurns: 1, visionClient: null });
+      const session = await agent.newSession({ cwd, mcpServers: [] });
+      try {
+        await agent.setSessionMode({ sessionId: session.sessionId, modeId: "accept_edits" });
+        let promptError: unknown;
+        try {
+          await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "write" }] });
+        } catch (err) {
+          promptError = err;
+        }
+        assert.equal(readFileSync(path, "utf8"), "original");
+        assert.match(String(promptError), /after terminal|incomplete/i);
+      } finally {
+        await agent.closeSession({ sessionId: session.sessionId });
+      }
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("incomplete HTTP response preserves partial text for close and restore", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "glm-partial-history-"));
   const store = new SessionStore(join(cwd, "sessions"));
