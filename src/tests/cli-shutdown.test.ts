@@ -212,6 +212,34 @@ test("CLI SIGTERM upgrades a disconnect shutdown exit code", { skip: process.pla
   }
 });
 
+test("CLI SIGINT upgrades a disconnect shutdown exit code", { skip: process.platform === "win32", timeout: 10_000 }, async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "glm-cli-disconnect-sigint-"));
+  const ready = join(cwd, "ready");
+  const marker = join(cwd, "marker");
+  const code = [
+    'const fs=require("node:fs");',
+    'process.on("SIGTERM",()=>{});',
+    `fs.writeFileSync(${JSON.stringify(ready)}, "ready");`,
+    `setTimeout(()=>fs.writeFileSync(${JSON.stringify(marker)}, "survived"),700);`,
+  ].join("");
+  const { child, started, close, closeServer } = await runCliUntilCommand(`${shellQuote(process.execPath)} -e ${shellQuote(code)}`, cwd);
+  try {
+    await started;
+    while (!existsSync(ready)) await wait(10);
+    close();
+    child.kill("SIGINT");
+    const exited = await waitForExit(child);
+    assert.equal(exited.code, 130);
+    assert.equal(exited.signal, null);
+    await wait(900);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    closeServer();
+    if (child.exitCode === null) child.kill("SIGKILL");
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("CLI shutdown preserves intentionally backgrounded commands after normal shell exit", { skip: process.platform === "win32", timeout: 10_000 }, async () => {
   const cwd = mkdtempSync(join(tmpdir(), "glm-cli-background-"));
   const marker = join(cwd, "marker");
