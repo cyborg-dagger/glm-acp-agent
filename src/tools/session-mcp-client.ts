@@ -228,16 +228,37 @@ export class HttpMcpClient implements ConnectedMcpClient {
   private async awaitInitialization(signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) throw new Error(`MCP ${this.server.name} call cancelled`);
     const initialization = this.ensureInitialized();
+    const initializationController = this.initializationAbortController;
     const waiting = this.initializationAbortController !== null;
     if (waiting) this.initializationWaiters += 1;
+    const abortSharedInitialization = () => {
+      if (
+        !waiting
+        || this.initializationWaiters !== 1
+        || this.initialized !== initialization
+        || this.initializationAbortController !== initializationController
+        || !initializationController
+      ) return;
+      // Clear the identity before aborting the transport. A new caller can
+      // arrive synchronously from the old caller's abort path and must not
+      // attach to this rejected initialization promise.
+      this.initialized = null;
+      this.initializationAbortController = null;
+      this.mcpSessionId = undefined;
+      initializationController.abort();
+    };
     try {
-      await waitForAbort(initialization, signal, `MCP ${this.server.name} call cancelled`);
+      await waitForAbort(
+        initialization,
+        signal,
+        `MCP ${this.server.name} call cancelled`,
+        abortSharedInitialization,
+      );
     } catch (err) {
       // One aborted waiter must not interrupt a handshake another caller needs.
-      // If this was the last waiter, abort the shared transport to release it.
-      if (signal?.aborted && waiting && this.initializationWaiters === 1) {
-        this.initializationAbortController?.abort();
-      }
+      // The abort callback handles the synchronous case; retry here after a
+      // concurrent waiter may have finished between the callback and catch.
+      if (signal?.aborted) abortSharedInitialization();
       throw err;
     } finally {
       if (waiting) this.initializationWaiters -= 1;
@@ -787,7 +808,12 @@ function collectSecretEnvValues(env: NodeJS.ProcessEnv): string[] {
   return [...values].sort((a, b) => b.length - a.length);
 }
 
-function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, message: string): Promise<T> {
+function waitForAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  message: string,
+  onAbortCleanup?: () => void,
+): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) return Promise.reject(new Error(message));
   return new Promise<T>((resolve, reject) => {
@@ -795,13 +821,15 @@ function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, m
     const claim = (): boolean => {
       if (settled) return false;
       settled = true;
-      signal.removeEventListener("abort", onAbort);
+      signal.removeEventListener("abort", handleAbort);
       return true;
     };
-    const onAbort = () => {
-      if (claim()) reject(new Error(message));
+    const handleAbort = () => {
+      if (!claim()) return;
+      onAbortCleanup?.();
+      reject(new Error(message));
     };
-    signal.addEventListener("abort", onAbort, { once: true });
+    signal.addEventListener("abort", handleAbort, { once: true });
     promise.then(
       (value) => {
         if (claim()) resolve(value);

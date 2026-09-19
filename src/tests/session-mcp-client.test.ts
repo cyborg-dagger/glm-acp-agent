@@ -110,6 +110,61 @@ test("HTTP MCP cancels a stalled shared initialization when its only waiter abor
   }
 });
 
+test("HTTP MCP retries initialization for a caller started immediately after cancellation", async () => {
+  const originalFetch = globalThis.fetch;
+  let initializeCalls = 0;
+  let firstInitializationStarted!: () => void;
+  let secondInitializationStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { firstInitializationStarted = resolve; });
+  const secondStarted = new Promise<void>((resolve) => { secondInitializationStarted = resolve; });
+  globalThis.fetch = (async (_url, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string; id?: number };
+    if (body.method === "initialize") {
+      initializeCalls += 1;
+      if (initializeCalls === 1) {
+        firstInitializationStarted();
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("initialization aborted")), { once: true });
+        });
+      }
+      secondInitializationStarted();
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: {} }), {
+        headers: { "Content-Type": "application/json", "MCP-Session-Id": "retry-session" },
+      });
+    }
+    if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (body.method === "tools/list") {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "search" }] } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (init?.method === "DELETE") return new Response(null, { status: 202 });
+    throw new Error(`unexpected method ${String(body.method)}`);
+  }) as typeof fetch;
+  try {
+    const client = new HttpMcpClient(httpServer());
+    const controller = new AbortController();
+    const cancelled = client.listTools(controller.signal);
+    void cancelled.catch(() => {});
+    await firstStarted;
+    controller.abort();
+
+    // Start the replacement before the cancelled caller's promise continuation
+    // runs. This is the race that must not attach to the doomed initialization.
+    const retry = client.listTools();
+    const watchdog = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("replacement initialization did not start")), 250).unref();
+    });
+    await Promise.race([secondStarted, watchdog]);
+    await assert.rejects(cancelled, /cancelled|aborted/i);
+    assert.deepEqual(await retry, [{ name: "search", description: undefined, inputSchema: undefined }]);
+    assert.equal(initializeCalls, 2);
+    await client.dispose();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("HTTP MCP keeps shared initialization alive for a concurrent non-aborted waiter", async () => {
   const originalFetch = globalThis.fetch;
   let initializeSignal: AbortSignal | undefined;
