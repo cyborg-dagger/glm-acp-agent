@@ -55,10 +55,15 @@ interface ConnectedMcpClient {
 
 export class SessionMcpTools {
   private bindings = new Map<string, ToolBinding>();
+  private clients = new Set<ConnectedMcpClient>();
 
-  constructor(bindings: ToolBinding[]) {
+  constructor(bindings: ToolBinding[], clients: Iterable<ConnectedMcpClient> = []) {
+    for (const client of clients) {
+      this.clients.add(client);
+    }
     for (const binding of bindings) {
       this.bindings.set(binding.exposedName, binding);
+      this.clients.add(binding.client);
     }
   }
 
@@ -85,8 +90,8 @@ export class SessionMcpTools {
   }
 
   async dispose(): Promise<void> {
-    const clients = new Set(Array.from(this.bindings.values()).map((binding) => binding.client));
-    await Promise.all(Array.from(clients).map((client) => client.dispose().catch(() => undefined)));
+    await Promise.all(Array.from(this.clients).map((client) => client.dispose().catch(() => undefined)));
+    this.clients.clear();
     this.bindings.clear();
   }
 }
@@ -128,7 +133,7 @@ export async function connectSessionMcpServers(
     throw err;
   }
 
-  return new SessionMcpTools(bindings);
+  return new SessionMcpTools(bindings, clients);
 }
 
 function createClient(server: McpServer): ConnectedMcpClient {
