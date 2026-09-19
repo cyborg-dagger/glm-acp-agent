@@ -188,6 +188,7 @@ interface SessionTransition {
   promise: Promise<unknown> | null;
   closePromise: Promise<void> | null;
   original: SessionState | null;
+  restoreAbortController: AbortController | null;
 }
 
 /** ACP stop reasons that the prompt loop can produce internally. */
@@ -421,7 +422,13 @@ export class GlmAcpAgent implements Agent {
     const thoughtLevel = resolveThoughtLevel(model, "max");
 
     const lifecycle = new SessionLifecycle();
-    this.transitions.set(sessionId, { lifecycle, promise: null, closePromise: null, original: null });
+    this.transitions.set(sessionId, {
+      lifecycle,
+      promise: null,
+      closePromise: null,
+      original: null,
+      restoreAbortController: null,
+    });
     this.sessions.set(sessionId, {
       cwd: params.cwd,
       messages: [systemPrompt],
@@ -943,6 +950,7 @@ export class GlmAcpAgent implements Agent {
       // even while restore has not yet installed its replacement state.
       record.lifecycle.requestClose();
     }
+    record.restoreAbortController?.abort();
     initial?.abortController?.abort();
     const closePromise = (async () => {
       const pendingTransition = record.promise;
@@ -1078,7 +1086,13 @@ export class GlmAcpAgent implements Agent {
       lifecycle: forkLifecycle,
     };
     this.sessions.set(newSessionId, forked);
-    this.transitions.set(newSessionId, { lifecycle: forkLifecycle, promise: null, closePromise: null, original: null });
+    this.transitions.set(newSessionId, {
+      lifecycle: forkLifecycle,
+      promise: null,
+      closePromise: null,
+      original: null,
+      restoreAbortController: null,
+    });
     this.persistSession(newSessionId, forked);
 
     // Notify on the *created* session id — the parent thread's command list is
@@ -1113,11 +1127,18 @@ export class GlmAcpAgent implements Agent {
     const lifecycle = record.lifecycle;
     const lease = lifecycle.begin("restoring");
     record.original = original ?? null;
+    const restoreAbortController = new AbortController();
+    record.restoreAbortController = restoreAbortController;
     let deferLeaseRelease = false;
 
     const transition = Promise.resolve().then(async (): Promise<LoadSessionResponse> => {
       let provisional: SessionMcpTools | null = null;
+      let provisionalDisposal: Promise<void> | null = null;
       let swapped = false;
+      const disposeProvisional = (tools: SessionMcpTools): Promise<void> => {
+        if (!provisionalDisposal) provisionalDisposal = tools.dispose();
+        return provisionalDisposal;
+      };
       try {
         let persisted: PersistedSession;
         if (original) {
@@ -1137,7 +1158,20 @@ export class GlmAcpAgent implements Agent {
         }
 
         this.assertRestoreOwner(lifecycle, lease);
-        provisional = await this.connectMcpServers(params.mcpServers ?? []);
+        const setup = this.connectMcpServers(params.mcpServers ?? [], restoreAbortController.signal);
+        void setup.then(
+          (tools) => {
+            if (restoreAbortController.signal.aborted) {
+              void disposeProvisional(tools).catch(() => undefined);
+            }
+          },
+          () => undefined
+        );
+        provisional = await waitForAbort(
+          setup,
+          restoreAbortController.signal,
+          `Session restore cancelled: ${params.sessionId}`
+        );
         if (!lifecycle.owns(lease) || lifecycle.closeRequested) {
           throw new Error(`Session restore cancelled: ${params.sessionId}`);
         }
@@ -1216,7 +1250,7 @@ export class GlmAcpAgent implements Agent {
         };
       } catch (err) {
         if (!swapped) {
-          await provisional?.dispose();
+          if (provisional) await disposeProvisional(provisional);
         }
         throw err;
       } finally {
@@ -1229,6 +1263,9 @@ export class GlmAcpAgent implements Agent {
     } finally {
       if (record.promise === transition) record.promise = null;
       if (!deferLeaseRelease && record.original === original) record.original = null;
+      if (record.restoreAbortController === restoreAbortController) {
+        record.restoreAbortController = null;
+      }
     }
   }
 
@@ -1268,7 +1305,13 @@ export class GlmAcpAgent implements Agent {
   }
 
   private registerTransition(sessionId: string, lifecycle: SessionLifecycle): SessionTransition {
-    const record: SessionTransition = { lifecycle, promise: null, closePromise: null, original: null };
+    const record: SessionTransition = {
+      lifecycle,
+      promise: null,
+      closePromise: null,
+      original: null,
+      restoreAbortController: null,
+    };
     this.transitions.set(sessionId, record);
     return record;
   }
@@ -2034,6 +2077,32 @@ async function safeSessionUpdate(
   } catch {
     // best-effort
   }
+}
+
+/** Reject the owner immediately while retaining a handler for a late setup result. */
+function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal, message: string): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error(message));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const claim = (): boolean => {
+      if (settled) return false;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      return true;
+    };
+    const onAbort = () => {
+      if (claim()) reject(new Error(message));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        if (claim()) resolve(value);
+      },
+      (error) => {
+        if (claim()) reject(error);
+      }
+    );
+  });
 }
 
 /**
