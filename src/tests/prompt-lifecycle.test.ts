@@ -1507,6 +1507,158 @@ test("close after swap disposes the current replacement rather than the stale or
   }
 });
 
+test("a restore timeout checkpoints the settled original after the prompt unwinds", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-timeout-checkpoint-"));
+  const store = new SessionStore(storeRoot);
+  let partialReceived!: () => void;
+  const partialReady = new Promise<void>((resolve) => { partialReceived = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: store,
+    sessionDrainTimeoutMs: 5,
+    glm: {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        yield { text: "retained before timeout" };
+        partialReceived();
+        await blocked;
+        yield { text: "late" };
+        yield { done: true, stopReason: "stop" };
+      },
+    },
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] });
+    await partialReady;
+    await assert.rejects(agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] }), /timed out/i);
+    release();
+    await prompt;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(store.load(sessionId)?.messages.some(
+      (message) => message.role === "assistant" && message.content === "retained before timeout",
+    ));
+  } finally {
+    release();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("a failed restore checkpoints drained history before leaving the original usable", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-failure-checkpoint-"));
+  const store = new SessionStore(storeRoot);
+  let partialReceived!: () => void;
+  const partialReady = new Promise<void>((resolve) => { partialReceived = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  const agent = new GlmAcpAgent(conn as never, {
+    sessionStore: store,
+    glm: {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        calls += 1;
+        if (calls === 1) {
+          yield { text: "retained before setup failure" };
+          partialReceived();
+          await blocked;
+        }
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      },
+    },
+    connectSessionMcpServers: async (servers) => {
+      if (servers.length > 0) throw new Error("setup failed");
+      return new SessionMcpTools([]);
+    },
+  });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] });
+    await partialReady;
+    const restore = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [{ type: "http", name: "broken", url: "https://mcp.example.test", headers: [] }] });
+    release();
+    await prompt;
+    await assert.rejects(restore, /setup failed/i);
+    assert.ok(store.load(sessionId)?.messages.some(
+      (message) => message.role === "assistant" && message.content === "retained before setup failure",
+    ));
+    assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "after" }] })).stopReason, "end_turn");
+  } finally {
+    release();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("close interrupts a stalled unloaded restore replay", async () => {
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-close-replay-"));
+  const store = new SessionStore(storeRoot);
+  const sessionId = "66666666-6666-6666-6666-666666666666";
+  store.save({
+    sessionId,
+    cwd: "/tmp",
+    messages: [
+      { role: "system", content: "system" },
+      { role: "user", content: "replay me" },
+    ],
+    title: null,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    model: "glm-5.3",
+    mode: "default",
+  });
+  let replayStarted!: () => void;
+  const replayReady = new Promise<void>((resolve) => { replayStarted = resolve; });
+  let releaseReplay!: () => void;
+  const replayDone = new Promise<void>((resolve) => { releaseReplay = resolve; });
+  const conn = {
+    signal: new AbortController().signal,
+    async sessionUpdate() {
+      replayStarted();
+      await replayDone;
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+  try {
+    const load = agent.loadSession({ sessionId, cwd: "/tmp", mcpServers: [] });
+    await replayReady;
+    const close = agent.closeSession({ sessionId });
+    await Promise.race([
+      close,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("close waited for replay")), 50)),
+    ]);
+    await assert.rejects(load, /cancelled/i);
+  } finally {
+    releaseReplay();
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("a failed unloaded restore removes its transition record", async () => {
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-unloaded-failure-record-"));
+  const store = new SessionStore(storeRoot);
+  const sessionId = "77777777-7777-7777-7777-777777777777";
+  store.save({
+    sessionId,
+    cwd: "/tmp",
+    messages: [{ role: "system", content: "system" }],
+    title: null,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    model: "glm-5.3",
+    mode: "default",
+  });
+  const agent = new GlmAcpAgent(connection() as never, {
+    sessionStore: store,
+    connectSessionMcpServers: async () => { throw new Error("setup failed"); },
+  });
+  try {
+    await assert.rejects(agent.resumeSession({ sessionId, cwd: "/tmp", mcpServers: [] }), /setup failed/i);
+    assert.equal((agent as unknown as { transitions: Map<string, unknown> }).transitions.size, 0);
+  } finally {
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
 test("a configuration change during load replay is carried into the replacement", async () => {
   let replayArmed = false;
   let gateUsed = false;

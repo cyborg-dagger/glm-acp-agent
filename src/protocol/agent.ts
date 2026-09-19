@@ -153,8 +153,6 @@ interface SessionState {
   closing: boolean;
   /** True after closeSession has disposed and removed this session. */
   closed: boolean;
-  /** De-duplicates concurrent closeSession calls. */
-  closePromise: Promise<void> | null;
   title: string | null;
   updatedAt: string;
   /** Active model for this session (clients can change via `session/set_model`). */
@@ -438,7 +436,6 @@ export class GlmAcpAgent implements Agent {
       promptPromise: null,
       closing: false,
       closed: false,
-      closePromise: null,
       title: null,
       updatedAt: new Date().toISOString(),
       model,
@@ -1152,7 +1149,6 @@ export class GlmAcpAgent implements Agent {
       promptPromise: null,
       closing: false,
       closed: false,
-      closePromise: null,
       title: forkedTitle,
       updatedAt: new Date().toISOString(),
       model: persisted.model,
@@ -1231,7 +1227,7 @@ export class GlmAcpAgent implements Agent {
           const { drained, pending } = await this.drainPrompt(original);
           if (!drained) {
             deferLeaseRelease = true;
-            this.releaseAfterPromptDrain(pending, original, lifecycle, lease, record);
+            this.releaseAfterPromptDrain(params.sessionId, pending, original, lifecycle, lease, record);
             throw new Error(`Session restore timed out waiting for prompt cleanup: ${lease.generation}`);
           }
           this.assertRestoreOwner(lifecycle, lease);
@@ -1278,7 +1274,6 @@ export class GlmAcpAgent implements Agent {
           promptPromise: null,
           closing: false,
           closed: false,
-          closePromise: null,
           title: restoreSource.title,
           updatedAt: restoreSource.updatedAt,
           model: restoreSource.model,
@@ -1299,7 +1294,12 @@ export class GlmAcpAgent implements Agent {
         // client rejects a replay notification, leave the live original in
         // place and dispose the provisional resources below.
         if (replay) {
-          await this.replayMessages(params.sessionId, restoredMessages, restored.displayText);
+          await this.replayMessages(
+            params.sessionId,
+            restoredMessages,
+            restored.displayText,
+            restoreAbortController.signal,
+          );
         }
         if (lifecycle.closeRequested) {
           throw new Error(`Session restore cancelled: ${params.sessionId}`);
@@ -1335,6 +1335,9 @@ export class GlmAcpAgent implements Agent {
           configOptions: this.configOptionsState(restored.model, restored.thoughtLevel, restored.mode),
         };
       } catch (err) {
+        if (!swapped && original) {
+          this.persistOriginalIfOwned(params.sessionId, original, lifecycle, lease, record);
+        }
         if (!swapped) {
           if (provisional) await disposeProvisional(provisional);
         }
@@ -1351,6 +1354,14 @@ export class GlmAcpAgent implements Agent {
       if (!deferLeaseRelease && record.original === original) record.original = null;
       if (record.restoreAbortController === restoreAbortController) {
         record.restoreAbortController = null;
+      }
+      if (
+        this.transitions.get(params.sessionId) === record &&
+        !record.closePromise &&
+        !record.promise &&
+        !this.sessions.has(params.sessionId)
+      ) {
+        this.transitions.delete(params.sessionId);
       }
     }
   }
@@ -1374,6 +1385,7 @@ export class GlmAcpAgent implements Agent {
   }
 
   private releaseAfterPromptDrain(
+    sessionId: string,
     pending: Promise<void> | null,
     session: SessionState,
     lifecycle: SessionLifecycle,
@@ -1385,9 +1397,23 @@ export class GlmAcpAgent implements Agent {
     // the timeout resolves, and re-reading the field would never attach the
     // release callback, leaving the lease stuck in `restoring` forever.
     void pending?.then(() => {
+      this.persistOriginalIfOwned(sessionId, session, lifecycle, lease, record);
       if (!lifecycle.closeRequested) lease.release();
       if (record.original === session) record.original = null;
     });
+  }
+
+  private persistOriginalIfOwned(
+    sessionId: string,
+    session: SessionState,
+    lifecycle: SessionLifecycle,
+    lease: TransitionLease,
+    record: SessionTransition,
+  ): void {
+    if (!lifecycle.owns(lease)) return;
+    if (record.original !== session) return;
+    if (this.sessions.get(sessionId) !== session) return;
+    this.persistSession(sessionId, session);
   }
 
   private registerTransition(sessionId: string, lifecycle: SessionLifecycle): SessionTransition {
@@ -1503,13 +1529,18 @@ export class GlmAcpAgent implements Agent {
   private async replayMessages(
     sessionId: string,
     messages: GlmMessage[],
-    displayText: SessionState["displayText"]
+    displayText: SessionState["displayText"],
+    signal?: AbortSignal,
   ): Promise<void> {
+    const replayUpdate = (update: Parameters<AgentSideConnection["sessionUpdate"]>[0]) =>
+      signal
+        ? waitForAbort(this.connection.sessionUpdate(update), signal, `Session replay cancelled: ${sessionId}`)
+        : this.connection.sessionUpdate(update);
     for (const msg of messages) {
       if (msg.role === "user") {
         const text = displayText.get(msg) ?? stringifyUserMessage(msg.content);
         if (text.length === 0) continue;
-        await this.connection.sessionUpdate({
+        await replayUpdate({
           sessionId,
           update: {
             sessionUpdate: "user_message_chunk",
@@ -1534,7 +1565,7 @@ export class GlmAcpAgent implements Agent {
                   .join("")
               : "";
         if (text.length === 0) continue;
-        await this.connection.sessionUpdate({
+        await replayUpdate({
           sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
