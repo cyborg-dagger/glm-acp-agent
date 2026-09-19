@@ -623,7 +623,7 @@ test("close is retained while an unloaded resume is setting up replacement resou
   }
 });
 
-test("close aborts stalled restore MCP setup and disposes a late replacement once", async () => {
+test("close aborts stalled restore MCP setup and disposes a late empty-catalog replacement once", async () => {
   const conn = connection();
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-abort-restore-setup-"));
   const store = new SessionStore(storeRoot);
@@ -643,8 +643,11 @@ test("close aborts stalled restore MCP setup and disposes a late replacement onc
   const lateResult = new Promise<void>((resolve) => { releaseLateResult = resolve; });
   let abortObserved = false;
   let disposed = 0;
-  const replacement = new SessionMcpTools([]);
-  replacement.dispose = async () => { disposed += 1; };
+  const replacement = new SessionMcpTools([], [{
+    async listTools() { return []; },
+    async callTool() { return undefined; },
+    async dispose() { disposed += 1; },
+  }]);
   const agent = new GlmAcpAgent(conn as never, {
     sessionStore: store,
     connectSessionMcpServers: async (_servers, signal) => {
