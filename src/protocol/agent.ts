@@ -2512,7 +2512,6 @@ function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal, message: stri
     );
   });
 }
-
 async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   let timer: NodeJS.Timeout | undefined;
   try {
