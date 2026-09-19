@@ -295,6 +295,11 @@ export class GlmClient {
     this.client = new OpenAI({ apiKey, baseURL });
   }
 
+  /** The same resolved reservation used in the outgoing `max_tokens` field. */
+  getMaxOutputTokens(): number {
+    return this.maxTokens;
+  }
+
   /**
    * Stream a chat completion from the GLM model, yielding chunks as they arrive.
    *
