@@ -1072,7 +1072,7 @@ export class GlmAcpAgent implements Agent {
           const { drained, pending } = await this.drainPrompt(source);
           if (!drained) {
             deferLeaseRelease = true;
-            this.releaseAfterPromptDrain(pending, source, lifecycle, lease, record);
+            this.releaseAfterPromptDrain(params.sessionId, pending, source, lifecycle, lease, record);
             throw new Error(`Session fork timed out waiting for prompt cleanup: ${lease.generation}`);
           }
         }

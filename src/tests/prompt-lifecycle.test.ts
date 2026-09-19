@@ -1289,6 +1289,11 @@ test("a timed-out fork creates no child resources and reopens after the prompt d
     release();
     await prompt;
     await new Promise((resolve) => setImmediate(resolve));
+    const persisted = store.load(sessionId);
+    assert.ok(
+      persisted?.messages.some((message) => message.role === "user" && message.content === "blocked"),
+      "the deferred fork rollback must checkpoint the drained turn before another prompt",
+    );
     assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "again" }] })).stopReason, "end_turn");
   } finally {
     release();
