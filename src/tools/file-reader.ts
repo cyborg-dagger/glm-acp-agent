@@ -9,6 +9,7 @@ export interface TextPage {
   nextLine?: number;
   truncated: boolean;
   incompleteLine?: number;
+  eof?: boolean;
 }
 
 /**

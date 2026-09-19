@@ -459,7 +459,11 @@ test("read_file renders EOF for a conforming editor at a short or empty offset",
     const short = await exec.execute("tc1", "read_file", JSON.stringify({ path, offset: 1, limit: 4 }));
     assert.equal(short.content, "line-1\nline-2");
     const empty = await exec.execute("tc2", "read_file", JSON.stringify({ path, offset: 3, limit: 2 }));
-    assert.match(empty.content, /offset 3 is beyond the last line of .* \(2 lines\)/);
+    assert.match(empty.content, /end of file: offset 3 is beyond the end of/);
+    assert.doesNotMatch(empty.content, /\(2 lines\)/);
+    const farPast = await exec.execute("tc3", "read_file", JSON.stringify({ path, offset: 100, limit: 2 }));
+    assert.match(farPast.content, /end of file: offset 100 is beyond the end of/);
+    assert.doesNotMatch(farPast.content, /99 lines/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

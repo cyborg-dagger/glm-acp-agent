@@ -183,6 +183,20 @@ export class ToolExecutor {
 
     try {
       const page = await this.readTextPage(absolutePath, offset, limit);
+      if (page.eof) {
+        const content = `[end of file: offset ${offset} is beyond the end of ${path}]`;
+        await this.connection.sessionUpdate({
+          sessionId: this.sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            status: "completed",
+            content: [{ type: "content", content: { type: "text", text: content } }],
+            rawOutput: elideForPreview({ content }),
+          },
+        });
+        return { content };
+      }
       if (page.totalLines !== undefined && offset > page.totalLines) {
         const content = `[end of file: offset ${offset} is beyond the last line of ${path} (${page.totalLines} line${page.totalLines === 1 ? "" : "s"})]`;
         await this.connection.sessionUpdate({
@@ -469,10 +483,12 @@ export class ToolExecutor {
       }
       const hasNext = lines.length > limit;
       const visible = lines.slice(0, limit);
-      const totalLines = hasNext ? undefined : offset - 1 + visible.length;
+      const atEof = !hasNext && visible.length === 0;
+      const totalLines = hasNext || atEof ? undefined : offset - 1 + visible.length;
       return { text: visible.join("\n"), firstLine: offset, lastCompleteLine: offset + visible.length - 1,
         ...(totalLines === undefined ? {} : { totalLines }),
-        ...(hasNext ? { nextLine: offset + visible.length } : {}), truncated: false };
+        ...(hasNext ? { nextLine: offset + visible.length } : {}), truncated: false,
+        ...(atEof ? { eof: true } : {}), };
     }
     return readLocalTextPage(path, offset, limit, this.resourceLimits.fileReadBytes, this.signal);
   }
