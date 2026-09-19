@@ -361,3 +361,80 @@ test("StdioVisionMcpClient retries once on tool-not-found after re-discovering t
   await client.dispose();
 });
 
+test("StdioVisionMcpClient paginates rediscovery and replaces the catalog with all pages", async () => {
+  const { child, written, pushStdout } = makeFakeChild();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  const callPromise = client.callTool("image_analysis", { image_source: "/img.png" });
+
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "old_image_tool" }] } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const firstCall = JSON.parse(written[3]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: firstCall.id, error: { code: -32601, message: "tool not found" } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const firstRediscovery = JSON.parse(written[4]?.trim() ?? "{}") as { id: number; method: string };
+  assert.equal(firstRediscovery.method, "tools/list");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: firstRediscovery.id, result: { tools: [{ name: "analyzeImage" }], nextCursor: "opaque/vision-2" } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const secondRediscovery = JSON.parse(written[5]?.trim() ?? "{}") as { id: number; params: { cursor: string } };
+  assert.equal(secondRediscovery.params.cursor, "opaque/vision-2");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: secondRediscovery.id, result: { tools: [{ name: "annotateImage" }] } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const retry = JSON.parse(written[6]?.trim() ?? "{}") as { id: number; params: { name: string } };
+  assert.equal(retry.params.name, "analyzeImage");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: retry.id, result: { content: [{ type: "text", text: "ok" }] } }) + "\n");
+
+  await assert.doesNotReject(callPromise);
+  const secondToolCall = client.callTool("annotateImage", { image_source: "/img.png" });
+  await new Promise((r) => setImmediate(r));
+  const secondToolBody = JSON.parse(written[7]?.trim() ?? "{}") as { id: number; params: { name: string } };
+  assert.equal(secondToolBody.params.name, "annotateImage");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: secondToolBody.id, result: { content: [{ type: "text", text: "annotated" }] } }) + "\n");
+  await secondToolCall;
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient clears its catalog when rediscovery returns zero tools", async () => {
+  const { child, written, pushStdout } = makeFakeChild();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  const callPromise = client.callTool("image_analysis", { image_source: "/img.png" });
+
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "old_image_tool" }] } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const firstCall = JSON.parse(written[3]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: firstCall.id, error: { code: -32601, message: "tool not found" } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const rediscovery = JSON.parse(written[4]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: rediscovery.id, result: { tools: [] } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const retry = JSON.parse(written[5]?.trim() ?? "{}") as { id: number; params: { name: string } };
+  assert.equal(retry.params.name, "image_analysis");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: retry.id, error: { code: -32601, message: "tool not found" } }) + "\n");
+  await assert.rejects(callPromise, /not available|tool not found/i);
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient rejects a rediscovered catalog with duplicate tool names", async () => {
+  const { child, written, pushStdout } = makeFakeChild();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  const callPromise = client.callTool("image_analysis", { image_source: "/img.png" });
+
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "old_image_tool" }] } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const firstCall = JSON.parse(written[3]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: firstCall.id, error: { code: -32601, message: "tool not found" } }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const rediscovery = JSON.parse(written[4]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: rediscovery.id, result: { tools: [{ name: "analyzeImage" }, { name: "analyzeImage" }] } }) + "\n");
+
+  await assert.rejects(callPromise, /duplicate tool name/i);
+  await client.dispose();
+});

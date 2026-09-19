@@ -13,13 +13,16 @@ import type { VisionMcpClient } from "../tools/vision-mcp-client.js";
 
 function connection() {
   const updates: Array<Record<string, unknown>> = [];
+  const permissionRequests: unknown[] = [];
   return {
     updates,
+    permissionRequests,
     signal: new AbortController().signal,
     async sessionUpdate(params: Record<string, unknown>) {
       updates.push(params);
     },
-    async requestPermission() {
+    async requestPermission(params: unknown) {
+      permissionRequests.push(params);
       return { outcome: { outcome: "selected", optionId: "allow" } };
     },
   };
@@ -313,6 +316,125 @@ test("a follow-up prompt starts after the cancelled image turn has fully unwound
   assert.equal(followUp.stopReason, "end_turn");
   assert.equal(followUp.userMessageId, "second");
   assert.equal(modelCalls, 1);
+});
+
+test("a malformed tool argument result is paired in history before the model and next prompt continue", async () => {
+  const conn = connection();
+  const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-invalid-tool-history-"));
+  const sessionStore = new SessionStore(storeRoot);
+  const modelInputs: Array<Array<{ role: string; tool_call_id?: string; content?: unknown; tool_calls?: unknown[] }>> = [];
+  let calls = 0;
+  const glm = {
+    async *streamChat(messages: Array<{ role: string; tool_call_id?: string; content?: unknown; tool_calls?: unknown[] }>): AsyncGenerator<GlmStreamChunk> {
+      modelInputs.push(structuredClone(messages));
+      calls += 1;
+      if (calls === 1) {
+        yield { toolCall: { id: "bad-root", name: "write_file", arguments: "null" } };
+        yield { done: true, stopReason: "tool_calls" };
+        return;
+      }
+      yield { text: calls === 2 ? "recovered" : "follow-up" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "write it" }] })).stopReason, "end_turn");
+    assert.equal(conn.permissionRequests.length, 0);
+    const historyForRecovery = modelInputs[1]!;
+    const assistantIndex = historyForRecovery.findIndex((message) => message.role === "assistant" && message.tool_calls);
+    assert.ok(assistantIndex >= 0);
+    assert.deepEqual(historyForRecovery[assistantIndex + 1], {
+      role: "tool",
+      tool_call_id: "bad-root",
+      content: "Error: Tool arguments must be a JSON object.",
+    });
+
+    assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] })).stopReason, "end_turn");
+    assert.equal(calls, 3);
+    await agent.closeSession({ sessionId });
+    const persisted = sessionStore.load(sessionId);
+    assert.ok(persisted);
+    assert.ok(persisted.messages.some((message) => message.role === "tool" && message.tool_call_id === "bad-root"));
+  } finally {
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("an unexpected executor failure settles history and stops until a user follow-up", async () => {
+  const conn = connection();
+  const sessionUpdate = conn.sessionUpdate.bind(conn);
+  let failFailedNotification = true;
+  conn.sessionUpdate = async (params: Record<string, unknown>) => {
+    const update = params["update"] as { sessionUpdate?: string; status?: string };
+    if (failFailedNotification && update.sessionUpdate === "tool_call" && update.status === "failed") {
+      failFailedNotification = false;
+      throw new Error("synthetic tool notification interruption");
+    }
+    await sessionUpdate(params);
+  };
+  const modelInputs: Array<Array<{ role: string; tool_call_id?: string; content?: unknown; tool_calls?: unknown[] }>> = [];
+  let calls = 0;
+  const glm = {
+    async *streamChat(messages: Array<{ role: string; tool_call_id?: string; content?: unknown; tool_calls?: unknown[] }>): AsyncGenerator<GlmStreamChunk> {
+      modelInputs.push(structuredClone(messages));
+      calls += 1;
+      if (calls === 1) {
+        yield { toolCall: { id: "interrupted", name: "write_file", arguments: "null" } };
+        yield { done: true, stopReason: "tool_calls" };
+        return;
+      }
+      yield { text: "recovered" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  await assert.rejects(agent.prompt({ sessionId, prompt: [{ type: "text", text: "write it" }] }), /outcome.*unknown/i);
+  assert.equal(calls, 1, "unexpected failure must not automatically continue the model");
+  await agent.prompt({ sessionId, prompt: [{ type: "text", text: "inspect what happened" }] });
+  assert.equal(calls, 2);
+  const tool = modelInputs[1]!.find(message => message.tool_call_id === "interrupted");
+  assert.match(String(tool?.content), /outcome.*unknown/i);
+});
+
+test("an error after the first write stops remaining tools and records uncertain versus unstarted outcomes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "glm-tool-uncertain-"));
+  const conn = connection();
+  const update = conn.sessionUpdate.bind(conn);
+  conn.sessionUpdate = async params => {
+    const event = params["update"] as { toolCallId?: string; status?: string };
+    if (event.toolCallId === "first" && ["completed", "failed"].includes(event.status ?? "")) {
+      throw new Error("fixture notification failed after write");
+    }
+    await update(params);
+  };
+  const store = new SessionStore(join(cwd, "sessions"));
+  let calls = 0;
+  const agent = new GlmAcpAgent(conn as never, { sessionStore: store, glm: {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      calls++;
+      for (const id of ["first", "second"]) yield { toolCall: { id, name: "write_file", arguments: JSON.stringify({ path: join(cwd, id), content: "written" }) } };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  } });
+  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+  try {
+    await agent.setSessionMode({ sessionId, modeId: "accept_edits" });
+    await assert.rejects(agent.prompt({ sessionId, prompt: [{ type: "text", text: "write both" }] }), /outcome.*unknown/i);
+    assert.equal(calls, 1);
+    assert.equal(existsSync(join(cwd, "first")), true);
+    assert.equal(existsSync(join(cwd, "second")), false);
+    await agent.closeSession({ sessionId });
+    const tools = store.load(sessionId)?.messages.filter(message => message.role === "tool");
+    assert.equal(tools?.length, 2);
+    assert.match(String(tools?.[0]?.content), /outcome.*unknown/i);
+    assert.match(String(tools?.[1]?.content), /not started/i);
+  } finally {
+    await agent.closeSession({ sessionId });
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("queued prompts form a chain so only the newest prompt can reach the model", async () => {
@@ -1367,11 +1489,18 @@ test("a configuration change during load replay is carried into the replacement"
     replayArmed = true;
     const loading = agent.loadSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
     await replayBlocked;
+    const timestampBeforeChange = store.load(sessionId)!.updatedAt;
+    while (Date.now() <= Date.parse(timestampBeforeChange)) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     await agent.setSessionMode({ sessionId, modeId: "bypass_permissions" });
+    const timestampAfterChange = store.load(sessionId)!.updatedAt;
+    assert.notEqual(timestampAfterChange, timestampBeforeChange);
     releaseReplay();
     const loaded = await loading;
     assert.equal(loaded.modes?.currentModeId, "bypass_permissions");
     assert.equal(store.load(sessionId)?.mode, "bypass_permissions");
+    assert.equal(store.load(sessionId)?.updatedAt, timestampAfterChange);
   } finally {
     releaseReplay();
     await rm(storeRoot, { recursive: true, force: true });

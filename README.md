@@ -4,6 +4,8 @@ An [Agent Client Protocol (ACP)](https://agentclientprotocol.com) agent written 
 
 The agent connects to any ACP-compatible IDE or client over **stdio**, streams responses back in real time, and can call a rich set of tools to interact with the user's file system, terminal, and the web.
 
+Streaming responses must include a supported terminal finish reason. An early connection close is reported as an interrupted response, with received text retained for session replay. Tool calls run only after a complete `tool_calls` response; calls in output-limit (`length`) or filtered (`content_filter`) responses are discarded and the corresponding stop reason is preserved.
+
 ---
 
 ## Coding Plan Only
@@ -241,6 +243,8 @@ The agent advertises a `thought_level` [SessionConfigOption](https://agentclient
 The endpoint validates `reasoning_effort` against `none | minimal | low | medium | high | xhigh | max` on GLM-5.3. GLM-5.3-Flash's documented values are only `low | high | max`, so the agent advertises that shorter ladder for Flash. `none` is never offered on either model.
 
 `ACP_GLM_PROMPT_IMAGES=false` still hides the image-attachment capability at session startup. With that flag set, clients should not offer image attachments at all.
+
+Switching to a text-only model is rejected while retained conversation history contains native images. Keep an image-capable model or start a text-only session with a textual description; images are never silently discarded or analyzed as part of a model switch. During an active prompt on a native-image model, wait for the turn to finish before switching to text-only capability. Other compatible selections affect subsequent model calls, while an in-flight call keeps its captured model and reasoning level. Restored histories receive the same compatibility check before a provider request.
 
 ### Vision MCP
 

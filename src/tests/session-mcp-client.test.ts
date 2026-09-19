@@ -3,7 +3,14 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { McpServerStdio } from "@agentclientprotocol/sdk";
-import { connectSessionMcpServers, StdioMcpClient } from "../tools/session-mcp-client.js";
+import {
+  HttpMcpClient,
+  SessionMcpTools,
+  StdioMcpClient,
+  type ConnectedMcpClient,
+  type ToolBinding,
+  connectSessionMcpServers,
+} from "../tools/session-mcp-client.js";
 
 interface FakeChild extends EventEmitter {
   stdin: Writable;
@@ -87,6 +94,251 @@ test("connectSessionMcpServers aborts stalled HTTP initialization", async () => 
   }
 });
 
+function httpServer() {
+  return { type: "http" as const, name: "fixture", url: "https://fixture.invalid", headers: [] };
+}
+
+test("HTTP MCP cancels a stalled shared initialization when its only waiter aborts", async () => {
+  const originalFetch = globalThis.fetch;
+  let initializeSignal: AbortSignal | undefined;
+  let initializationAborted = false;
+  const initializationStarted = new Promise<void>((resolve) => {
+    globalThis.fetch = (async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string };
+      if (body.method !== "initialize") throw new Error(`unexpected method ${String(body.method)}`);
+      initializeSignal = init?.signal ?? undefined;
+      resolve();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          initializationAborted = true;
+          reject(new Error("initialization aborted"));
+        }, { once: true });
+      });
+    }) as typeof fetch;
+  });
+  try {
+    const client = new HttpMcpClient(httpServer());
+    const controller = new AbortController();
+    const listPromise = client.listTools(controller.signal);
+    await initializationStarted;
+    controller.abort();
+    const watchdog = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("HTTP initialization cancellation hung")), 250).unref();
+    });
+    await assert.rejects(Promise.race([listPromise, watchdog]), /cancelled|aborted/i);
+    assert.equal(initializeSignal?.aborted, true);
+    assert.equal(initializationAborted, true);
+    await client.dispose();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("HTTP MCP retries initialization for a caller started immediately after cancellation", async () => {
+  const originalFetch = globalThis.fetch;
+  let initializeCalls = 0;
+  let firstInitializationStarted!: () => void;
+  let secondInitializationStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { firstInitializationStarted = resolve; });
+  const secondStarted = new Promise<void>((resolve) => { secondInitializationStarted = resolve; });
+  globalThis.fetch = (async (_url, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string; id?: number };
+    if (body.method === "initialize") {
+      initializeCalls += 1;
+      if (initializeCalls === 1) {
+        firstInitializationStarted();
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("initialization aborted")), { once: true });
+        });
+      }
+      secondInitializationStarted();
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: {} }), {
+        headers: { "Content-Type": "application/json", "MCP-Session-Id": "retry-session" },
+      });
+    }
+    if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (body.method === "tools/list") {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "search" }] } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (init?.method === "DELETE") return new Response(null, { status: 202 });
+    throw new Error(`unexpected method ${String(body.method)}`);
+  }) as typeof fetch;
+  try {
+    const client = new HttpMcpClient(httpServer());
+    const controller = new AbortController();
+    const cancelled = client.listTools(controller.signal);
+    void cancelled.catch(() => {});
+    await firstStarted;
+    controller.abort();
+
+    // Start the replacement before the cancelled caller's promise continuation
+    // runs. This is the race that must not attach to the doomed initialization.
+    const retry = client.listTools();
+    const watchdog = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("replacement initialization did not start")), 250).unref();
+    });
+    await Promise.race([secondStarted, watchdog]);
+    await assert.rejects(cancelled, /cancelled|aborted/i);
+    assert.deepEqual(await retry, [{ name: "search", description: undefined, inputSchema: undefined }]);
+    assert.equal(initializeCalls, 2);
+    await client.dispose();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("HTTP MCP keeps shared initialization alive for a concurrent non-aborted waiter", async () => {
+  const originalFetch = globalThis.fetch;
+  let initializeSignal: AbortSignal | undefined;
+  let resolveInitialize!: (response: Response) => void;
+  let initializeCalls = 0;
+  const initializationStarted = new Promise<void>((resolve) => {
+    globalThis.fetch = (async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string; id?: number };
+      if (body.method === "initialize") {
+        initializeCalls += 1;
+        initializeSignal = init?.signal ?? undefined;
+        resolve();
+        return new Promise<Response>((responseResolve) => { resolveInitialize = responseResolve; });
+      }
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      if (body.method === "tools/list") {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "search" }] } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected method ${String(body.method)}`);
+    }) as typeof fetch;
+  });
+  try {
+    const client = new HttpMcpClient(httpServer());
+    const controller = new AbortController();
+    const cancelled = client.listTools(controller.signal);
+    const surviving = client.listTools();
+    await initializationStarted;
+    controller.abort();
+    await assert.rejects(cancelled, /cancelled|aborted/i);
+    assert.equal(initializeSignal?.aborted, false);
+    resolveInitialize(new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), {
+      headers: { "Content-Type": "application/json", "MCP-Session-Id": "shared-session" },
+    }));
+    assert.deepEqual(await surviving, [{ name: "search", description: undefined, inputSchema: undefined }]);
+    assert.equal(initializeCalls, 1);
+    await client.dispose();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("HTTP MCP forwards cancellation to a stalled initialized notification", async () => {
+  const originalFetch = globalThis.fetch;
+  let notificationSignal: AbortSignal | undefined;
+  let notificationAborted = false;
+  const notificationStarted = new Promise<void>((resolve) => {
+    globalThis.fetch = (async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string; id?: number };
+      if (body.method === "initialize") {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: {} }), {
+          headers: { "Content-Type": "application/json", "MCP-Session-Id": "notification-session" },
+        });
+      }
+      if (body.method !== "notifications/initialized") throw new Error(`unexpected method ${String(body.method)}`);
+      notificationSignal = init?.signal ?? undefined;
+      resolve();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          notificationAborted = true;
+          reject(new Error("initialized notification aborted"));
+        }, { once: true });
+      });
+    }) as typeof fetch;
+  });
+  try {
+    const client = new HttpMcpClient(httpServer());
+    const controller = new AbortController();
+    const listPromise = client.listTools(controller.signal);
+    await notificationStarted;
+    controller.abort();
+    const watchdog = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("initialized notification cancellation hung")), 250).unref();
+    });
+    await assert.rejects(Promise.race([listPromise, watchdog]), /cancelled|aborted/i);
+    assert.equal(notificationSignal?.aborted, true);
+    assert.equal(notificationAborted, true);
+    await client.dispose();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("HTTP discovery rejects malformed later pages rather than exposing a partial catalog", async () => {
+  const savedFetch = globalThis.fetch;
+  try {
+    for (const invalid of [null, { tools: {} }, { tools: [null] }, { tools: [{ name: 42 }] }]) {
+      let pages = 0;
+      globalThis.fetch = (async (_url, init) => {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+        const result = body.method === "tools/list"
+          ? (++pages === 1 ? { tools: [{ name: "first" }], nextCursor: "next" } : invalid)
+          : {};
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), { headers: { "Content-Type": "application/json" } });
+      }) as typeof fetch;
+      await assert.rejects(connectSessionMcpServers([{ type: "http", name: "fixture", url: "https://fixture.invalid", headers: [] }]), /malformed.*tools\/list/i);
+    }
+  } finally { globalThis.fetch = savedFetch; }
+});
+
+for (const operation of ["cancel", "dispose"]) {
+  test(`HTTP ${operation} still aborts after response headers while body is pending`, async () => {
+    const originalFetch = globalThis.fetch;
+    let bodyStarted!: () => void;
+    const started = new Promise<void>(resolve => { bodyStarted = resolve; });
+    let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    globalThis.fetch = (async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      if (body.method === "tools/call") {
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            bodyController = controller;
+            init?.signal?.addEventListener("abort", () => controller.error(new Error("body aborted")), { once: true });
+            bodyStarted();
+            return new Promise<void>(() => {});
+          },
+        }, { highWaterMark: 0 }), { headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id,
+        result: body.method === "tools/list" ? { tools: [{ name: "read" }] } : {},
+      }), { headers: { "Content-Type": "application/json" } });
+    }) as typeof fetch;
+    let tools: SessionMcpTools | undefined;
+    let call: Promise<unknown> | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      tools = await connectSessionMcpServers([{ type: "http", name: "fixture", url: "https://fixture.invalid", headers: [] }]);
+      const controller = new AbortController();
+      call = tools.callTool("read", {}, controller.signal);
+      void call.catch(() => {});
+      await started;
+      if (operation === "cancel") controller.abort();
+      else await tools.dispose();
+      const watchdog = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("pending body was not interrupted")), 200);
+      });
+      await assert.rejects(Promise.race([call, watchdog]), /body aborted/);
+    } finally {
+      if (timer) clearTimeout(timer);
+      bodyController?.error(new Error("fixture cleanup"));
+      await call?.catch(() => {});
+      await tools?.dispose();
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
 /** Drive a fake child through initialize + tools/list so the client is ready for tools/call. */
 async function completeHandshake(
   written: string[],
@@ -112,6 +364,94 @@ test("StdioMcpClient rejects an asynchronous spawn error instead of hanging", as
 
   await assert.rejects(listPromise, /could not launch `npx`/i);
   await client.dispose();
+});
+
+test("StdioMcpClient collects every tools/list page and forwards the opaque cursor", async () => {
+  const { child, written, pushStdout } = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+  const listPromise = client.listTools();
+
+  await new Promise((r) => setImmediate(r));
+  const init = JSON.parse(written[0]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: init.id, result: {} }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const firstList = JSON.parse(written[2]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({
+    jsonrpc: "2.0",
+    id: firstList.id,
+    result: { tools: [{ name: "first" }], nextCursor: "opaque/std-2" },
+  }) + "\n");
+  await new Promise((r) => setImmediate(r));
+  const secondList = JSON.parse(written[3]?.trim() ?? "{}") as { id: number; params: { cursor: string } };
+  assert.equal(secondList.params.cursor, "opaque/std-2");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: secondList.id, result: { tools: [{ name: "second" }] } }) + "\n");
+
+  assert.deepEqual((await listPromise).map((tool) => tool.name), ["first", "second"]);
+  const secondCall = client.callTool("second", {});
+  await new Promise((r) => setImmediate(r));
+  const secondCallBody = JSON.parse(written[4]?.trim() ?? "{}") as { id: number; params: { name: string } };
+  assert.equal(secondCallBody.params.name, "second");
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: secondCallBody.id, result: { content: [{ type: "text", text: "ok" }] } }) + "\n");
+  await secondCall;
+  await client.dispose();
+});
+
+test("SessionMcpTools owns and disposes zero-tool clients exactly once", async () => {
+  let disposeCount = 0;
+  const client: ConnectedMcpClient = {
+    listTools: async () => [],
+    callTool: async () => undefined,
+    dispose: async () => { disposeCount += 1; },
+  };
+  const tools = new SessionMcpTools([] as ToolBinding[], [client, client]);
+  await Promise.all([tools.dispose(), tools.dispose()]);
+  assert.equal(disposeCount, 1);
+});
+
+test("HTTP MCP discovery collects a second page with its opaque cursor", async () => {
+  const savedFetch = globalThis.fetch;
+  const calls: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    calls.push(body);
+    if (body.method === "initialize") {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: {} }), {
+        headers: { "Content-Type": "application/json", "MCP-Session-Id": "session-http" },
+      });
+    }
+    if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (body.method === "tools/list" && calls.filter((entry) => entry.method === "tools/list").length === 1) {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "first" }], nextCursor: "opaque/http-2" } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (body.method === "tools/list") {
+      assert.deepEqual(body.params, { cursor: "opaque/http-2" });
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "second" }] } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (body.method === "tools/call") {
+      assert.equal((body.params as { name: string }).name, "second");
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { content: [{ type: "text", text: "ok" }] } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    throw new Error(`unexpected method ${String(body.method)}`);
+  }) as typeof fetch;
+  try {
+    const tools = await connectSessionMcpServers([{
+      type: "http",
+      name: "http",
+      url: "https://mcp.example.test",
+      headers: [],
+    }]);
+    assert.deepEqual(tools.toolNames, ["first", "second"]);
+    await tools.callTool("second", {});
+    await tools.dispose();
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
 });
 
 test("StdioMcpClient rejects a pending tools/call when the child errors asynchronously", async () => {
@@ -535,3 +875,62 @@ test("StdioMcpClient does not resurrect a disposed server", async () => {
   await assert.rejects(() => client.callTool("search", {}), /disposed/i);
   assert.equal(spawnCount, 0);
 });
+
+test("HTTP dispose aborts its DELETE request once disposal returns", async () => {
+  const originalFetch = globalThis.fetch;
+  // A server can return DELETE headers while leaving the body pending. The
+  // fetch promise settles on headers, so the only observable contract of the
+  // fix is that the request signal is aborted by the time dispose() returns.
+  let deleteSignal: AbortSignal | undefined;
+  globalThis.fetch = (async (_url, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    if (body.method === "initialize") {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: {} }), {
+        headers: { "Content-Type": "application/json", "MCP-Session-Id": "session-delete" },
+      });
+    }
+    if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (init?.method === "DELETE") {
+      deleteSignal = init.signal ?? undefined;
+      return new Response(new ReadableStream<Uint8Array>({
+        pull() { return new Promise<void>(() => {}); },
+      }, { highWaterMark: 0 }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id,
+      result: body.method === "tools/list" ? { tools: [{ name: "read" }] } : {},
+    }), { headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    const tools = await connectSessionMcpServers([{ type: "http", name: "fixture", url: "https://fixture.invalid", headers: [] }]);
+    await tools.dispose();
+    assert.ok(deleteSignal, "a DELETE request was made");
+    assert.equal(deleteSignal.aborted, true, "dispose must abort the DELETE request so its body cannot hold resources");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+for (const scenario of ["within a page", "across pages"] as const) {
+  test(`HTTP discovery rejects duplicate tool names ${scenario}`, async () => {
+    const savedFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async (_url, init) => {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+        const page = scenario === "within a page"
+          ? { tools: [{ name: "dup" }, { name: "dup" }] }
+          : { tools: [{ name: "dup" }], nextCursor: "page2" };
+        if (body.method === "tools/list" && body.params?.cursor === "page2") {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "dup" }] } }),
+            { headers: { "Content-Type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: page }),
+          { headers: { "Content-Type": "application/json" } });
+      }) as typeof fetch;
+      await assert.rejects(
+        connectSessionMcpServers([{ type: "http", name: "fixture", url: "https://fixture.invalid", headers: [] }]),
+        /duplicate tool name/i,
+      );
+    } finally { globalThis.fetch = savedFetch; }
+  });
+}
