@@ -1089,7 +1089,7 @@ export class GlmAcpAgent implements Agent {
         // A prompt that missed the drain deadline may still hold an unmatched
         // assistant tool call. Leave the last valid on-disk checkpoint intact.
         if (promptsSettled[index] === true) this.persistSession(sessionId, session);
-        resourceDisposals.push(this.disposeSessionTools(session).catch(() => undefined));
+        resourceDisposals.push(this.disposeSessionTools(session));
         if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
         this.sessionTodos.delete(sessionId);
       }

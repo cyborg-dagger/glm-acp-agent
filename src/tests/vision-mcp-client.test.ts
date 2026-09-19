@@ -38,6 +38,8 @@ function makeFakeChild(): {
     exitCode: null,
     kill: () => {
       killCount += 1;
+      child.exitCode = 137;
+      queueMicrotask(() => child.emit("exit", 137, "SIGTERM"));
       return true;
     },
   }) as FakeChild;
@@ -307,6 +309,17 @@ test("StdioVisionMcpClient disposal escalates a stubborn child and waits for exi
   assert.equal(disposeResolved, false);
   await disposing;
   assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(child.stdin.destroyed, true);
+  assert.equal(child.stdout.destroyed, true);
+  assert.equal(child.stderr.destroyed, true);
+});
+
+test("StdioVisionMcpClient disposal rejects when KILL cannot prove child exit", async () => {
+  const { child } = makeFakeChild();
+  child.kill = () => true;
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  (client as unknown as { child: FakeChild }).child = child;
+  await assert.rejects(client.dispose(), /did not exit after termination/i);
   assert.equal(child.stdin.destroyed, true);
   assert.equal(child.stdout.destroyed, true);
   assert.equal(child.stderr.destroyed, true);

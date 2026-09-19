@@ -101,9 +101,11 @@ export class SessionMcpTools {
     if (!this.disposePromise) {
       this.disposePromise = (async () => {
         const clients = Array.from(this.clients);
-        await Promise.all(clients.map((client) => client.dispose().catch(() => undefined)));
+        const results = await Promise.allSettled(clients.map((client) => client.dispose()));
         this.clients.clear();
         this.bindings.clear();
+        const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        if (failure) throw failure.reason;
       })();
     }
     await this.disposePromise;
@@ -738,7 +740,7 @@ export class StdioMcpClient implements ConnectedMcpClient {
   }
 
   private terminateChild(child: ChildProcessWithoutNullStreams): void {
-    void this.terminateChildAndWait(child);
+    void this.terminateChildAndWait(child).catch(() => undefined);
   }
 
   private async terminateChildAndWait(child: ChildProcessWithoutNullStreams): Promise<void> {
@@ -768,6 +770,7 @@ export class StdioMcpClient implements ConnectedMcpClient {
     child.removeListener("close", onExit);
     child.removeListener("error", onExit);
     closeChildPipes(child);
+    if (!settled) throw new Error("MCP child process did not exit after termination");
   }
 
   private sendChildSignal(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): boolean {

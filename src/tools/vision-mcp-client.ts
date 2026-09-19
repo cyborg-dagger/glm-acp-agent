@@ -306,7 +306,7 @@ export class StdioVisionMcpClient implements VisionMcpClient {
   }
 
   private terminateChild(child: ChildProcessWithoutNullStreams): void {
-    void this.terminateChildAndWait(child);
+    void this.terminateChildAndWait(child).catch(() => undefined);
   }
 
   private async terminateChildAndWait(child: ChildProcessWithoutNullStreams): Promise<void> {
@@ -336,6 +336,7 @@ export class StdioVisionMcpClient implements VisionMcpClient {
     child.removeListener("close", onExit);
     child.removeListener("error", onExit);
     closeChildPipes(child);
+    if (!settled) throw new Error("Vision MCP child process did not exit after termination");
   }
 
   private sendChildSignal(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): boolean {
