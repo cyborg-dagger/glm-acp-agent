@@ -359,6 +359,11 @@ export class GlmClient {
     let terminalChoiceSeen = false;
 
     for await (const chunk of stream) {
+      if (chunk.choices.length > 1) {
+        throw new IncompleteModelStreamError(
+          "Incomplete model stream: received multiple model choices for one completion."
+        );
+      }
       if (terminalChoiceSeen && chunk.choices.length > 0) {
         throw new IncompleteModelStreamError(
           "Incomplete model stream: received a model frame after terminal completion."
