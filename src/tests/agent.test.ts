@@ -848,8 +848,14 @@ test("shutdown keeps the last valid checkpoint when a prompt exceeds the drain d
     const conn = createConnectionStub();
     let streamStarted!: () => void;
     const started = new Promise<void>((resolve) => { streamStarted = resolve; });
+    let streamCalls = 0;
     const glm = {
       async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        if (streamCalls++ === 0) {
+          yield { text: "checkpoint response" };
+          yield { done: true, stopReason: "stop" };
+          return;
+        }
         yield {
           toolCall: {
             id: "stuck-tool",
@@ -871,16 +877,20 @@ test("shutdown keeps the last valid checkpoint when a prompt exceeds the drain d
     await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
     const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
 
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "checkpoint" }] });
+    const checkpoint = store.load(sessionId);
+    assert.ok(checkpoint, "the shutdown test needs a valid persisted checkpoint");
+    const expectedCheckpoint = structuredClone(checkpoint);
+
     void agent.prompt({ sessionId, prompt: [{ type: "text", text: "stuck" }] }).catch(() => undefined);
     await started;
     await assert.rejects(agent.shutdown("sigterm"), /timed out waiting for prompt cleanup/);
 
     const persisted = store.load(sessionId);
-    assert.ok(
-      !persisted?.messages.some(
-        (message) => message.role === "assistant" && (message as { tool_calls?: unknown[] }).tool_calls?.length,
-      ),
-      "a prompt that missed the drain deadline must not be checkpointed with an unmatched tool call",
+    assert.deepEqual(
+      persisted,
+      expectedCheckpoint,
+      "a prompt that missed the drain deadline must leave the last valid checkpoint unchanged",
     );
   } finally {
     cleanup();
