@@ -60,27 +60,30 @@ if (args.includes("--setup")) {
 } else {
   const runtime = startAgentRuntime({ maxTurns: parseMaxTurnsFlag(args) });
   let finishing: Promise<void> | null = null;
+  let signalExitCode: number | null = null;
 
-  const finish = (reason: "disconnect" | "sigterm" | "sigint" | "fatal", successCode: number) => {
+  const finish = (reason: "disconnect" | "sigterm" | "sigint" | "fatal", exitCode: number) => {
+    if (reason === "sigterm" || reason === "sigint") signalExitCode = exitCode;
     if (finishing) return finishing;
+
     finishing = (async () => {
       const clean = await settlesWithin(runtime.shutdown(reason), 5_000);
       if (clean) {
         runtime.closeTransport();
-        process.exitCode = successCode;
+        process.exitCode = signalExitCode ?? exitCode;
         return;
       }
       process.stderr.write("glm-acp-agent: shutdown deadline exceeded; forcing active command cleanup\n");
       await settlesWithin(runtime.forceShutdown(), 1_000);
-      process.exitCode = 1;
+      process.exitCode = signalExitCode ?? 1;
       // An unresolved client/MCP handle would otherwise keep the CLI alive
       // indefinitely after the documented deadline. Command cleanup had its
       // forced attempt above; report the incomplete shutdown as nonzero.
-      process.exit(1);
+      process.exit(process.exitCode);
     })().catch((err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
       process.stderr.write(`Fatal shutdown error: ${message}\n`);
-      process.exitCode = 1;
+      process.exitCode = signalExitCode ?? 1;
     });
     return finishing;
   };
@@ -88,8 +91,8 @@ if (args.includes("--setup")) {
   void runtime.connection.closed
     .then(() => finish("disconnect", 0))
     .catch(() => finish("fatal", 1));
-  process.once("SIGINT", () => { void finish("sigint", 130); });
-  process.once("SIGTERM", () => { void finish("sigterm", 143); });
+  process.on("SIGINT", () => { void finish("sigint", 130); });
+  process.on("SIGTERM", () => { void finish("sigterm", 143); });
 }
 
 async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {

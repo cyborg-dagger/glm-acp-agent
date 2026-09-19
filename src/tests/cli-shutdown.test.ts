@@ -94,6 +94,11 @@ async function runCliUntilCommand(command: string, cwd: string): Promise<{ child
   };
 }
 
+async function waitForExit(child: ChildProcess): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  const [code, signal] = await once(child, "exit") as [number | null, NodeJS.Signals | null];
+  return { code, signal };
+}
+
 test("CLI stdin close waits for SIGTERM-resistant command cleanup", { skip: process.platform === "win32", timeout: 10_000 }, async () => {
   const cwd = mkdtempSync(join(tmpdir(), "glm-cli-shutdown-"));
   const ready = join(cwd, "ready");
@@ -140,6 +145,64 @@ test("CLI SIGTERM closes its stdin transport after cleanup even when the client 
     child.kill("SIGTERM");
     const [exitCode] = await once(child, "exit");
     assert.equal(exitCode, 143);
+    await wait(900);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    closeServer();
+    if (child.exitCode === null) child.kill("SIGKILL");
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("CLI keeps cleanup alive across repeated SIGTERM signals", { skip: process.platform === "win32", timeout: 10_000 }, async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "glm-cli-repeat-sigterm-"));
+  const ready = join(cwd, "ready");
+  const marker = join(cwd, "marker");
+  const code = [
+    'const fs=require("node:fs");',
+    'process.on("SIGTERM",()=>{});',
+    `fs.writeFileSync(${JSON.stringify(ready)}, "ready");`,
+    `setTimeout(()=>fs.writeFileSync(${JSON.stringify(marker)}, "survived"),700);`,
+  ].join("");
+  const { child, started, closeServer } = await runCliUntilCommand(`${shellQuote(process.execPath)} -e ${shellQuote(code)}`, cwd);
+  try {
+    await started;
+    while (!existsSync(ready)) await wait(10);
+    child.kill("SIGTERM");
+    // Let the first handler start shutdown before delivering the second signal.
+    await wait(50);
+    child.kill("SIGTERM");
+    const exited = await waitForExit(child);
+    assert.equal(exited.code, 143);
+    assert.equal(exited.signal, null);
+    await wait(900);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    closeServer();
+    if (child.exitCode === null) child.kill("SIGKILL");
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("CLI SIGTERM upgrades a disconnect shutdown exit code", { skip: process.platform === "win32", timeout: 10_000 }, async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "glm-cli-disconnect-sigterm-"));
+  const ready = join(cwd, "ready");
+  const marker = join(cwd, "marker");
+  const code = [
+    'const fs=require("node:fs");',
+    'process.on("SIGTERM",()=>{});',
+    `fs.writeFileSync(${JSON.stringify(ready)}, "ready");`,
+    `setTimeout(()=>fs.writeFileSync(${JSON.stringify(marker)}, "survived"),700);`,
+  ].join("");
+  const { child, started, close, closeServer } = await runCliUntilCommand(`${shellQuote(process.execPath)} -e ${shellQuote(code)}`, cwd);
+  try {
+    await started;
+    while (!existsSync(ready)) await wait(10);
+    close();
+    child.kill("SIGTERM");
+    const exited = await waitForExit(child);
+    assert.equal(exited.code, 143);
+    assert.equal(exited.signal, null);
     await wait(900);
     assert.equal(existsSync(marker), false);
   } finally {
