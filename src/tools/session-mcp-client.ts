@@ -65,10 +65,11 @@ export class SessionMcpTools {
   private clients: Set<ConnectedMcpClient>;
   private disposePromise: Promise<void> | null = null;
 
-  constructor(bindings: ToolBinding[], clients: ConnectedMcpClient[]) {
+  constructor(bindings: ToolBinding[], clients: ConnectedMcpClient[] = []) {
     this.clients = new Set(clients);
     for (const binding of bindings) {
       this.bindings.set(binding.exposedName, binding);
+      this.clients.add(binding.client);
     }
   }
 
@@ -108,7 +109,8 @@ export class SessionMcpTools {
 }
 
 export async function connectSessionMcpServers(
-  servers: ReadonlyArray<McpServer>
+  servers: ReadonlyArray<McpServer>,
+  signal?: AbortSignal
 ): Promise<SessionMcpTools> {
   const usedNames = new Set(TOOL_DEFINITIONS.map((tool) => tool.function.name));
   const bindings: ToolBinding[] = [];
@@ -116,9 +118,10 @@ export async function connectSessionMcpServers(
 
   try {
     for (const server of servers) {
+      if (signal?.aborted) throw new Error("MCP session setup cancelled");
       const client = createClient(server);
       clients.push(client);
-      const tools = await client.listTools();
+      const tools = await client.listTools(signal);
       assertUniqueSourceNames(tools, server.name);
       for (const tool of tools) {
         const exposedName = chooseToolName(tool.name, server.name, usedNames);

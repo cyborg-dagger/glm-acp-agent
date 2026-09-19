@@ -70,6 +70,30 @@ function stdioServer(overrides: Partial<McpServerStdio> = {}): McpServerStdio {
 
 const tick = () => new Promise((r) => setImmediate(r));
 
+test("connectSessionMcpServers aborts stalled HTTP initialization", async () => {
+  const previousFetch = globalThis.fetch;
+  let setupSignal: AbortSignal | undefined;
+  globalThis.fetch = ((_: RequestInfo | URL, init?: RequestInit) => {
+    setupSignal = init?.signal ?? undefined;
+    return new Promise<Response>((_resolve, reject) => {
+      setupSignal?.addEventListener("abort", () => reject(new Error("synthetic setup abort")), { once: true });
+    });
+  }) as typeof fetch;
+  const controller = new AbortController();
+  try {
+    const pending = connectSessionMcpServers([
+      { type: "http", name: "stalled", url: "https://mcp.example.test/stalled", headers: [] },
+    ], controller.signal);
+    await tick();
+    assert.ok(setupSignal, "HTTP setup must receive an abort signal");
+    controller.abort();
+    await assert.rejects(pending, /synthetic setup abort|cancelled/i);
+    assert.equal(setupSignal.aborted, true);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
 function httpServer() {
   return { type: "http" as const, name: "fixture", url: "https://fixture.invalid", headers: [] };
 }
