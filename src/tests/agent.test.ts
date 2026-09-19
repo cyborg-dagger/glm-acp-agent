@@ -3122,6 +3122,7 @@ test("emergency compaction evicts history even when the estimate is under target
   await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
 
   const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5.3-flash" });
   const session = (agent as unknown as {
     sessions: Map<string, { messages: unknown[] }>;
   }).sessions.get(sessionId);

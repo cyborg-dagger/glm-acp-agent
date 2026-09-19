@@ -58,6 +58,7 @@ import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
 import { SessionLifecycle, type TransitionLease } from "./session-lifecycle.js";
+import { checkModelTransition } from "./model-transition.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import {
   discoverSlashCommands,
@@ -69,6 +70,7 @@ import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
 import { debug, error, isDebugEnabled } from "../llm/logger.js";
+import { validateStreamCompletion } from "../llm/stream-state.js";
 
 /**
  * Maximum bytes of AGENTS.md / CLAUDE.md to embed in the system prompt.
@@ -545,6 +547,14 @@ export class GlmAcpAgent implements Agent {
     session: SessionState,
     modelId: string
   ): Promise<void> {
+    if (session.closing || session.closed) throw new Error(`Session is closing: ${sessionId}`);
+    const compatibility = checkModelTransition(session.messages, modelId);
+    if (!compatibility.ok) throw new Error(compatibility.message);
+    // A native-image prompt may still be preprocessing and not yet appear in
+    // history. Keep its selected input capability fixed through that turn.
+    if (session.promptPromise && isVisionNativeModel(session.model) && !isVisionNativeModel(modelId)) {
+      throw new Error("Cannot switch away from an image-capable model during an active prompt. Wait for the prompt to finish and try again.");
+    }
     const available = getAvailableModels();
     const known = available.find((m) => m.modelId === modelId);
     if (!known) {
@@ -1162,17 +1172,88 @@ export class GlmAcpAgent implements Agent {
   ): Promise<ForkSessionResponse> {
     if (this.shuttingDown) throw new Error("Agent is shutting down");
     const source = this.sessions.get(params.sessionId);
-    const persisted = source
-      ? this.snapshot(params.sessionId, source)
-      : this.requirePersisted(params.sessionId);
-    const setup = this.connectMcpForSession(params.mcpServers ?? []);
-    let installed: SessionState | null = null;
-    let newSessionId: string | null = null;
+    const record = this.transitions.get(params.sessionId)
+      ?? this.registerTransition(params.sessionId, source?.lifecycle ?? new SessionLifecycle());
+    const lifecycle = record.lifecycle;
+    const lease = lifecycle.begin("snapshotting");
+    record.original = source ?? null;
+    const forkAbortController = new AbortController();
+    record.restoreAbortController = forkAbortController;
+    let deferLeaseRelease = false;
+    const transition = Promise.resolve().then(async (): Promise<ForkSessionResponse> => {
+      let provisional: SessionMcpTools | null = null;
+      let provisionalDisposal: Promise<void> | null = null;
+      const disposeProvisional = (tools: SessionMcpTools): Promise<void> => {
+        if (!provisionalDisposal) provisionalDisposal = tools.dispose();
+        return provisionalDisposal;
+      };
+      try {
+        if (source) {
+          source.abortController?.abort();
+          const { drained, pending } = await this.drainPrompt(source);
+          if (!drained) {
+            deferLeaseRelease = true;
+            this.releaseAfterPromptDrain(pending, source, lifecycle, lease, record);
+            throw new Error(`Session fork timed out waiting for prompt cleanup: ${lease.generation}`);
+          }
+        }
+        if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
+          throw new Error(`Session fork cancelled: ${params.sessionId}`);
+        }
+        const persisted = source
+          ? this.snapshot(params.sessionId, source)
+          : this.requirePersisted(params.sessionId);
+        assertSettledToolHistory(persisted.messages);
+        // A draining prompt deliberately suppresses its normal final save:
+        // the fork owns its lifecycle while it settles. Checkpoint the exact
+        // settled parent snapshot before any child setup, so a restart cannot
+        // recover the older (and possibly unmatched) tool-call history.
+        if (source) this.persistSession(params.sessionId, source, persisted);
+        const setup = this.connectMcpServers(params.mcpServers ?? [], forkAbortController.signal);
+        void setup.then(
+          (tools) => {
+            if (forkAbortController.signal.aborted) {
+              void disposeProvisional(tools).catch(() => undefined);
+            }
+          },
+          () => undefined
+        );
+        provisional = await waitForAbort(
+          setup,
+          forkAbortController.signal,
+          `Session fork cancelled: ${params.sessionId}`
+        );
+        if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
+          throw new Error(`Session fork cancelled: ${params.sessionId}`);
+        }
+        const response = this.createFork(params, persisted, provisional);
+        provisional = null;
+        return response;
+      } finally {
+        if (provisional) await disposeProvisional(provisional);
+        if (!deferLeaseRelease) lease.release();
+      }
+    });
+    record.promise = transition;
     try {
-      const mcpTools = await setup.tools;
-      const toolDefinitions = this.availableToolDefinitions(mcpTools);
+      return await transition;
+    } finally {
+      if (record.promise === transition) record.promise = null;
+      if (!deferLeaseRelease && record.original === (source ?? null)) record.original = null;
+      if (record.restoreAbortController === forkAbortController) {
+        record.restoreAbortController = null;
+      }
+    }
+  }
 
-    newSessionId = randomUUID();
+  private createFork(
+    params: ForkSessionRequest,
+    persisted: PersistedSession,
+    mcpTools: SessionMcpTools,
+  ): ForkSessionResponse {
+    const toolDefinitions = this.availableToolDefinitions(mcpTools);
+
+    const newSessionId = randomUUID();
     const forkedTitle =
       persisted.title === null ? null : `${persisted.title} (fork)`;
     const forkedMessages = rebuildRestoredMessages(
@@ -1209,7 +1290,6 @@ export class GlmAcpAgent implements Agent {
       lifecycle: forkLifecycle,
     };
     this.sessions.set(newSessionId, forked);
-    installed = forked;
     this.transitions.set(newSessionId, {
       lifecycle: forkLifecycle,
       promise: null,
@@ -1233,17 +1313,6 @@ export class GlmAcpAgent implements Agent {
         forked.mode
       ),
     };
-    } catch (error) {
-      if (installed) {
-        if (this.sessions.get(newSessionId!) === installed) this.sessions.delete(newSessionId!);
-        await this.disposeSessionTools(installed);
-      } else {
-        await setup.dispose();
-      }
-      throw error;
-    } finally {
-      setup.release();
-    }
   }
 
   async resumeSession(
@@ -1366,6 +1435,7 @@ export class GlmAcpAgent implements Agent {
           restored.model = original.model;
           restored.mode = original.mode;
           restored.thoughtLevel = original.thoughtLevel;
+          restored.updatedAt = original.updatedAt;
         }
         this.sessions.set(params.sessionId, restored);
         this.sessionTodos.delete(params.sessionId);
@@ -1476,7 +1546,8 @@ export class GlmAcpAgent implements Agent {
 
   private isDrainingOriginal(sessionId: string, session: SessionState): boolean {
     const record = this.transitions.get(sessionId);
-    if (record?.original === session && record.lifecycle.phase === "restoring") return true;
+    if (record?.original === session &&
+        (record.lifecycle.phase === "restoring" || record.lifecycle.phase === "snapshotting")) return true;
     // A normal close aborts the prompt and waits for it before persisting. The
     // closing generation must still finish its canonical history (without UI
     // notifications), otherwise already-received text or an in-flight tool
@@ -1562,11 +1633,15 @@ export class GlmAcpAgent implements Agent {
     };
   }
 
-  private persistSession(sessionId: string, session: SessionState): void {
+  private persistSession(
+    sessionId: string,
+    session: SessionState,
+    persisted = this.snapshot(sessionId, session),
+  ): void {
     if (this.sessions.get(sessionId) !== session) return;
     if (!this.sessionStore) return;
     try {
-      this.sessionStore.save(this.snapshot(sessionId, session));
+      this.sessionStore.save(persisted);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(
@@ -1683,16 +1758,18 @@ export class GlmAcpAgent implements Agent {
       }
     };
 
-    const cancelledToolResult = (toolCallId: string): void => {
-      session.messages.push({
+    const cancelledToolResult = (toolCallId: string): GlmMessage => {
+      return {
         role: "tool",
         tool_call_id: toolCallId,
         content: "Tool call cancelled before execution.",
-      });
+      };
     };
 
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal.aborted || !ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
+      const compatibility = checkModelTransition(session.messages, session.model);
+      if (!compatibility.ok) throw new Error(compatibility.message);
 
       // Proactive compaction: check if history exceeds 90% of context window.
       const window = getContextWindow(session.model);
@@ -1770,6 +1847,12 @@ export class GlmAcpAgent implements Agent {
             lastStopReason = chunk.stopReason;
           }
         }
+        if (!signal.aborted) {
+          lastStopReason = validateStreamCompletion(lastStopReason, toolCalls);
+          if (lastStopReason === "length" || lastStopReason === "content_filter") {
+            toolCalls.length = 0;
+          }
+        }
       } catch (err) {
         commitTurnUsage();
         if (signal.aborted) {
@@ -1792,6 +1875,11 @@ export class GlmAcpAgent implements Agent {
         } else if (!cancelledDuringStream && isOverflow) {
           throw new Error("Context overflow persisted after emergency compaction", { cause: err });
         } else if (!cancelledDuringStream) {
+          // Keep text the client has already seen, but never retain an
+          // incomplete executable tool batch from an interrupted stream.
+          if (assistantText.length > 0) {
+            session.messages.push({ role: "assistant", content: assistantText });
+          }
           throw err;
         }
       }
@@ -1803,14 +1891,16 @@ export class GlmAcpAgent implements Agent {
 
       commitTurnUsage();
 
-      // Record the assistant turn in history so the model has full context for
-      // the next iteration.
       const retainDrainedHistory = preservesDrainingHistory();
       if (!ownsPrompt() && !retainDrainedHistory) {
         return { stopReason: "cancelled", usage: totalUsage };
       }
-      if (toolCalls.length > 0) {
-        session.messages.push({
+
+      // Tool-call turns are retained locally until every declared call has a
+      // terminal result. This prevents a thrown executor error from leaving an
+      // assistant tool batch unmatched in provider or persisted history.
+      const assistantToolMessage: GlmMessage | undefined = toolCalls.length > 0
+        ? {
           role: "assistant",
           content: assistantText.length > 0 ? assistantText : null,
           tool_calls: toolCalls.map((tc) => ({
@@ -1818,14 +1908,15 @@ export class GlmAcpAgent implements Agent {
             type: "function" as const,
             function: { name: tc.name, arguments: tc.arguments },
           })),
-        });
-      } else if (assistantText.length > 0) {
+        }
+        : undefined;
+      if (!assistantToolMessage && assistantText.length > 0) {
         session.messages.push({ role: "assistant", content: assistantText });
       }
 
       if (cancelledDuringStream || signal.aborted) {
-        if (ownsPrompt() || retainDrainedHistory) {
-          for (const tc of toolCalls) cancelledToolResult(tc.id);
+        if (assistantToolMessage && (ownsPrompt() || retainDrainedHistory)) {
+          session.messages.push(assistantToolMessage, ...toolCalls.map((tc) => cancelledToolResult(tc.id)));
         }
         return { stopReason: "cancelled", usage: totalUsage };
       }
@@ -1837,9 +1928,18 @@ export class GlmAcpAgent implements Agent {
 
       // Execute tool calls in declaration order and feed each result back.
       let cancellationObserved = false;
+      const toolResults: GlmMessage[] = [];
+      let toolFailure: Error | undefined;
       for (const tc of toolCalls) {
+        if (toolFailure) {
+          toolResults.push({ role: "tool", tool_call_id: tc.id,
+            content: "Tool call not started because an earlier tool's outcome is unknown." });
+          continue;
+        }
         if (signal.aborted || !ownsPrompt()) {
-          if (ownsPrompt() || preservesDrainingHistory()) cancelledToolResult(tc.id);
+          if (ownsPrompt() || preservesDrainingHistory()) {
+            toolResults.push(cancelledToolResult(tc.id));
+          }
           cancellationObserved = true;
           continue;
         }
@@ -1847,11 +1947,22 @@ export class GlmAcpAgent implements Agent {
         let result: { content: string };
         try {
           result = await executor.execute(tc.id, tc.name, tc.arguments);
-        } catch (err) {
-          if (!signal.aborted && !preservesDrainingHistory()) throw err;
-          if (ownsPrompt() || preservesDrainingHistory()) cancelledToolResult(tc.id);
-          cancellationObserved = true;
-          continue;
+        } catch (cause) {
+          result = {
+            content: "Error: tool execution failed unexpectedly; its outcome may be unknown. Inspect the current state before repeating any side effect.",
+          };
+          if (signal.aborted || !ownsPrompt()) {
+            if (ownsPrompt() || preservesDrainingHistory()) {
+              toolResults.push({ role: "tool", tool_call_id: tc.id, content: result.content });
+            }
+            cancellationObserved = true;
+            continue;
+          }
+          // An executor can fail after an operation has started (for example,
+          // while publishing a client notification). Do not replay it; give
+          // the model one terminal result and state that its side effect is
+          // uncertain so the provider history remains structurally valid.
+          toolFailure = new Error(result.content, { cause });
         }
         debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} contentLength=${result.content.length}`);
 
@@ -1860,12 +1971,17 @@ export class GlmAcpAgent implements Agent {
           cancellationObserved = true;
           continue;
         }
-        session.messages.push({
+        toolResults.push({
           role: "tool",
           tool_call_id: tc.id,
           content: result.content,
         });
         if (signal.aborted || !ownsPrompt()) cancellationObserved = true;
+      }
+
+      if (ownsPrompt() || preservesDrainingHistory()) {
+        session.messages.push(assistantToolMessage!, ...toolResults);
+        if (toolFailure) throw toolFailure;
       }
 
       if (cancellationObserved || signal.aborted || !ownsPrompt()) {
@@ -2359,6 +2475,34 @@ async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Prom
  * is sacred — it carries the live user message, and a request without it is not
  * a retry of anything.
  */
+/** Reject a fork source whose assistant/tool suffix is not provider-ready. */
+function assertSettledToolHistory(messages: readonly GlmMessage[]): void {
+  let pending: Set<string> | null = null;
+  for (const message of messages) {
+    if (pending) {
+      if (message.role !== "tool" || !pending.has(message.tool_call_id)) {
+        throw new Error(`Cannot fork session: missing tool result for ${[...pending].join(", ")}`);
+      }
+      pending.delete(message.tool_call_id);
+      if (pending.size === 0) pending = null;
+      continue;
+    }
+    if (message.role === "tool") {
+      throw new Error(`Cannot fork session: orphan tool result ${message.tool_call_id}`);
+    }
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      const ids = message.tool_calls.map((call) => call.id);
+      if (new Set(ids).size !== ids.length) {
+        throw new Error("Cannot fork session: duplicate tool call ids");
+      }
+      pending = new Set(ids);
+    }
+  }
+  if (pending) {
+    throw new Error(`Cannot fork session: missing tool result for ${[...pending].join(", ")}`);
+  }
+}
+
 function compactMessages(
   messages: GlmMessage[],
   targetTokens: number,
