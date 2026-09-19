@@ -56,6 +56,7 @@ import { ToolExecutor, type TodoItem } from "../tools/executor.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
+import { checkModelTransition } from "./model-transition.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import {
   discoverSlashCommands,
@@ -493,6 +494,14 @@ export class GlmAcpAgent implements Agent {
     session: SessionState,
     modelId: string
   ): Promise<void> {
+    if (session.closing || session.closed) throw new Error(`Session is closing: ${sessionId}`);
+    const compatibility = checkModelTransition(session.messages, modelId);
+    if (!compatibility.ok) throw new Error(compatibility.message);
+    // A native-image prompt may still be preprocessing and not yet appear in
+    // history. Keep its selected input capability fixed through that turn.
+    if (session.promptPromise && isVisionNativeModel(session.model) && !isVisionNativeModel(modelId)) {
+      throw new Error("Cannot switch away from an image-capable model during an active prompt. Wait for the prompt to finish and try again.");
+    }
     const available = getAvailableModels();
     const known = available.find((m) => m.modelId === modelId);
     if (!known) {
@@ -1293,16 +1302,18 @@ export class GlmAcpAgent implements Agent {
       }
     };
 
-    const cancelledToolResult = (toolCallId: string): void => {
-      session.messages.push({
+    const cancelledToolResult = (toolCallId: string): GlmMessage => {
+      return {
         role: "tool",
         tool_call_id: toolCallId,
         content: "Tool call cancelled before execution.",
-      });
+      };
     };
 
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal.aborted) return { stopReason: "cancelled", usage: totalUsage };
+      const compatibility = checkModelTransition(session.messages, session.model);
+      if (!compatibility.ok) throw new Error(compatibility.message);
 
       this.compactSessionForRequest(session, false);
 
@@ -1430,10 +1441,11 @@ export class GlmAcpAgent implements Agent {
         (lastStopReason === "stop" || lastStopReason === "tool_calls")
         ? { reasoning_content: assistantReasoning } : {};
 
-      // Record the assistant turn in history so the model has full context for
-      // the next iteration.
-      if (toolCalls.length > 0) {
-        session.messages.push({
+      // Tool-call turns are retained locally until every declared call has a
+      // terminal result. This prevents a thrown executor error from leaving an
+      // assistant tool batch unmatched in provider or persisted history.
+      const assistantToolMessage: GlmMessage | undefined = toolCalls.length > 0
+        ? {
           role: "assistant",
           content: assistantText.length > 0 ? assistantText : null,
           ...reasoning,
@@ -1442,13 +1454,16 @@ export class GlmAcpAgent implements Agent {
             type: "function" as const,
             function: { name: tc.name, arguments: tc.arguments },
           })),
-        });
-      } else if (assistantText.length > 0 || reasoning.reasoning_content !== undefined) {
+        }
+        : undefined;
+      if (!assistantToolMessage && (assistantText.length > 0 || reasoning.reasoning_content !== undefined)) {
         session.messages.push({ role: "assistant", content: assistantText || null, ...reasoning });
       }
 
       if (cancelledDuringStream || signal.aborted) {
-        for (const tc of toolCalls) cancelledToolResult(tc.id);
+        if (assistantToolMessage) {
+          session.messages.push(assistantToolMessage, ...toolCalls.map((tc) => cancelledToolResult(tc.id)));
+        }
         return { stopReason: "cancelled", usage: totalUsage };
       }
 
@@ -1459,9 +1474,16 @@ export class GlmAcpAgent implements Agent {
 
       // Execute tool calls in declaration order and feed each result back.
       let cancellationObserved = false;
+      const toolResults: GlmMessage[] = [];
+      let toolFailure: Error | undefined;
       for (const tc of toolCalls) {
+        if (toolFailure) {
+          toolResults.push({ role: "tool", tool_call_id: tc.id,
+            content: "Tool call not started because an earlier tool's outcome is unknown." });
+          continue;
+        }
         if (signal.aborted) {
-          cancelledToolResult(tc.id);
+          toolResults.push(cancelledToolResult(tc.id));
           cancellationObserved = true;
           continue;
         }
@@ -1469,21 +1491,33 @@ export class GlmAcpAgent implements Agent {
         let result: { content: string };
         try {
           result = await executor.execute(tc.id, tc.name, tc.arguments);
-        } catch (err) {
-          if (!signal.aborted) throw err;
-          cancelledToolResult(tc.id);
-          cancellationObserved = true;
-          continue;
+        } catch (cause) {
+          result = {
+            content: "Error: tool execution failed unexpectedly; its outcome may be unknown. Inspect the current state before repeating any side effect.",
+          };
+          if (signal.aborted) {
+            toolResults.push({ role: "tool", tool_call_id: tc.id, content: result.content });
+            cancellationObserved = true;
+            continue;
+          }
+          // An executor can fail after an operation has started (for example,
+          // while publishing a client notification). Do not replay it; give
+          // the model one terminal result and state that its side effect is
+          // uncertain so the provider history remains structurally valid.
+          toolFailure = new Error(result.content, { cause });
         }
         debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} contentLength=${result.content.length}`);
 
-        session.messages.push({
+        toolResults.push({
           role: "tool",
           tool_call_id: tc.id,
           content: result.content,
         });
         if (signal.aborted) cancellationObserved = true;
       }
+
+      session.messages.push(assistantToolMessage!, ...toolResults);
+      if (toolFailure) throw toolFailure;
 
       if (cancellationObserved || signal.aborted) {
         return { stopReason: "cancelled", usage: totalUsage };

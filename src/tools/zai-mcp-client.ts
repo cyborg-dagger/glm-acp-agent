@@ -1,4 +1,11 @@
 import { remapArguments, resolveToolName, type DiscoveredTool } from "./mcp-arg-remap.js";
+import {
+  collectToolPages,
+  assertValidToolPage,
+  DEFAULT_MCP_MAX_PAGES,
+  DEFAULT_MCP_MAX_SCHEMA_BYTES,
+  DEFAULT_MCP_MAX_TOOLS,
+} from "./mcp-pagination.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
@@ -33,13 +40,20 @@ export interface ZaiMcpToolCall {
   signal?: AbortSignal;
 }
 
+export interface ZaiMcpClientOptions {
+  maxPages?: number;
+  maxTools?: number;
+  maxSchemaBytes?: number;
+}
+
 export class ZaiMcpClient {
   private sessions = new Map<string, { sessionId?: string; initialized: boolean; tools: DiscoveredTool[] }>();
   private nextId = 1;
 
   constructor(
     private fetchImpl: typeof fetch = ((...args: Parameters<typeof fetch>) =>
-      fetch(...args)) as typeof fetch
+      fetch(...args)) as typeof fetch,
+    private limits: ZaiMcpClientOptions = {}
   ) {}
 
   async callTool(call: ZaiMcpToolCall): Promise<unknown> {
@@ -136,28 +150,35 @@ export class ZaiMcpClient {
     sessionId: string | undefined,
     signal?: AbortSignal
   ): Promise<DiscoveredTool[]> {
-    const response = await this.fetchJsonRpc(
-      endpoint,
-      apiKey,
-      "tools/list",
-      {
-        jsonrpc: "2.0",
-        id: this.nextId++,
-        method: "tools/list",
+    const rawTools = await collectToolPages({
+      signal: signal ?? new AbortController().signal,
+      maxPages: this.limits.maxPages ?? DEFAULT_MCP_MAX_PAGES,
+      maxTools: this.limits.maxTools ?? DEFAULT_MCP_MAX_TOOLS,
+      maxSchemaBytes: this.limits.maxSchemaBytes ?? DEFAULT_MCP_MAX_SCHEMA_BYTES,
+      requestPage: async (cursor, pageSignal) => {
+        const response = await this.fetchJsonRpc(
+          endpoint,
+          apiKey,
+          "tools/list",
+          {
+            jsonrpc: "2.0",
+            id: this.nextId++,
+            method: "tools/list",
+            ...(cursor === undefined ? {} : { params: { cursor } }),
+          },
+          "tools/list",
+          pageSignal,
+          sessionId
+        );
+        return parseToolPage(response.body.result);
       },
-      "tools/list",
-      signal,
-      sessionId
-    );
-    const result = response.body.result as
-      | { tools?: { name: string; inputSchema?: { properties?: Record<string, unknown> } }[] }
-      | undefined;
-    return (
-      result?.tools?.map((t) => ({
-        name: t.name,
-        properties: t.inputSchema?.properties ? Object.keys(t.inputSchema.properties) : [],
-      })) ?? []
-    );
+    });
+    const tools = rawTools.map((tool) => ({
+      name: tool.name,
+      properties: tool.inputSchema?.properties ? Object.keys(tool.inputSchema.properties) : [],
+    }));
+    assertUniqueToolNames(tools, endpoint);
+    return tools;
   }
 
   private async sendRequest(
@@ -240,6 +261,39 @@ const defaultClient = new ZaiMcpClient();
 
 export function callZaiMcpTool(call: ZaiMcpToolCall): Promise<unknown> {
   return defaultClient.callTool(call);
+}
+
+interface RawZaiTool {
+  name: string;
+  inputSchema?: { properties?: Record<string, unknown> };
+  [key: string]: unknown;
+}
+
+function parseToolPage(result: unknown): { tools: RawZaiTool[]; nextCursor?: string | null } {
+  assertValidToolPage(result);
+  const record = result as Record<string, unknown>;
+  const tools = Array.isArray(record.tools)
+    ? record.tools.filter((tool): tool is RawZaiTool =>
+        Boolean(tool) && typeof tool === "object" && typeof (tool as Record<string, unknown>).name === "string"
+      )
+    : [];
+  const nextCursor = record.nextCursor;
+  return {
+    tools,
+    nextCursor: nextCursor === undefined || nextCursor === null || typeof nextCursor === "string"
+      ? nextCursor
+      : nextCursor as never,
+  };
+}
+
+function assertUniqueToolNames(tools: DiscoveredTool[], endpoint: string): void {
+  const seen = new Set<string>();
+  for (const tool of tools) {
+    if (seen.has(tool.name)) {
+      throw new Error(`MCP server "${endpoint}" returned duplicate tool name "${tool.name}"`);
+    }
+    seen.add(tool.name);
+  }
 }
 
 function buildHeaders(
