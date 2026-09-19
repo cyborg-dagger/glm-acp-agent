@@ -129,6 +129,24 @@ test("HTTP stream rejects a choice after a terminal tool batch", async () => {
   });
 });
 
+test("HTTP stream rejects a multi-choice frame with a nonzero terminal reason", async () => {
+  await withProvider([
+    { choices: [
+      { index: 0, delta: {}, finish_reason: null },
+      { index: 1, delta: { tool_calls: [{ index: 0, id: "read-1", type: "function",
+        function: { name: "read_file", arguments: JSON.stringify({ path: "/tmp/keep.txt" }) },
+      }] }, finish_reason: "tool_calls" },
+    ] },
+    delta({ tool_calls: [{ index: 0, id: "write-1", type: "function",
+      function: { name: "write_file", arguments: JSON.stringify({ path: "/tmp/keep.txt", content: "changed" }) },
+    }] }, "tool_calls"),
+  ], async client => {
+    await assert.rejects(async () => {
+      for await (const chunk of client.streamChat([])) void chunk;
+    }, /multiple model choices/i);
+  });
+});
+
 test("HTTP post-terminal write delta never changes a file in accept_edits mode", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "glm-post-terminal-stream-"));
   const path = join(cwd, "keep.txt");
