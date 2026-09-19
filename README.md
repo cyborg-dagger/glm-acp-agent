@@ -6,6 +6,8 @@ The agent connects to any ACP-compatible IDE or client over **stdio**, streams r
 
 Streaming responses must include a supported terminal finish reason. An early connection close is reported as an interrupted response, with received text retained for session replay. Tool calls run only after a complete `tool_calls` response; calls in output-limit (`length`) or filtered (`content_filter`) responses are discarded and the corresponding stop reason is preserved.
 
+Completed provider reasoning is retained unchanged in conversation history and saved sessions for subsequent model calls, even when thought display is disabled. `ACP_GLM_STREAM_THINKING=false` controls client display only. Reasoning from cancelled, incomplete, or output-limited responses is not replayed as a completed reasoning chain.
+
 ---
 
 ## Coding Plan Only
