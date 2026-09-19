@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { Readable, Writable } from "node:stream";
 import type { McpServerStdio } from "@agentclientprotocol/sdk";
 import {
+  HttpMcpClient,
   SessionMcpTools,
   StdioMcpClient,
   type ConnectedMcpClient,
@@ -68,6 +69,130 @@ function stdioServer(overrides: Partial<McpServerStdio> = {}): McpServerStdio {
 }
 
 const tick = () => new Promise((r) => setImmediate(r));
+
+function httpServer() {
+  return { type: "http" as const, name: "fixture", url: "https://fixture.invalid", headers: [] };
+}
+
+test("HTTP MCP cancels a stalled shared initialization when its only waiter aborts", async () => {
+  const originalFetch = globalThis.fetch;
+  let initializeSignal: AbortSignal | undefined;
+  let initializationAborted = false;
+  const initializationStarted = new Promise<void>((resolve) => {
+    globalThis.fetch = (async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string };
+      if (body.method !== "initialize") throw new Error(`unexpected method ${String(body.method)}`);
+      initializeSignal = init?.signal ?? undefined;
+      resolve();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          initializationAborted = true;
+          reject(new Error("initialization aborted"));
+        }, { once: true });
+      });
+    }) as typeof fetch;
+  });
+  try {
+    const client = new HttpMcpClient(httpServer());
+    const controller = new AbortController();
+    const listPromise = client.listTools(controller.signal);
+    await initializationStarted;
+    controller.abort();
+    const watchdog = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("HTTP initialization cancellation hung")), 250).unref();
+    });
+    await assert.rejects(Promise.race([listPromise, watchdog]), /cancelled|aborted/i);
+    assert.equal(initializeSignal?.aborted, true);
+    assert.equal(initializationAborted, true);
+    await client.dispose();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("HTTP MCP keeps shared initialization alive for a concurrent non-aborted waiter", async () => {
+  const originalFetch = globalThis.fetch;
+  let initializeSignal: AbortSignal | undefined;
+  let resolveInitialize!: (response: Response) => void;
+  let initializeCalls = 0;
+  const initializationStarted = new Promise<void>((resolve) => {
+    globalThis.fetch = (async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string; id?: number };
+      if (body.method === "initialize") {
+        initializeCalls += 1;
+        initializeSignal = init?.signal ?? undefined;
+        resolve();
+        return new Promise<Response>((responseResolve) => { resolveInitialize = responseResolve; });
+      }
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      if (body.method === "tools/list") {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "search" }] } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected method ${String(body.method)}`);
+    }) as typeof fetch;
+  });
+  try {
+    const client = new HttpMcpClient(httpServer());
+    const controller = new AbortController();
+    const cancelled = client.listTools(controller.signal);
+    const surviving = client.listTools();
+    await initializationStarted;
+    controller.abort();
+    await assert.rejects(cancelled, /cancelled|aborted/i);
+    assert.equal(initializeSignal?.aborted, false);
+    resolveInitialize(new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), {
+      headers: { "Content-Type": "application/json", "MCP-Session-Id": "shared-session" },
+    }));
+    assert.deepEqual(await surviving, [{ name: "search", description: undefined, inputSchema: undefined }]);
+    assert.equal(initializeCalls, 1);
+    await client.dispose();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("HTTP MCP forwards cancellation to a stalled initialized notification", async () => {
+  const originalFetch = globalThis.fetch;
+  let notificationSignal: AbortSignal | undefined;
+  let notificationAborted = false;
+  const notificationStarted = new Promise<void>((resolve) => {
+    globalThis.fetch = (async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string; id?: number };
+      if (body.method === "initialize") {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: {} }), {
+          headers: { "Content-Type": "application/json", "MCP-Session-Id": "notification-session" },
+        });
+      }
+      if (body.method !== "notifications/initialized") throw new Error(`unexpected method ${String(body.method)}`);
+      notificationSignal = init?.signal ?? undefined;
+      resolve();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          notificationAborted = true;
+          reject(new Error("initialized notification aborted"));
+        }, { once: true });
+      });
+    }) as typeof fetch;
+  });
+  try {
+    const client = new HttpMcpClient(httpServer());
+    const controller = new AbortController();
+    const listPromise = client.listTools(controller.signal);
+    await notificationStarted;
+    controller.abort();
+    const watchdog = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("initialized notification cancellation hung")), 250).unref();
+    });
+    await assert.rejects(Promise.race([listPromise, watchdog]), /cancelled|aborted/i);
+    assert.equal(notificationSignal?.aborted, true);
+    assert.equal(notificationAborted, true);
+    await client.dispose();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("HTTP discovery rejects malformed later pages rather than exposing a partial catalog", async () => {
   const savedFetch = globalThis.fetch;

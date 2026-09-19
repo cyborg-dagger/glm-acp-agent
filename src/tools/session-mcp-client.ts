@@ -156,9 +156,11 @@ function createClient(server: McpServer): ConnectedMcpClient {
   return new StdioMcpClient(server);
 }
 
-class HttpMcpClient implements ConnectedMcpClient {
+export class HttpMcpClient implements ConnectedMcpClient {
   private nextId = 1;
   private initialized: Promise<void> | null = null;
+  private initializationAbortController: AbortController | null = null;
+  private initializationWaiters = 0;
   private mcpSessionId: string | undefined;
   private activeRequests = new Set<AbortController>();
   private disposed = false;
@@ -166,7 +168,7 @@ class HttpMcpClient implements ConnectedMcpClient {
   constructor(private server: McpServerHttp & { type: "http" }) {}
 
   async listTools(signal?: AbortSignal): Promise<McpTool[]> {
-    await this.ensureInitialized();
+    await this.awaitInitialization(signal);
     return collectToolPages({
       signal: signal ?? new AbortController().signal,
       maxPages: DEFAULT_MCP_MAX_PAGES,
@@ -185,7 +187,7 @@ class HttpMcpClient implements ConnectedMcpClient {
   }
 
   async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
-    await this.ensureInitialized();
+    await this.awaitInitialization(signal);
     return this.request("tools/call", { name, arguments: args }, "tools/call", signal, name);
   }
 
@@ -194,6 +196,7 @@ class HttpMcpClient implements ConnectedMcpClient {
     this.disposed = true;
     for (const controller of this.activeRequests) controller.abort();
     this.initialized = null;
+    this.initializationAbortController = null;
     this.mcpSessionId = undefined;
     if (!sessionId) return;
 
@@ -222,19 +225,48 @@ class HttpMcpClient implements ConnectedMcpClient {
     }
   }
 
-  private async ensureInitialized(): Promise<void> {
-    if (this.disposed) throw new Error(`MCP ${this.server.name} client disposed`);
-    if (this.initialized) return this.initialized;
-    this.initialized = this.initialize();
+  private async awaitInitialization(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new Error(`MCP ${this.server.name} call cancelled`);
+    const initialization = this.ensureInitialized();
+    const waiting = this.initializationAbortController !== null;
+    if (waiting) this.initializationWaiters += 1;
     try {
-      await this.initialized;
+      await waitForAbort(initialization, signal, `MCP ${this.server.name} call cancelled`);
     } catch (err) {
-      this.initialized = null;
+      // One aborted waiter must not interrupt a handshake another caller needs.
+      // If this was the last waiter, abort the shared transport to release it.
+      if (signal?.aborted && waiting && this.initializationWaiters === 1) {
+        this.initializationAbortController?.abort();
+      }
       throw err;
+    } finally {
+      if (waiting) this.initializationWaiters -= 1;
     }
   }
 
-  private async initialize(): Promise<void> {
+  private ensureInitialized(): Promise<void> {
+    if (this.disposed) throw new Error(`MCP ${this.server.name} client disposed`);
+    if (this.initialized) return this.initialized;
+    const controller = new AbortController();
+    this.initializationAbortController = controller;
+    const initialization = this.initialize(controller.signal);
+    this.initialized = initialization;
+    void initialization.then(
+      () => {
+        if (this.initialized === initialization) this.initializationAbortController = null;
+      },
+      () => {
+        if (this.initialized === initialization) {
+          this.initialized = null;
+          this.initializationAbortController = null;
+          this.mcpSessionId = undefined;
+        }
+      },
+    );
+    return initialization;
+  }
+
+  private async initialize(signal: AbortSignal): Promise<void> {
     const response = await this.fetchJsonRpc(
       "initialize",
       {
@@ -247,13 +279,14 @@ class HttpMcpClient implements ConnectedMcpClient {
           clientInfo: { name: "glm-acp-agent", version: "1.0.0" },
         },
       },
-      "initialize"
+      "initialize",
+      signal
     );
     this.mcpSessionId = response.sessionId;
     await this.sendNotification({
       jsonrpc: "2.0",
       method: "notifications/initialized",
-    });
+    }, signal);
   }
 
   private async request(
@@ -278,7 +311,7 @@ class HttpMcpClient implements ConnectedMcpClient {
     return response.body.result;
   }
 
-  private async sendNotification(body: JsonRpcRequest): Promise<void> {
+  private async sendNotification(body: JsonRpcRequest, signal?: AbortSignal): Promise<void> {
     await this.fetchWithLifecycle({
       method: "POST",
       headers: this.headers("notifications/initialized"),
@@ -288,7 +321,7 @@ class HttpMcpClient implements ConnectedMcpClient {
         throw new Error(`MCP ${this.server.name} notifications/initialized failed: HTTP ${response.status}: ${await response.text()}`);
       }
       await response.body?.cancel();
-    });
+    }, signal);
   }
 
   private async fetchJsonRpc(
