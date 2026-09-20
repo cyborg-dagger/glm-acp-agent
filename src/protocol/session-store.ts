@@ -19,7 +19,42 @@ import type { GlmMessage, ThoughtLevel } from "../llm/glm-client.js";
  * shape of `PersistedSession` changes incompatibly so future loaders can
  * migrate (or reject) old records instead of silently producing garbage.
  */
-export const SESSION_SCHEMA_VERSION = 4 as const;
+export const SESSION_SCHEMA_VERSION = 5 as const;
+
+/** Ledger state of one tool call inside a persisted pending batch. */
+export type PendingToolCallState = "queued" | "started" | "recorded";
+
+export interface PendingToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+  state: PendingToolCallState;
+  /** Bounded result content; present iff `state === "recorded"`. */
+  result?: string;
+}
+
+export interface PendingToolBatch {
+  /** The assistant message that declared the tool calls (staged, not yet legal history). */
+  assistant: GlmMessage;
+  calls: PendingToolCall[];
+}
+
+/**
+ * An in-flight turn persisted for crash recovery. `messages` holds the current
+ * user message plus only completed legal exchanges; the pending tool batch
+ * lives under `pendingBatch` and is committed into `messages` once every call
+ * is terminal.
+ */
+export interface PersistedActiveTurn {
+  turnId: string;
+  startedAt: string;
+  messages: GlmMessage[];
+  pendingBatch: PendingToolBatch | null;
+  /** Display-text overrides whose indices are relative to `messages`. */
+  displayText?: Record<string, string>;
+  /** Partial assistant output recovered from a controlled interruption; diagnostic only. */
+  partialAssistant?: { text: string; reasoning: string };
+}
 
 /**
  * On-disk representation of a session. Only fields that need to survive a
@@ -57,6 +92,8 @@ export interface PersistedSession {
    * correct across the compaction that drops turns from `messages`.
    */
   displayText?: Record<string, string>;
+  /** Present only while a turn is in flight (schema v5); recovered on load. */
+  activeTurn?: PersistedActiveTurn;
 }
 
 /** Light-weight summary of a persisted session — used by `listSessions`. */
@@ -195,6 +232,62 @@ function isGlmMessage(value: unknown): value is GlmMessage {
   return true;
 }
 
+const VALID_PENDING_STATES = new Set<PendingToolCallState>(["queued", "started", "recorded"]);
+
+function toolCallIds(message: unknown): string[] | undefined {
+  if (!isGlmMessage(message)) return undefined;
+  const calls = (message as { tool_calls?: unknown }).tool_calls;
+  if (!Array.isArray(calls)) return undefined;
+  const ids: string[] = [];
+  for (const call of calls) {
+    if (!isRecord(call) || typeof call.id !== "string") return undefined;
+    ids.push(call.id);
+  }
+  return ids;
+}
+
+/** Structural validation of a persisted in-flight turn. Rejects inconsistent ledgers rather than inferring success. */
+function isValidActiveTurn(value: unknown): value is PersistedActiveTurn {
+  if (!isRecord(value)) return false;
+  if (typeof value.turnId !== "string" || value.turnId.length === 0) return false;
+  if (typeof value.startedAt !== "string" || Number.isNaN(Date.parse(value.startedAt))) return false;
+  if (!Array.isArray(value.messages) || !value.messages.every(isGlmMessage)) return false;
+  if (value.pendingBatch !== null && value.pendingBatch !== undefined && !isRecord(value.pendingBatch)) return false;
+
+  const batch = value.pendingBatch as PendingToolBatch | null | undefined;
+  if (batch) {
+    const declaredCalls = toolCallIds(batch.assistant);
+    if (declaredCalls === undefined) return false;
+    if (!Array.isArray(batch.calls)) return false;
+    const declared = new Set(declaredCalls);
+    const ledger = new Set<string>();
+    for (const call of batch.calls) {
+      if (!isRecord(call)) return false;
+      if (typeof call.id !== "string" || typeof call.name !== "string" || typeof call.arguments !== "string") return false;
+      if (typeof call.state !== "string" || !VALID_PENDING_STATES.has(call.state as PendingToolCallState)) return false;
+      if (call.state === "recorded") {
+        if (typeof call.result !== "string") return false;
+      } else if (call.result !== undefined) {
+        return false;
+      }
+      if (declared.has(call.id)) ledger.add(call.id);
+    }
+    if (ledger.size !== declared.size || ledger.size !== batch.calls.length) return false;
+  }
+
+  if (value.displayText !== undefined) {
+    if (!isRecord(value.displayText)) return false;
+    for (const [index, text] of Object.entries(value.displayText)) {
+      if (!/^\d+$/.test(index) || typeof text !== "string") return false;
+    }
+  }
+  if (value.partialAssistant !== undefined) {
+    const partial = value.partialAssistant;
+    if (!isRecord(partial) || typeof partial.text !== "string" || typeof partial.reasoning !== "string") return false;
+  }
+  return true;
+}
+
 function parsePersistedSession(value: unknown, expectedSessionId: string): PersistedSession | undefined {
   if (!isRecord(value)) return undefined;
 
@@ -236,6 +329,8 @@ function parsePersistedSession(value: unknown, expectedSessionId: string): Persi
       if (!/^\d+$/.test(index) || typeof text !== "string") return undefined;
     }
   }
+
+  if (value.activeTurn !== undefined && !isValidActiveTurn(value.activeTurn)) return undefined;
 
   const parsed = value as unknown as PersistedSession;
   if (version === 1) {
@@ -330,6 +425,46 @@ export class SessionStore {
       } catch {
         // The rename succeeded, or the temp file was never created.
       }
+    }
+  }
+
+  /**
+   * Preserve the original file before the first migrated/repaired v5 record
+   * replaces it. The backup name is private and created exclusively, so a
+   * second restore cannot overwrite the first backup. Returns whether a new
+   * backup was written.
+   */
+  backupPreV5(sessionId: string): boolean {
+    let path: string;
+    try {
+      path = this.pathFor(sessionId);
+    } catch {
+      return false;
+    }
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf8");
+    } catch {
+      return false;
+    }
+    const backupPath = join(this.dir, `.${basename(path)}.pre-v5.bak`);
+    try {
+      mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+      const fd = openSync(backupPath, "wx", 0o600);
+      try {
+        const bytes = Buffer.from(raw, "utf8");
+        for (let offset = 0; offset < bytes.byteLength;) {
+          offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);
+        }
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      return true;
+    } catch {
+      // Already backed up, or the filesystem refuses; either way the caller
+      // proceeds with the atomic replace of the live file.
+      return false;
     }
   }
 

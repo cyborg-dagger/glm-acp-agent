@@ -932,10 +932,25 @@ test("shutdown keeps the last valid checkpoint when a prompt exceeds the drain d
     await assert.rejects(agent.shutdown("sigterm"), /timed out waiting for prompt cleanup/);
 
     const persisted = store.load(sessionId);
+    assert.ok(persisted, "a record must remain on disk after the drain timeout");
+    // The committed prefix is unchanged and the stuck prompt left only its
+    // admission checkpoint: the admitted user turn under `activeTurn`, with
+    // no half-finished tool batch anywhere in the record.
+    assert.deepEqual(persisted.messages, expectedCheckpoint.messages);
+    const active = persisted.activeTurn;
+    assert.ok(active, "the admitted turn is durably checkpointed");
     assert.deepEqual(
-      persisted,
-      expectedCheckpoint,
-      "a prompt that missed the drain deadline must leave the last valid checkpoint unchanged",
+      active.messages?.map((message) => message.content),
+      ["stuck"],
+    );
+    assert.equal(active.pendingBatch, null, "a stream that never completed must not stage a batch");
+    // And that record settles into legal history on recovery.
+    const { recoverInterruptedSession } = await import("../protocol/session-recovery.js");
+    const recovered = recoverInterruptedSession(persisted);
+    assert.equal(recovered.activeTurn, undefined);
+    assert.deepEqual(
+      recovered.messages?.map((message) => message.role),
+      [...(expectedCheckpoint.messages ?? []).map((message) => message.role), "user"],
     );
   } finally {
     cleanup();

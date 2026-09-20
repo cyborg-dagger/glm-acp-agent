@@ -20,6 +20,7 @@ import {
   type CommandLimits,
 } from "./command-limits.js";
 import { ProcessSupervisor } from "./process-supervisor.js";
+import type { ToolExecutionHooks } from "../protocol/session-recovery.js";
 import { readResourceLimits, type ResourceLimits } from "./resource-limits.js";
 import { boundToolResult, takeUtf8Prefix } from "./tool-output.js";
 import { readLocalTextFileBounded, readLocalTextPage, type TextPage } from "./file-reader.js";
@@ -97,6 +98,7 @@ export class ToolExecutor {
     private setTodos: (todos: TodoItem[]) => void = () => undefined,
     private resourceLimits: ResourceLimits = readResourceLimits(),
     private processSupervisor: ProcessSupervisor | null = null,
+    private executionHooks: ToolExecutionHooks | null = null,
   ) {}
 
   /**
@@ -153,6 +155,15 @@ export class ToolExecutor {
   // ---------------------------------------------------------------------------
   // Private tool implementations
   // ---------------------------------------------------------------------------
+
+  /**
+   * Required crash-recovery checkpoint: record that this call is starting
+   * (after validation and permission, before any effect) and persist it.
+   * A rejection must prevent the effect that follows it.
+   */
+  private async markStarted(toolCallId: string, toolName: string): Promise<void> {
+    await this.executionHooks?.onExecutionStart({ id: toolCallId, name: toolName });
+  }
 
   private async readFile(
     toolCallId: string,
@@ -383,6 +394,7 @@ export class ToolExecutor {
       },
     });
 
+    await this.markStarted(toolCallId, "write_file");
     try {
       if (this.signal?.aborted) {
         await this.markFailed(toolCallId, "Cancelled by turn.");
@@ -606,6 +618,7 @@ export class ToolExecutor {
       };
     }
 
+    await this.markStarted(toolCallId, "edit_file");
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
       update: {
@@ -807,6 +820,7 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, "Cancelled by turn.");
       return { content: "Command cancelled by turn." };
     }
+    await this.markStarted(toolCallId, "run_command");
 
     try {
       const limits = readCommandLimits();
@@ -884,6 +898,7 @@ export class ToolExecutor {
       },
     });
 
+    await this.markStarted(toolCallId, "web_search");
     try {
       const apiKey = requireResolvedApiKey();
       const toolArgs: Record<string, unknown> = { query };
@@ -946,6 +961,7 @@ export class ToolExecutor {
       },
     });
 
+    await this.markStarted(toolCallId, "web_reader");
     try {
       const apiKey = requireResolvedApiKey();
 
@@ -1014,6 +1030,7 @@ export class ToolExecutor {
       },
     });
 
+    await this.markStarted(toolCallId, "image_analysis");
     try {
       const visionArgs: Record<string, unknown> = { image_source: imageSource };
       if (prompt) visionArgs["prompt"] = prompt;
@@ -1056,6 +1073,7 @@ export class ToolExecutor {
       },
     });
 
+    await this.markStarted(toolCallId, toolName);
     try {
       const mcpResult = await this.sessionMcpTools!.callTool(toolName, args, this.signal);
       const text = unwrapToolText(mcpResult);

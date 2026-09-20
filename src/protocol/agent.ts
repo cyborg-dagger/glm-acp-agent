@@ -38,6 +38,12 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { PROTOCOL_VERSION as VERSION } from "@agentclientprotocol/sdk";
 import {
+  CheckpointError,
+  recoverInterruptedSession,
+  type ToolExecutionHooks,
+} from "./session-recovery.js";
+import type { PendingToolBatch } from "./session-store.js";
+import {
   GlmClient,
   getAvailableModels,
   getDefaultModel,
@@ -192,6 +198,14 @@ interface SessionState {
   displayText: WeakMap<GlmMessage, string>;
   /** Synchronous gate for replacement and close transitions. */
   lifecycle: SessionLifecycle;
+  /**
+   * The in-flight turn persisted for crash recovery (schema v5): the index in
+   * `messages` where the admitted user message starts. Null whenever no turn
+   * is in flight; the persisted projection splits history at this index.
+   */
+  activeTurn: { turnId: string; startedAt: string; startIndex: number } | null;
+  /** Ledger of a staged-but-unsettled tool batch (mirrors the persisted pendingBatch). */
+  pendingBatch: PendingToolBatch | null;
 }
 
 interface SessionTransition {
@@ -480,6 +494,8 @@ export class GlmAcpAgent implements Agent {
       thoughtLevel,
       commands: discoverSlashCommands(params.cwd),
       displayText: new WeakMap(),
+      activeTurn: null,
+      pendingBatch: null,
       lifecycle,
       });
 
@@ -903,6 +919,16 @@ export class GlmAcpAgent implements Agent {
         session.displayText.set(userMessage, displayText);
       }
 
+      // Crash-durability checkpoint: the admitted user turn reaches disk
+      // before any provider request. A failure here stops the turn before it
+      // starts, so nothing is admitted that could be silently lost.
+      session.activeTurn = {
+        turnId: randomUUID(),
+        startedAt: new Date().toISOString(),
+        startIndex: session.messages.length - 1,
+      };
+      this.persistCheckpoint(params.sessionId, session);
+
       const { stopReason, usage } = await this.runPromptLoop(
         params.sessionId,
       session,
@@ -965,6 +991,13 @@ export class GlmAcpAgent implements Agent {
             content: { type: "text", text: `\n\n[error] ${message}` },
           },
         });
+        // A failed turn must not silently discard its admitted user turn
+        // (plus any partial assistant text already in history). Settle the
+        // active-turn bookkeeping and persist best-effort.
+        session.activeTurn = null;
+        session.pendingBatch = null;
+        session.updatedAt = new Date().toISOString();
+        this.persistSession(params.sessionId, session);
       }
       throw err;
     } finally {
@@ -1304,6 +1337,8 @@ export class GlmAcpAgent implements Agent {
         forkedMessages,
         persisted.displayText
       ),
+      activeTurn: null,
+      pendingBatch: null,
       lifecycle: forkLifecycle,
     };
     this.sessions.set(newSessionId, forked);
@@ -1430,6 +1465,8 @@ export class GlmAcpAgent implements Agent {
             restoredMessages,
             restoreSource.displayText
           ),
+          activeTurn: null,
+          pendingBatch: null,
           lifecycle,
         };
 
@@ -1664,19 +1701,45 @@ export class GlmAcpAgent implements Agent {
   }
 
   private snapshot(sessionId: string, session: SessionState): PersistedSession {
-    const displayText = serializeDisplayText(session.messages, session.displayText);
-    return {
+    const base = {
       sessionId,
       cwd: session.cwd,
-      messages: session.messages,
       title: session.title,
       updatedAt: session.updatedAt,
       model: session.model,
       mode: session.mode,
       thoughtLevel: session.thoughtLevel,
-      // Absent for the common case where nothing diverges, so an ordinary
-      // session gains no on-disk weight.
-      ...(displayText ? { displayText } : {}),
+    };
+    const active = session.activeTurn;
+    if (!active) {
+      const displayText = serializeDisplayText(session.messages, session.displayText);
+      return {
+        ...base,
+        messages: session.messages,
+        // Absent for the common case where nothing diverges, so an ordinary
+        // session gains no on-disk weight.
+        ...(displayText ? { displayText } : {}),
+      };
+    }
+    // In-flight turn: the persisted projection splits the canonical committed
+    // prefix from the active legal suffix and stores the pending batch only
+    // under activeTurn — never a half-finished batch inside top-level messages.
+    const startIndex = Math.min(active.startIndex, session.messages.length);
+    const prefix = session.messages.slice(0, startIndex);
+    const suffix = session.messages.slice(startIndex);
+    const prefixText = serializeDisplayText(prefix, session.displayText);
+    const suffixText = serializeDisplayText(suffix, session.displayText);
+    return {
+      ...base,
+      messages: prefix,
+      ...(prefixText ? { displayText: prefixText } : {}),
+      activeTurn: {
+        turnId: active.turnId,
+        startedAt: active.startedAt,
+        messages: suffix,
+        pendingBatch: session.pendingBatch,
+        ...(suffixText ? { displayText: suffixText } : {}),
+      },
     };
   }
 
@@ -1697,6 +1760,26 @@ export class GlmAcpAgent implements Agent {
     }
   }
 
+  /**
+   * A required crash-recovery checkpoint: unlike the best-effort
+   * `persistSession`, a failure throws so the guarded operation never starts
+   * or continues after its durable record is missing. Guarded by the
+   * process-local session generation — this is not cross-process locking.
+   * A disabled session store is supported and explicitly lacks crash durability.
+   */
+  private persistCheckpoint(sessionId: string, session: SessionState): void {
+    if (this.sessions.get(sessionId) !== session) return;
+    if (!this.sessionStore) return;
+    try {
+      this.sessionStore.save(this.snapshot(sessionId, session));
+    } catch (err) {
+      throw new CheckpointError(
+        `failed to persist session checkpoint: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
+    }
+  }
+
   private requirePersisted(sessionId: string): PersistedSession {
     if (!this.sessionStore) {
       throw new Error("Session persistence is disabled");
@@ -1704,6 +1787,15 @@ export class GlmAcpAgent implements Agent {
     const persisted = this.sessionStore.load(sessionId);
     if (!persisted) {
       throw new Error(`Session not found: ${sessionId}`);
+    }
+    // Recovery runs exactly once, before load/resume/fork exposes the session.
+    // It settles interrupted turns without invoking any executor, then
+    // validates and atomically saves the repaired record before it is used.
+    const recovered = recoverInterruptedSession(persisted);
+    if (recovered !== persisted) {
+      this.sessionStore.backupPreV5(sessionId);
+      this.sessionStore.save(recovered);
+      return recovered;
     }
     return persisted;
   }
@@ -1790,7 +1882,8 @@ export class GlmAcpAgent implements Agent {
         if (ownsPrompt()) this.sessionTodos.set(sessionId, todos);
       },
       undefined,
-      processSupervisor
+      processSupervisor,
+      this.executionHooksFor(sessionId, session, ownsPrompt),
     );
 
     let totalUsage: Usage | undefined;
@@ -1819,6 +1912,7 @@ export class GlmAcpAgent implements Agent {
       };
     };
 
+    try {
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal.aborted || !ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
       const compatibility = checkModelTransition(session.messages, session.model);
@@ -1986,6 +2080,20 @@ export class GlmAcpAgent implements Agent {
         return { stopReason: this.mapStopReason(lastStopReason), usage: totalUsage };
       }
 
+      // Stage the complete batch as queued and checkpoint it before any tool
+      // begins: a crash from here on recovers each call as not-started,
+      // started-unknown or recorded from the durable ledger.
+      session.pendingBatch = {
+        assistant: assistantToolMessage!,
+        calls: toolCalls.map((tc) => ({
+          id: tc.id,
+          name: tc.name,
+          arguments: tc.arguments,
+          state: "queued" as const,
+        })),
+      };
+      this.persistCheckpoint(sessionId, session);
+
       // Execute tool calls in declaration order and feed each result back.
       let cancellationObserved = false;
       const toolResults: GlmMessage[] = [];
@@ -1993,7 +2101,9 @@ export class GlmAcpAgent implements Agent {
       for (const tc of toolCalls) {
         if (toolFailure) {
           toolResults.push({ role: "tool", tool_call_id: tc.id,
-            content: "Tool call not started because an earlier tool's outcome is unknown." });
+            content: toolFailure instanceof CheckpointError
+              ? "Tool call not started because an earlier required persistence checkpoint failed."
+              : "Tool call not started because an earlier tool's outcome is unknown." });
           continue;
         }
         if (signal.aborted || !ownsPrompt()) {
@@ -2008,6 +2118,19 @@ export class GlmAcpAgent implements Agent {
         try {
           result = await executor.execute(tc.id, tc.name, tc.arguments);
         } catch (cause) {
+          if (cause instanceof CheckpointError) {
+            // The required start checkpoint failed before any effect: this
+            // call never started, and no further effects may run this turn.
+            if (ownsPrompt() || preservesDrainingHistory()) {
+              toolResults.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: "Error: the persistence checkpoint failed before this tool started. No effect occurred.",
+              });
+            }
+            toolFailure = cause;
+            continue;
+          }
           result = {
             content: "Error: tool execution failed unexpectedly; its outcome may be unknown. Inspect the current state before repeating any side effect.",
           };
@@ -2037,10 +2160,30 @@ export class GlmAcpAgent implements Agent {
           content: result.content,
         });
         if (signal.aborted || !ownsPrompt()) cancellationObserved = true;
+        // Record the result durably before the next tool may start. A failure
+        // stops further effects but keeps the known result in this batch.
+        const ledgerEntry = session.pendingBatch?.calls.find((call) => call.id === tc.id);
+        if (ledgerEntry && ownsPrompt()) {
+          ledgerEntry.state = "recorded";
+          ledgerEntry.result = result.content;
+          try {
+            this.persistCheckpoint(sessionId, session);
+          } catch (cause) {
+            if (cause instanceof CheckpointError) {
+              toolFailure = cause;
+              continue;
+            }
+            throw cause;
+          }
+        }
       }
 
       if (ownsPrompt() || preservesDrainingHistory()) {
         session.messages.push(assistantToolMessage!, ...toolResults);
+        // The batch is terminal: commit it out of the pending ledger and
+        // checkpoint before the next model call.
+        session.pendingBatch = null;
+        this.persistCheckpoint(sessionId, session);
         if (toolFailure) throw toolFailure;
       }
 
@@ -2066,6 +2209,36 @@ export class GlmAcpAgent implements Agent {
       },
     });
     return { stopReason: "max_turn_requests", usage: totalUsage };
+    } finally {
+      // Whatever exit the loop takes — completion, cancellation, drain or a
+      // thrown error — the caller has settled history by now, so the active
+      // turn ends. Only the owner (or a draining original) may clear it.
+      if (ownsPrompt() || preservesDrainingHistory()) {
+        session.pendingBatch = null;
+        session.activeTurn = null;
+      }
+    }
+  }
+
+  /**
+   * Crash-recovery hooks handed to the tool executor: marking a call started
+   * is a required checkpoint, so a persistence failure rejects the hook and
+   * prevents the tool's effect from beginning.
+   */
+  private executionHooksFor(
+    sessionId: string,
+    session: SessionState,
+    ownsPrompt: () => boolean,
+  ): ToolExecutionHooks | null {
+    return {
+      onExecutionStart: async (call) => {
+        if (!ownsPrompt()) return;
+        const entry = session.pendingBatch?.calls.find((pending) => pending.id === call.id);
+        if (!entry) return;
+        entry.state = "started";
+        this.persistCheckpoint(sessionId, session);
+      },
+    };
   }
 
   private mapStopReason(stopReason: string | undefined): InternalStopReason {
