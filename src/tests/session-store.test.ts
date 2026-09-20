@@ -23,6 +23,7 @@ import {
   type PersistedActiveTurn,
   type PersistedSession,
 } from "../protocol/session-store.js";
+import { LEGACY_UNKNOWN_TEXT } from "../protocol/session-recovery.js";
 
 function makeDir(): string {
   return mkdtempSync(join(tmpdir(), "glm-acp-session-store-"));
@@ -431,7 +432,7 @@ test("malformed activeTurn records are rejected, not partially loaded", () => {
   }
 });
 
-test("legacy v4 records load unchanged through the v5 parser; dangling tool calls are not repaired", () => {
+test("legacy v4 dangling tool calls are settled with unknown outcomes through the v5 parser", () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
@@ -448,10 +449,18 @@ test("legacy v4 records load unchanged through the v5 parser; dangling tool call
     writeRaw(dir, v4.sessionId, v4);
     const loaded = store.load(v4.sessionId);
     assert.equal(loaded?.schemaVersion, SESSION_SCHEMA_VERSION);
+    // The parser must repair the dangling tail while the record still carries
+    // its on-disk v4 version: normalizing to 5 first would hide it from the
+    // legacy branch of recoverInterruptedSession forever.
     assert.deepEqual(
       loaded?.messages,
-      v4.messages,
-      "the store must not repair or drop a dangling tool-call tail"
+      [
+        { role: "user", content: "run the tools" },
+        assistantWithToolCalls(["a", "b"]),
+        { role: "tool", tool_call_id: "a", content: LEGACY_UNKNOWN_TEXT },
+        { role: "tool", tool_call_id: "b", content: LEGACY_UNKNOWN_TEXT },
+      ],
+      "a dangling legacy tool-call tail must be settled at load time"
     );
     assert.deepEqual(loaded?.displayText, { "1": "run the tools" });
     assert.equal(loaded?.mode, "default");

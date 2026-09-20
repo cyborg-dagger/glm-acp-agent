@@ -10,6 +10,7 @@ import type { PersistedSession } from "../protocol/session-store.js";
 import {
   CheckpointError,
   INTERRUPTION_NOTE,
+  LEGACY_UNKNOWN_TEXT,
   UNKNOWN_OUTCOME_TEXT,
 } from "../protocol/session-recovery.js";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
@@ -78,6 +79,7 @@ interface RawRecord {
   messages?: Array<{
     role: string;
     content?: unknown;
+    tool_call_id?: string;
     tool_calls?: Array<{ id?: string }>;
   }>;
 }
@@ -414,6 +416,132 @@ test("fork of an interrupted record also recovers before forking", async () => {
     // The source record was settled by the fork's recovery pass as well.
     const parent = readRawRecord(dir, sessionId);
     assert.equal(parent.activeTurn, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+/**
+ * A v4 record that ends in one declared tool call whose result was never
+ * recorded — the legacy crash marker. Recovery must settle this through the
+ * real load/resume/fork composition, not only through the pure function.
+ */
+function legacyDanglingTail(sessionId: string): PersistedSession {
+  return {
+    schemaVersion: 4,
+    sessionId,
+    cwd: "/tmp/project",
+    title: "legacy dangling tail",
+    updatedAt: "2026-09-20T10:00:00.000Z",
+    model: "glm-5.3",
+    mode: "default",
+    thoughtLevel: "max",
+    messages: [
+      { role: "user", content: "run the tool" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call-1",
+            type: "function",
+            function: { name: "write_file", arguments: "{}" },
+          },
+        ],
+      },
+    ],
+  };
+}
+
+test("a v4 record with a dangling tool call is repaired through session/load, then stays settled across session/resume and session/fork", async () => {
+  const { store, dir, cleanup } = makeTempStore();
+  try {
+    const sessionId = "eeee5555-eeee-eeee-eeee-eeeeeeeeeeee";
+    writeSessionRecord(dir, legacyDanglingTail(sessionId));
+
+    // --- session/load ---
+    const loadConn = createConnectionStub();
+    const loaderGlm = makeCapturingGlm();
+    const loader = new GlmAcpAgent(loadConn as never, {
+      glm: loaderGlm.glm,
+      sessionStore: store,
+    });
+    await initialize(loader);
+    // An unrelated live session, so the load below exercises the disk path.
+    await loader.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    await loader.loadSession({ sessionId, cwd: "/tmp/project", mcpServers: [] });
+
+    // The load checkpoint must carry the repaired tail: the declared call is
+    // followed by its unknown-outcome result, so the record on disk is
+    // provider-ready v5 history rather than a poisoned dangling batch.
+    const settled = readRawRecord(dir, sessionId);
+    assert.equal(settled.schemaVersion, SESSION_SCHEMA_VERSION);
+    assert.deepEqual(
+      (settled.messages ?? []).map((m) => m.role),
+      ["system", "user", "assistant", "tool"],
+      "session/load must repair the dangling legacy tool call before checkpointing"
+    );
+    assert.equal(
+      (settled.messages ?? []).find((m) => m.role === "tool")?.content,
+      LEGACY_UNKNOWN_TEXT
+    );
+
+    // The history handed to the provider is settled as well.
+    await loader.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] });
+    const sent = loaderGlm.calls[loaderGlm.calls.length - 1] ?? [];
+    const toolIndex = sent.findIndex(
+      (m) => m.role === "tool" && m.tool_call_id === "call-1"
+    );
+    assert.notEqual(toolIndex, -1, "session/load must not expose a dangling tool call to the provider");
+    assert.equal(sent[toolIndex]?.content, LEGACY_UNKNOWN_TEXT);
+    const declared = sent[toolIndex - 1];
+    if (declared?.role !== "assistant") {
+      assert.fail("the unknown-outcome result must follow the assistant that declared call-1");
+    }
+    assert.equal(declared.tool_calls?.[0]?.id, "call-1");
+
+    // --- session/resume (a fresh agent simulates a new process: disk path) ---
+    const resumeConn = createConnectionStub();
+    const resumerGlm = makeCapturingGlm();
+    const resumer = new GlmAcpAgent(resumeConn as never, {
+      glm: resumerGlm.glm,
+      sessionStore: store,
+    });
+    await initialize(resumer);
+    await resumer.resumeSession({ sessionId, cwd: "/tmp/project", mcpServers: [] });
+
+    await resumer.prompt({ sessionId, prompt: [{ type: "text", text: "and again" }] });
+    const resumed = resumerGlm.calls[resumerGlm.calls.length - 1] ?? [];
+    assert.notEqual(
+      resumed.findIndex(
+        (m) => m.role === "tool" && m.tool_call_id === "call-1" && m.content === LEGACY_UNKNOWN_TEXT
+      ),
+      -1,
+      "session/resume must keep the repaired tail settled"
+    );
+
+    // --- session/fork (a fresh agent again: the source exists only on disk) ---
+    const forker = new GlmAcpAgent(createConnectionStub() as never, {
+      sessionStore: store,
+    });
+    await initialize(forker);
+    // Must be accepted: assertSettledToolHistory sees the repaired tail, not
+    // a dangling legacy batch.
+    const fork = await forker.unstable_forkSession({
+      sessionId,
+      cwd: "/tmp/fork",
+      mcpServers: [],
+    });
+    assert.notEqual(fork.sessionId, sessionId);
+    const forked = readRawRecord(dir, fork.sessionId);
+    assert.equal(
+      (forked.messages ?? []).some(
+        (m) => m.role === "tool" && m.tool_call_id === "call-1" && m.content === LEGACY_UNKNOWN_TEXT
+      ),
+      true,
+      "the forked record must inherit the repaired history"
+    );
   } finally {
     cleanup();
   }

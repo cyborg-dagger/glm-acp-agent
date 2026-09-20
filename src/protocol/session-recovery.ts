@@ -123,8 +123,13 @@ function mergeDisplayText(
  * Append unknown-outcome results for the ids of a terminal legacy assistant
  * tool batch that never received them. Middle-of-history damage and orphan
  * results are left untouched; only a terminal batch is a crash marker.
+ *
+ * Exported for the session store, which must run this repair while the
+ * record still carries its on-disk schema version — before the parser
+ * normalizes it to 5 and the legacy branch of `recoverInterruptedSession`
+ * becomes unreachable (see `parsePersistedSession`).
  */
-function repairLegacyTail(record: PersistedSession): PersistedSession {
+export function repairLegacyTail(record: PersistedSession): PersistedSession {
   const messages = record.messages ?? [];
   // Walk back over the trailing run of tool results; the terminal exchange is
   // the assistant message (if any) that declared them.
