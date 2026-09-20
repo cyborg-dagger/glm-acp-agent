@@ -267,6 +267,33 @@ The model can also call `image_analysis` explicitly with `{ image_source: "/path
 
 ---
 
+## Interrupted-session recovery
+
+Session files are schema v5 records under `ACP_GLM_SESSION_DIR`. While a turn is in flight, the record carries an `activeTurn` holding the admitted user message, the turn's completed exchanges, and — while tools run — a `queued` / `started` / `recorded` ledger for the pending tool batch. Four checkpoints are *required*: a persistence failure stops the guarded operation instead of letting it continue without a durable record.
+
+- The admitted user message is written before the turn's first provider request.
+- The staged tool batch is written before any of its tools executes.
+- Each call's `started` marker is written after validation and permission, immediately before its side effect — a failed checkpoint here prevents the effect from starting.
+- Each recorded result is written before the next tool may start.
+
+### What happens on restart
+
+`session/load`, `session/resume`, and `session/fork` settle an interrupted record before exposing it. Recovery never invokes an executor and never repeats a side effect. Calls whose results were recorded before the interruption keep those results. A call that had started but not recorded comes back as outcome unknown — the agent stopped after the call began but before its result was recorded, and the current state should be inspected before repeating any side effect. A call that never started comes back as not started, with no effect. When a batch was actually unfinished, one visible assistant note describing this settlement is appended. A settled record carries no in-flight state, so recovery is idempotent.
+
+### Legacy sessions (schema v1–v4)
+
+An older record whose transcript ends in an assistant tool batch with missing results — the on-disk signature of a crash — gets the same conservative treatment for the missing ids only: each receives an unknown-outcome result, and nothing else in the history is rewritten. Before the first repaired v5 record replaces the file, the original is preserved once as `.<sessionId>.json.pre-v5.bak` with mode `0600`.
+
+### Durability boundary
+
+Checkpoints protect admitted prompts and tool boundaries, nothing more. Assistant text and reasoning streamed since the last checkpoint can be lost to a hard kill. Running with session persistence disabled (no session directory) works, but has no crash durability. Concurrent writers from separate agent processes remain unsupported — the guard that orders checkpoints is process-local.
+
+### Downgrading
+
+Binaries older than this schema (v4) reject v5 session files rather than misread them. To downgrade, restore from the `.pre-v5.bak` backups instead of deleting the session directory.
+
+---
+
 ## Running
 
 ### Standalone (stdio)
