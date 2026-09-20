@@ -1,0 +1,19 @@
+name: "Verify package"
+description: "Shared release-gate validation: lint, full test suite, and registry manifest sync check. Used by CI and the publish workflow so release checks cannot drift."
+
+runs:
+  using: "composite"
+  steps:
+    - name: Lint
+      shell: bash
+      run: npm run lint
+
+    # Builds the production dist (tests excluded), compiles the test copy to
+    # .test-dist, and runs the suite against it.
+    - name: Test
+      shell: bash
+      run: npm test
+
+    - name: Check registry manifest version sync
+      shell: bash
+      run: node dist/registry/sync-manifest.js --check

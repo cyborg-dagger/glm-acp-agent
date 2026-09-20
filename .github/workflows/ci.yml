@@ -37,19 +37,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Lint
-        run: npm run lint
+      # Same validation steps the publish workflow runs before packing (lint +
+      # test + registry manifest sync), shared verbatim so release checks
+      # cannot drift from CI.
+      - uses: ./.github/actions/verify-package
 
-      - name: Build
-        run: npm run build
-
-      - name: Test
-        run: npm test
-
-      - name: Check registry manifest version sync
-        run: node dist/registry/sync-manifest.js --check
-
-      - name: Packed package CLI smoke test
+      - name: Packed package CLI + ACP smoke test
         run: node scripts/packed-cli-smoke.mjs
 
       - name: Set up Bun (Linux Node 22)

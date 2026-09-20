@@ -4,7 +4,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const testsDirectory = join(repositoryRoot, "dist", "tests");
+// Optional argv[2]: the compiled tests directory, relative to the repository
+// root. Defaults to the legacy production build output for backwards
+// compatibility (`node scripts/run-tests.mjs` still runs dist/tests).
+const testsDirectory = join(repositoryRoot, process.argv[2] ?? join("dist", "tests"));
 const entries = await readdir(testsDirectory, { withFileTypes: true });
 const testFiles = entries
   .filter((entry) => entry.isFile() && entry.name.endsWith(".test.js"))

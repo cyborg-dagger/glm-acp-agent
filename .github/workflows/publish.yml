@@ -13,7 +13,11 @@ jobs:
       id-token: write
 
     steps:
+      # Check out the exact tag the release was cut from — never whatever main
+      # happens to hold at publish time.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v5
@@ -25,17 +29,42 @@ jobs:
       - name: Upgrade npm (Trusted Publishing requires >= 11.5.1)
         run: npm install -g npm@latest
 
+      # Gate 1: the tag, package.json, and registry/glm-acp-agent/agent.json
+      # must describe the same version before anything is built or packed.
+      - name: Validate release tag / package / manifest version agreement
+        run: node scripts/validate-release-version.mjs "${{ github.event.release.tag_name }}"
+
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build
+      # Gate 2: the same lint + test + manifest-sync validation CI runs on every
+      # push (shared composite action), so release checks cannot drift.
+      - uses: ./.github/actions/verify-package
 
-      - name: Check registry manifest version sync
-        run: node dist/registry/sync-manifest.js --check
+      # Pack exactly once. Everything below verifies and publishes THIS file —
+      # never rebuild or repack between verification and publication.
+      - name: Pack the release tarball (once)
+        run: npm pack --pack-destination "$RUNNER_TEMP" --json > "$RUNNER_TEMP/pack-metadata.json"
 
-      - name: Publish
-        run: npm publish --provenance --access public
+      - name: Resolve tarball path and SHA-256
+        run: |
+          FILENAME=$(node -p "JSON.parse(require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/pack-metadata.json', 'utf8'))[0].filename")
+          echo "TARBALL=$RUNNER_TEMP/$FILENAME" >> "$GITHUB_ENV"
+          SHA=$(sha256sum "$RUNNER_TEMP/$FILENAME" | cut -d' ' -f1)
+          echo "TARBALL_SHA256=$SHA" >> "$GITHUB_ENV"
+          echo "Packed $RUNNER_TEMP/$FILENAME (sha256 $SHA)"
+
+      # Gate 3: smoke the exact tarball that will be published — CLI help plus
+      # a full ACP initialize / session/new / prompt handshake against a
+      # loopback auth stub with a fake API key.
+      - name: Packed package smoke test (exact release tarball)
+        run: node scripts/packed-cli-smoke.mjs "$TARBALL"
+
+      - name: Record the verified artifact
+        run: echo "Publishing $TARBALL (sha256 $TARBALL_SHA256)"
+
+      - name: Publish the verified tarball
+        run: npm publish "$TARBALL" --provenance --access public
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
