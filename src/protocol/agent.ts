@@ -1793,7 +1793,13 @@ export class GlmAcpAgent implements Agent {
     // validates and atomically saves the repaired record before it is used.
     const recovered = recoverInterruptedSession(persisted);
     if (recovered !== persisted) {
-      this.sessionStore.backupPreV5(sessionId);
+      // The rollback copy must be durable before the live record is replaced:
+      // a failed backup throws and leaves the on-disk record untouched, and a
+      // `false` means the record vanished between the load above and the
+      // backup read — either way the repaired record must not be saved.
+      if (!this.sessionStore.backupPreV5(sessionId)) {
+        throw new Error(`Session record disappeared before its pre-v5 backup: ${sessionId}`);
+      }
       this.sessionStore.save(recovered);
       return recovered;
     }

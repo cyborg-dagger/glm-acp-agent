@@ -440,9 +440,17 @@ export class SessionStore {
 
   /**
    * Preserve the original file before the first migrated/repaired v5 record
-   * replaces it. The backup name is private and created exclusively, so a
-   * second restore cannot overwrite the first backup. Returns whether a new
-   * backup was written.
+   * replaces it. The bytes are written to a unique temporary file in the same
+   * directory, fsynced, closed, and only then atomically renamed onto the
+   * exclusive `.pre-v5.bak` name, so the final path never holds a partial
+   * backup written by this code. A backup that already exists and parses as
+   * this session's persisted record is success (idempotent — it is never
+   * needlessly rewritten); a corrupt or partial leftover is replaced by the
+   * good backup through the same rename. Returns whether a durable backup is
+   * in place; `false` means there was no live record to protect (missing
+   * source or unsafe id), which is not an error. An actual failure (unwritable
+   * directory, I/O error, …) throws, so callers can refuse to replace the
+   * live record without its rollback copy.
    */
   backupPreV5(sessionId: string): boolean {
     let path: string;
@@ -458,23 +466,61 @@ export class SessionStore {
       return false;
     }
     const backupPath = join(this.dir, `.${basename(path)}.pre-v5.bak`);
+    if (this.hasValidBackup(backupPath, sessionId)) return true;
+    const tempPath = join(this.dir, `.${basename(backupPath)}.${randomUUID()}.tmp`);
+    let fd: number | undefined;
     try {
       mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-      const fd = openSync(backupPath, "wx", 0o600);
-      try {
-        const bytes = Buffer.from(raw, "utf8");
-        for (let offset = 0; offset < bytes.byteLength;) {
-          offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);
-        }
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
+      fd = openSync(tempPath, "wx", 0o600);
+      const bytes = Buffer.from(raw, "utf8");
+      for (let offset = 0; offset < bytes.byteLength;) {
+        offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);
       }
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = undefined;
+      // The rename is atomic: the final name flips from absent — or from a
+      // stale partial file left by the pre-atomic implementation — to a
+      // complete backup in a single step.
+      renameSync(tempPath, backupPath);
       return true;
+    } catch (err) {
+      throw new Error(
+        `failed to back up session ${sessionId} before migration: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
+    } finally {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd);
+        } catch {
+          // Preserve the original backup error.
+        }
+      }
+      try {
+        unlinkSync(tempPath);
+      } catch {
+        // The rename succeeded, or the temp file was never created.
+      }
+    }
+  }
+
+  /**
+   * A file already sitting at the backup path counts as a valid backup only
+   * when it parses as the persisted record for this session; anything else
+   * (absent, corrupt, partial, or for another session) must be replaceable.
+   */
+  private hasValidBackup(backupPath: string, sessionId: string): boolean {
+    let raw: string;
+    try {
+      raw = readFileSync(backupPath, "utf8");
     } catch {
-      // Already backed up, or the filesystem refuses; either way the caller
-      // proceeds with the atomic replace of the live file.
-      return false;
+      return false; // absent or unreadable — nothing valid to honour
+    }
+    try {
+      return parsePersistedSession(JSON.parse(raw) as unknown, sessionId) !== undefined;
+    } catch {
+      return false; // corrupt or partial JSON from a failed legacy write
     }
   }
 
