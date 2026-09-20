@@ -123,7 +123,9 @@ test("load rejects malformed metadata, mismatched ids, and unsupported versions"
       ["bad-display-text", { ...base, displayText: { "0": 12 } }],
       ["bad-display-text-root", { ...base, displayText: [] }],
       ["bad-version-type", { ...base, schemaVersion: "4" }],
-      ["unsupported-version", { ...base, schemaVersion: 5 }],
+      // 5 is the current schema; use a genuinely-future version so this case
+      // keeps rejecting on the version check, not an accidental id mismatch.
+      ["unsupported-version", { ...base, schemaVersion: 99 }],
       ["old-version-zero", { ...base, schemaVersion: 0 }],
     ];
 
