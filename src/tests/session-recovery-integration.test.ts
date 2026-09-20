@@ -1,6 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
@@ -414,6 +423,134 @@ test("fork of an interrupted record also recovers before forking", async () => {
     // The source record was settled by the fork's recovery pass as well.
     const parent = readRawRecord(dir, sessionId);
     assert.equal(parent.activeTurn, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Pre-v5 backup gating: the live record is replaced only once a durable
+// rollback copy is in place (see the backupPreV5 unit tests for the store
+// contract itself).
+// ---------------------------------------------------------------------------
+
+function posixPermissionsOnly(): boolean {
+  return (process.platform as string) !== "win32" && (process.getuid?.() ?? 0) !== 0;
+}
+
+test("an unwritable store directory fails the load and leaves the interrupted record untouched", async () => {
+  if (!posixPermissionsOnly()) return;
+  const { store, dir, cleanup } = makeTempStore();
+  try {
+    const sessionId = "eeee5555-eeee-eeee-eeee-eeeeeeeeeeee";
+    writeSessionRecord(dir, interruptedAfterToolStart(sessionId));
+    const liveRaw = readFileSync(recordPath(dir, sessionId), "utf8");
+
+    chmodSync(dir, 0o500);
+    try {
+      const agent = new GlmAcpAgent(createConnectionStub() as never, { sessionStore: store });
+      await assert.rejects(
+        () => agent.loadSession({ sessionId, cwd: "/tmp/project", mcpServers: [] }),
+        /back up session/,
+      );
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+
+    assert.equal(
+      readFileSync(recordPath(dir, sessionId), "utf8"),
+      liveRaw,
+      "the live record must not be replaced without its backup"
+    );
+    assert.equal(existsSync(backupPath(dir, sessionId)), false, "no backup may be claimed");
+    assert.deepEqual(
+      readdirSync(dir).filter((name) => name.includes(".tmp")),
+      []
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("a directory occupying the backup path fails the load and leaves the record untouched", async () => {
+  const { store, dir, cleanup } = makeTempStore();
+  try {
+    const sessionId = "ffff6666-ffff-ffff-ffff-ffffffffffff";
+    writeSessionRecord(dir, interruptedAfterToolStart(sessionId));
+    const liveRaw = readFileSync(recordPath(dir, sessionId), "utf8");
+    mkdirSync(backupPath(dir, sessionId));
+
+    const agent = new GlmAcpAgent(createConnectionStub() as never, { sessionStore: store });
+    await assert.rejects(
+      () => agent.loadSession({ sessionId, cwd: "/tmp/project", mcpServers: [] }),
+      /back up session/,
+    );
+
+    assert.equal(
+      readFileSync(recordPath(dir, sessionId), "utf8"),
+      liveRaw,
+      "the live record must not be replaced without its backup"
+    );
+    assert.equal(existsSync(backupPath(dir, sessionId)), true, "the occupying directory survives");
+    assert.deepEqual(
+      readdirSync(dir).filter((name) => name.includes(".tmp")),
+      []
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("a pre-existing valid backup counts as success and recovery proceeds without rewriting it", async () => {
+  const { store, dir, cleanup } = makeTempStore();
+  try {
+    const sessionId = "aaaa7777-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    writeSessionRecord(dir, interruptedAfterToolStart(sessionId));
+    const originalRaw = readFileSync(recordPath(dir, sessionId), "utf8");
+    writeFileSync(backupPath(dir, sessionId), originalRaw, "utf8");
+
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.loadSession({ sessionId, cwd: "/tmp/project", mcpServers: [] });
+
+    const settled = readRawRecord(dir, sessionId);
+    assert.equal(settled.activeTurn, undefined);
+    assert.equal(countInterruptionNotes(settled), 1);
+    assert.equal(
+      readFileSync(backupPath(dir, sessionId), "utf8"),
+      originalRaw,
+      "a valid backup must be honoured, not rewritten"
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("a partial leftover backup is replaced by a good one and recovery is not blocked", async () => {
+  const { store, dir, cleanup } = makeTempStore();
+  try {
+    const sessionId = "bbbb8888-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    writeSessionRecord(dir, interruptedAfterToolStart(sessionId));
+    // A torn file of the kind the old write-in-place backup could leave.
+    writeFileSync(backupPath(dir, sessionId), '{"schemaVersion":5,"session', "utf8");
+
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { sessionStore: store });
+    await agent.loadSession({ sessionId, cwd: "/tmp/project", mcpServers: [] });
+
+    const settled = readRawRecord(dir, sessionId);
+    assert.equal(settled.activeTurn, undefined);
+    assert.equal(countInterruptionNotes(settled), 1);
+
+    const backup = JSON.parse(
+      readFileSync(backupPath(dir, sessionId), "utf8"),
+    ) as RawRecord;
+    assert.ok(backup.activeTurn, "the backup must hold the original interrupted record");
+    assert.equal(backup.activeTurn?.pendingBatch?.calls?.[0]?.state, "started");
+    assert.deepEqual(
+      readdirSync(dir).filter((name) => name.includes(".tmp")),
+      []
+    );
   } finally {
     cleanup();
   }

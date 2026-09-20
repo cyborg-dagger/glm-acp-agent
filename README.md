@@ -282,7 +282,7 @@ Session files are schema v5 records under `ACP_GLM_SESSION_DIR`. While a turn is
 
 ### Legacy sessions (schema v1–v4)
 
-An older record whose transcript ends in an assistant tool batch with missing results — the on-disk signature of a crash — gets the same conservative treatment for the missing ids only: each receives an unknown-outcome result, and nothing else in the history is rewritten. Before the first repaired v5 record replaces the file, the original is preserved once as `.<sessionId>.json.pre-v5.bak` with mode `0600`.
+An older record whose transcript ends in an assistant tool batch with missing results — the on-disk signature of a crash — gets the same conservative treatment for the missing ids only: each receives an unknown-outcome result, and nothing else in the history is rewritten. Before the first repaired v5 record replaces the file, the original is preserved once as `.<sessionId>.json.pre-v5.bak` with mode `0600`. The backup is written to a temporary file, fsynced, and atomically renamed into place, so the backup path never holds a partial copy; if the backup cannot be written, the original file is left untouched and recovery fails instead of proceeding without a rollback copy.
 
 ### Durability boundary
 

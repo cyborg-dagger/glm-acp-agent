@@ -462,7 +462,7 @@ test("legacy v4 records load unchanged through the v5 parser; dangling tool call
   }
 });
 
-test("backupPreV5 writes a private exclusive backup exactly once", () => {
+test("backupPreV5 writes an atomic private backup; an existing valid backup is idempotent success", () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
@@ -481,6 +481,11 @@ test("backupPreV5 writes a private exclusive backup exactly once", () => {
     if ((process.platform as string) !== "win32") {
       assert.equal(statSync(backupPath).mode & 0o777, 0o600);
     }
+    assert.deepEqual(
+      readdirSync(dir).filter((name) => name.includes(".tmp")),
+      [],
+      "no temporary file may survive the rename"
+    );
 
     store.save(validSession({
       sessionId: first.sessionId,
@@ -489,17 +494,128 @@ test("backupPreV5 writes a private exclusive backup exactly once", () => {
     }));
     assert.equal(
       store.backupPreV5(first.sessionId),
-      false,
-      "a second backup must not overwrite the first"
+      true,
+      "a valid pre-existing backup is success, not failure"
     );
     assert.equal(
       readFileSync(backupPath, "utf8"),
       originalRaw,
-      "the backup must still hold the original pre-v5 content"
+      "a valid pre-existing backup must not be rewritten"
     );
 
     assert.equal(store.backupPreV5("never-saved"), false, "a missing source means no backup");
     assert.equal(store.backupPreV5("../escaped"), false, "unsafe ids are refused, not thrown");
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("backupPreV5 replaces a corrupt or mismatched leftover backup", () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const session = validSession({ sessionId: "stale-backup" });
+    store.save(session);
+    const livePath = join(dir, `${session.sessionId}.json`);
+    const backupPath = join(dir, `.${session.sessionId}.json.pre-v5.bak`);
+    const originalRaw = readFileSync(livePath, "utf8");
+
+    // A partial file left behind by a crash under the old write-in-place
+    // implementation, valid JSON that is not a persisted record, and a valid
+    // record for a different session are all invalid backups that must not
+    // block recovery forever.
+    const rawLeftovers: string[] = ['{"schemaVersion":5,"session'];
+    const structuredLeftovers: unknown[] = [
+      { unrelated: true },
+      validSession({ sessionId: "some-other-session" }),
+    ];
+    for (const leftover of rawLeftovers) {
+      writeFileSync(backupPath, leftover, "utf8");
+      assert.equal(
+        store.backupPreV5(session.sessionId),
+        true,
+        "an invalid leftover must be replaced by a good backup"
+      );
+      assert.equal(readFileSync(backupPath, "utf8"), originalRaw);
+      assert.deepEqual(
+        readdirSync(dir).filter((name) => name.includes(".tmp")),
+        []
+      );
+    }
+    for (const leftover of structuredLeftovers) {
+      writeFileSync(backupPath, JSON.stringify(leftover), "utf8");
+      assert.equal(
+        store.backupPreV5(session.sessionId),
+        true,
+        "an invalid leftover must be replaced by a good backup"
+      );
+      assert.equal(readFileSync(backupPath, "utf8"), originalRaw);
+      assert.deepEqual(
+        readdirSync(dir).filter((name) => name.includes(".tmp")),
+        []
+      );
+    }
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("backupPreV5 throws and leaves the live record intact when the store directory is unwritable", () => {
+  if ((process.platform as string) === "win32" || (process.getuid?.() ?? 0) === 0) {
+    return; // POSIX permission contract is not observable on Windows or as root
+  }
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const session = validSession({ sessionId: "unwritable-dir" });
+    store.save(session);
+    const livePath = join(dir, `${session.sessionId}.json`);
+    const backupPath = join(dir, `.${session.sessionId}.json.pre-v5.bak`);
+    const originalRaw = readFileSync(livePath, "utf8");
+
+    chmodSync(dir, 0o500);
+    try {
+      assert.throws(() => store.backupPreV5(session.sessionId), /back up session/);
+      assert.equal(existsSync(backupPath), false, "no backup may be claimed");
+      assert.equal(
+        readFileSync(livePath, "utf8"),
+        originalRaw,
+        "the live record must stay untouched when its backup cannot be written"
+      );
+      assert.deepEqual(readdirSync(dir).filter((name) => name.includes(".tmp")), []);
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("backupPreV5 fails cleanly when a directory occupies the backup path", () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const session = validSession({ sessionId: "dir-in-the-way" });
+    store.save(session);
+    const livePath = join(dir, `${session.sessionId}.json`);
+    const backupPath = join(dir, `.${session.sessionId}.json.pre-v5.bak`);
+    const originalRaw = readFileSync(livePath, "utf8");
+    mkdirSync(backupPath);
+
+    // A directory is not a backup and cannot be replaced by a rename; the
+    // attempt must fail loudly rather than report success.
+    assert.throws(() => store.backupPreV5(session.sessionId), /back up session/);
+    assert.equal(statSync(backupPath).isDirectory(), true, "the directory must not be destroyed");
+    assert.equal(
+      readFileSync(livePath, "utf8"),
+      originalRaw,
+      "the live record must stay untouched"
+    );
+    assert.deepEqual(
+      readdirSync(dir).filter((name) => name.includes(".tmp")),
+      [],
+      "failed attempts must not leave temporary artifacts"
+    );
   } finally {
     cleanup(dir);
   }
