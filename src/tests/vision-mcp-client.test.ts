@@ -497,6 +497,52 @@ test("StdioVisionMcpClient fails the connection on an over-limit stdio frame", a
   await client.dispose();
 });
 
+test("StdioVisionMcpClient rejects a valid response padded with whitespace past the frame limit", async () => {
+  const harness = makeFakeChild();
+  const client = new StdioVisionMcpClient({
+    apiKey: "k",
+    spawn: () => harness.child as never,
+    limits: { ...readResourceLimits({}), mcpFrameBytes: 100 },
+  });
+  const pending = client.callTool("analyze", { image: "x" });
+  await visionTick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
+  await visionTick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "analyze" }] } }) + "\n");
+  await visionTick();
+  const callBody = JSON.parse(harness.written[3]?.trim() ?? "{}") as { id: number };
+  const body = JSON.stringify({ jsonrpc: "2.0", id: callBody.id, result: { ok: true } });
+  const paddedLine = ` ${body} ${" ".repeat(345 - body.length - 2)}`;
+  assert.ok(Buffer.byteLength(body) <= 100, "the trimmed response must fit the limit");
+  assert.equal(Buffer.byteLength(paddedLine), 345, "the raw line must exceed the limit");
+  harness.pushStdout(`${paddedLine}\n`);
+  await assert.rejects(pending, /frame exceeded/i);
+  assert.ok(harness.getKillCount() >= 1, "the owned child must be terminated");
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient accepts a CRLF-terminated frame whose raw line exactly meets the frame limit", async () => {
+  const harness = makeFakeChild();
+  const client = new StdioVisionMcpClient({
+    apiKey: "k",
+    spawn: () => harness.child as never,
+    limits: { ...readResourceLimits({}), mcpFrameBytes: 100 },
+  });
+  const pending = client.callTool("analyze", { image: "x" });
+  await visionTick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
+  await visionTick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "analyze" }] } }) + "\n");
+  await visionTick();
+  const callBody = JSON.parse(harness.written[3]?.trim() ?? "{}") as { id: number };
+  const body = JSON.stringify({ jsonrpc: "2.0", id: callBody.id, result: { ok: true } });
+  const paddedLine = ` ${body} ${" ".repeat(100 - body.length - 2)}`;
+  assert.equal(Buffer.byteLength(paddedLine), 100);
+  harness.pushStdout(`${paddedLine}\r\n`);
+  assert.deepEqual(await pending, { ok: true });
+  await client.dispose();
+});
+
 test("StdioVisionMcpClient accepts many small frames arriving in one large chunk", async () => {
   const harness = makeFakeChild();
   const client = new StdioVisionMcpClient({

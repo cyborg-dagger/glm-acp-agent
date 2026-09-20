@@ -396,10 +396,12 @@ export class StdioVisionMcpClient implements VisionMcpClient {
     this.buffer += chunk;
     let idx: number;
     while ((idx = this.buffer.indexOf("\n")) !== -1) {
-      const line = this.buffer.slice(0, idx).trim();
+      const rawSlice = this.buffer.slice(0, idx);
       this.buffer = this.buffer.slice(idx + 1);
-      if (!line) continue;
-      if (Buffer.byteLength(line) > this.limits.mcpFrameBytes) {
+      // Measure the raw line, excluding only the newline/CRLF delimiter; whitespace
+      // padding must not hide the frame's true size from the byte limit.
+      const rawLine = rawSlice.endsWith("\r") ? rawSlice.slice(0, -1) : rawSlice;
+      if (Buffer.byteLength(rawLine) > this.limits.mcpFrameBytes) {
         this.failConnection(
           new Error(`Vision MCP stdio frame exceeded the ${String(this.limits.mcpFrameBytes)}-byte limit`),
           this.child as ChildProcessWithoutNullStreams,
@@ -407,6 +409,8 @@ export class StdioVisionMcpClient implements VisionMcpClient {
         );
         return;
       }
+      const line = rawLine.trim();
+      if (!line) continue;
       let parsed: { id?: number; result?: unknown; error?: { code?: number; message?: string } };
       try {
         parsed = JSON.parse(line) as typeof parsed;
