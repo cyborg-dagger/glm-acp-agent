@@ -260,6 +260,10 @@ export class ZaiMcpClient {
       const text = await readDiagnosticBody(response, this.resourceLimits, signal ?? new AbortController().signal);
       throw new Error(formatMcpError(mcpMethod, response.status, text));
     }
+    // A successful notification carries no protocol payload: release the body
+    // so a non-empty or indefinitely open response cannot retain its fetch and
+    // socket resources across initializations and retries.
+    await response.body?.cancel().catch(() => undefined);
   }
 
   private async fetchJsonRpc(

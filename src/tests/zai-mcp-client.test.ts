@@ -557,3 +557,33 @@ test("ZaiMcpClient skips SSE responses with a wrong id and returns the matching 
   assert.deepEqual(result, { matched: true });
   assert.ok(id > 0);
 });
+
+test("ZaiMcpClient releases the notification body after a successful initialization", async () => {
+  let cancelCount = 0;
+  const notificationBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      // Non-empty and never closed: a successful response must not leave the
+      // fetch and socket resources behind it retained across retries.
+      controller.enqueue(new TextEncoder().encode("202 accepted, still open"));
+    },
+    cancel() {
+      cancelCount += 1;
+    },
+  });
+  const client = new ZaiMcpClient(async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string; id?: number };
+    if (body.method === "initialize") {
+      return jsonResponse({ jsonrpc: "2.0", id: body.id, result: {} }, { sessionId: "sess" });
+    }
+    if (body.method === "notifications/initialized") {
+      return new Response(notificationBody, { status: 202 });
+    }
+    if (body.method === "tools/list") {
+      return jsonResponse({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "search" }] } });
+    }
+    return jsonResponse({ jsonrpc: "2.0", id: body.id, result: { ok: true } });
+  });
+  const result = await client.callTool({ endpoint: "https://z.example/mcp", toolName: "search", arguments: {}, apiKey: "k" });
+  assert.deepEqual(result, { ok: true });
+  assert.equal(cancelCount, 1);
+});
