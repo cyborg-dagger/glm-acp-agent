@@ -629,3 +629,96 @@ test("backupPreV5 fails cleanly when a directory occupies the backup path", () =
     cleanup(dir);
   }
 });
+
+// ---------------------------------------------------------------------------
+// The load-time backup gate: a pre-v5 record is backed up before its migrated
+// v5 form can be handed out for persistence (the agent persists after load on
+// every session/load, session/resume and session/fork path).
+// ---------------------------------------------------------------------------
+
+test("load of a pre-v5 record backs up the raw bytes before migrating", () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const v4: PersistedSession = validSession({
+      sessionId: "load-backs-up",
+      schemaVersion: 4,
+      messages: [
+        { role: "user", content: "run the tools" },
+        assistantWithToolCalls(["a"]),
+      ],
+    });
+    writeRaw(dir, v4.sessionId, v4);
+    const livePath = join(dir, `${v4.sessionId}.json`);
+    const backupPath = join(dir, `.${v4.sessionId}.json.pre-v5.bak`);
+    const rawBefore = readFileSync(livePath, "utf8");
+
+    const loaded = store.load(v4.sessionId);
+
+    assert.equal(
+      readFileSync(backupPath, "utf8"),
+      rawBefore,
+      "the backup must hold the raw pre-v5 bytes, not the migrated record"
+    );
+    assert.equal(
+      readFileSync(livePath, "utf8"),
+      rawBefore,
+      "load itself must not rewrite the live record"
+    );
+    assert.equal(loaded?.schemaVersion, SESSION_SCHEMA_VERSION);
+    assert.deepEqual(
+      loaded?.messages,
+      [
+        { role: "user", content: "run the tools" },
+        assistantWithToolCalls(["a"]),
+        { role: "tool", tool_call_id: "a", content: LEGACY_UNKNOWN_TEXT },
+      ],
+      "the handed-out record is the migrated, repaired one"
+    );
+    assert.deepEqual(readdirSync(dir).filter((name) => name.includes(".tmp")), []);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("load refuses to hand out a migrated record when its backup cannot be written", () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const session = validSession({ sessionId: "load-backup-fails", schemaVersion: 4 });
+    writeRaw(dir, session.sessionId, session);
+    const livePath = join(dir, `${session.sessionId}.json`);
+    const backupPath = join(dir, `.${session.sessionId}.json.pre-v5.bak`);
+    const rawBefore = readFileSync(livePath, "utf8");
+    mkdirSync(backupPath);
+
+    assert.throws(() => store.load(session.sessionId), /back up session/);
+    assert.equal(
+      readFileSync(livePath, "utf8"),
+      rawBefore,
+      "the live record must stay untouched when its backup cannot be written"
+    );
+    assert.deepEqual(readdirSync(dir).filter((name) => name.includes(".tmp")), []);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("a settled v5 record loads without any backup attempt", () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const session: PersistedSession = {
+      ...validSession({ sessionId: "settled-no-backup" }),
+      schemaVersion: SESSION_SCHEMA_VERSION,
+    };
+    store.save(session);
+    const backupPath = join(dir, `.${session.sessionId}.json.pre-v5.bak`);
+    // A directory at the backup path would make any backup attempt throw, so
+    // a successful load proves no attempt was made for an already-v5 record.
+    mkdirSync(backupPath);
+    assert.deepEqual(store.load(session.sessionId), { ...session, schemaVersion: SESSION_SCHEMA_VERSION });
+  } finally {
+    cleanup(dir);
+  }
+});
