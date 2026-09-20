@@ -13,6 +13,7 @@ import {
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { GlmMessage, ThoughtLevel } from "../llm/glm-client.js";
+import { repairLegacyTail } from "./session-recovery.js";
 
 /**
  * Schema version embedded in every persisted session file. Bump whenever the
@@ -333,23 +334,32 @@ function parsePersistedSession(value: unknown, expectedSessionId: string): Persi
   if (value.activeTurn !== undefined && !isValidActiveTurn(value.activeTurn)) return undefined;
 
   const parsed = value as unknown as PersistedSession;
+  // A pre-v5 record may end in an assistant tool batch whose results were
+  // never recorded — a crash marker. Repair that tail here, while the record
+  // still carries its on-disk schema version: once the spreads below rewrite
+  // it to 5, the legacy branch of `recoverInterruptedSession` can no longer
+  // fire, which would leave the documented repair unreachable through the
+  // real session/load, session/resume and session/fork path. `messages` has
+  // been fully validated above, so the repair only ever appends well-formed
+  // tool results; settled (v5) records are untouched.
+  const settled = version < SESSION_SCHEMA_VERSION ? repairLegacyTail(parsed) : parsed;
   if (version === 1) {
     return {
-      ...parsed,
+      ...settled,
       mode: "default",
-      thoughtLevel: parsed.thoughtLevel ?? "max",
+      thoughtLevel: settled.thoughtLevel ?? "max",
       schemaVersion: SESSION_SCHEMA_VERSION,
     };
   }
   if (version === 2) {
     return {
-      ...parsed,
-      thoughtLevel: parsed.thoughtLevel ?? "max",
+      ...settled,
+      thoughtLevel: settled.thoughtLevel ?? "max",
       schemaVersion: SESSION_SCHEMA_VERSION,
     };
   }
   return {
-    ...parsed,
+    ...settled,
     schemaVersion: SESSION_SCHEMA_VERSION,
   };
 }
