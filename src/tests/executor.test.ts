@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeCredentials } from "../llm/credentials.js";
+import type { ToolExecutionHooks } from "../protocol/session-recovery.js";
 import { ToolExecutor, isProcessGroupAlive } from "../tools/executor.js";
 import type { ResourceLimits } from "../tools/resource-limits.js";
 import type { VisionMcpClient } from "../tools/vision-mcp-client.js";
@@ -1998,4 +1999,268 @@ test("image_analysis is unavailable when no vision client is configured", async 
     JSON.stringify({ image_source: "/tmp/x.png" })
   );
   assert.match(result.content, /vision[^.]*not configured/i);
+});
+
+// ---------------------------------------------------------------------------
+// Execution-start checkpoint hooks (crash recovery)
+// ---------------------------------------------------------------------------
+
+function createHookStub(impl?: (call: { id: string; name: string }) => Promise<void>): {
+  hooks: ToolExecutionHooks;
+  calls: Array<{ id: string; name: string }>;
+} {
+  const calls: Array<{ id: string; name: string }> = [];
+  return {
+    calls,
+    hooks: {
+      async onExecutionStart(call) {
+        calls.push({ id: call.id, name: call.name });
+        if (impl) await impl(call);
+      },
+    },
+  };
+}
+
+test("write_file marks started after permission and before the write", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-hook-write-"));
+  const path = join(dir, "out.txt");
+  const { hooks, calls } = createHookStub(async () => {
+    // At checkpoint time the effect must not have happened yet.
+    assert.equal(existsSync(path), false, "target file already existed when the start hook fired");
+  });
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    dir,
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    hooks
+  );
+  try {
+    const result = await exec.execute("tc1", "write_file", JSON.stringify({ path, content: "hi" }));
+    assert.match(result.content, /written successfully/);
+    assert.equal(readFileSync(path, "utf8"), "hi");
+    assert.deepEqual(calls, [{ id: "tc1", name: "write_file" }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a rejected start hook prevents the write entirely", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-hook-reject-"));
+  const path = join(dir, "out.txt");
+  let hookCalls = 0;
+  const hooks: ToolExecutionHooks = {
+    async onExecutionStart() {
+      hookCalls += 1;
+      throw new Error("checkpoint rejected: tool call not started");
+    },
+  };
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    dir,
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    hooks
+  );
+  try {
+    // The checkpoint rejection propagates out of execute() — it must not be
+    // swallowed into a successful-looking result.
+    await assert.rejects(
+      exec.execute("tc1", "write_file", JSON.stringify({ path, content: "must not land" })),
+      /checkpoint|not start/i
+    );
+    assert.equal(hookCalls, 1);
+    assert.equal(existsSync(path), false);
+    // Nothing may report the write as completed.
+    const completed = conn.updates.filter(
+      (u) => (u.update as { status?: string }).status === "completed"
+    );
+    assert.equal(completed.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("permission-rejected calls never mark started", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-hook-perm-reject-"));
+  const path = join(dir, "out.txt");
+  const { hooks, calls } = createHookStub();
+  const conn = createConnectionStub({ permission: "reject" });
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    dir,
+    () => "default",
+    undefined,
+    undefined,
+    null,
+    hooks
+  );
+  try {
+    const result = await exec.execute("tc1", "write_file", JSON.stringify({ path, content: "data" }));
+    assert.match(result.content, /rejected by user/i);
+    assert.deepEqual(calls, []);
+    assert.equal(existsSync(path), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read-only tools never mark started", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-hook-readonly-"));
+  writeFileSync(join(dir, "note.txt"), "from disk", "utf8");
+  const { hooks, calls } = createHookStub();
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    dir,
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    hooks
+  );
+  try {
+    const read = await exec.execute("tc1", "read_file", JSON.stringify({ path: "note.txt" }));
+    assert.equal(read.content, "from disk");
+    const list = await exec.execute("tc2", "list_files", JSON.stringify({ path: "." }));
+    assert.match(list.content, /note\.txt/);
+    assert.deepEqual(calls, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("run_command marks started before the process spawns", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-hook-cmd-"));
+  const marker = join(dir, "command-ran");
+  const { hooks, calls } = createHookStub(async () => {
+    // At checkpoint time the command's side effect must not exist yet.
+    assert.equal(existsSync(marker), false, "command marker already existed when the start hook fired");
+  });
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    dir,
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    hooks
+  );
+  try {
+    const command = `${shellNodeCommand()} -e 'require("node:fs").writeFileSync(${shellFixturePath(marker, "command-ran")}, "done")'`;
+    const result = await exec.execute("tc1", "run_command", JSON.stringify({ command }));
+    assert.match(result.content, /Exit code: 0/);
+    assert.equal(readFileSync(marker, "utf8"), "done");
+    assert.deepEqual(calls, [{ id: "tc1", name: "run_command" }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("edit_file marks started only after the re-read validation passes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-hook-edit-stale-"));
+  const path = join(dir, "code.txt");
+  writeFileSync(path, "keep\nold snippet\n", "utf8");
+  const { hooks, calls } = createHookStub();
+  const conn = createConnectionStub({
+    permission: "allow",
+    // The user edits the buffer while the permission prompt is up.
+    onPermission: () => writeFileSync(path, "keep\nuser rewrote this\n", "utf8"),
+  });
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    dir,
+    () => "default",
+    undefined,
+    undefined,
+    null,
+    hooks
+  );
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "edit_file",
+      JSON.stringify({ path, old_text: "old snippet", new_text: "new snippet" })
+    );
+    assert.match(result.content, /changed while waiting for permission/);
+    // A stale edit never reaches the start checkpoint.
+    assert.deepEqual(calls, []);
+    assert.equal(readFileSync(path, "utf8"), "keep\nuser rewrote this\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("edit_file marks started after validation and before the write lands", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-hook-edit-"));
+  const path = join(dir, "code.txt");
+  writeFileSync(path, "const a = 1;\nconst b = 2;\n", "utf8");
+  const { hooks, calls } = createHookStub(async () => {
+    // At checkpoint time the edit has not been written back yet.
+    assert.match(readFileSync(path, "utf8"), /const b = 2;/);
+  });
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    dir,
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    hooks
+  );
+  try {
+    const result = await exec.execute(
+      "tc1",
+      "edit_file",
+      JSON.stringify({ path, old_text: "const b = 2;", new_text: "const b = 3;" })
+    );
+    assert.match(result.content, /edited successfully/);
+    assert.equal(readFileSync(path, "utf8"), "const a = 1;\nconst b = 3;\n");
+    assert.deepEqual(calls, [{ id: "tc1", name: "edit_file" }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
