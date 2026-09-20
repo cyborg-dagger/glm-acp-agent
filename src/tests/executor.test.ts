@@ -2021,6 +2021,14 @@ function createHookStub(impl?: (call: { id: string; name: string }) => Promise<v
   };
 }
 
+function createRejectingHookStub(): ToolExecutionHooks {
+  return {
+    async onExecutionStart() {
+      throw new Error("checkpoint rejected: tool call not started");
+    },
+  };
+}
+
 test("write_file marks started after permission and before the write", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-hook-write-"));
   const path = join(dir, "out.txt");
@@ -2092,9 +2100,261 @@ test("a rejected start hook prevents the write entirely", async () => {
       (u) => (u.update as { status?: string }).status === "completed"
     );
     assert.equal(completed.length, 0);
+    // The card already announced as pending/in_progress must reach a terminal
+    // failed state instead of hanging in-progress forever.
+    const failed = conn.updates.filter(
+      (u) => (u.update as { status?: string }).status === "failed"
+    );
+    assert.equal(failed.length, 1);
+    const failedUpdate = failed[0]!.update as {
+      toolCallId?: string;
+      rawOutput?: { error?: string };
+    };
+    assert.equal(failedUpdate.toolCallId, "tc1");
+    assert.match(String(failedUpdate.rawOutput?.error), /checkpoint|not start/i);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a failed status update that itself fails never masks the checkpoint error", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-hook-reject-noisy-"));
+  const path = join(dir, "out.txt");
+  const conn = createConnectionStub();
+  // The transport is down for the terminal failed update itself: reporting the
+  // failure is best-effort and must not replace the checkpoint error.
+  conn.sessionUpdate = async (payload: Record<string, unknown>) => {
+    if ((payload.update as { status?: string }).status === "failed") {
+      throw new Error("session update transport is down");
+    }
+    conn.updates.push(payload);
+  };
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    dir,
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    createRejectingHookStub()
+  );
+  try {
+    await assert.rejects(
+      exec.execute("tc1", "write_file", JSON.stringify({ path, content: "must not land" })),
+      /checkpoint|not start/i
+    );
+    assert.equal(existsSync(path), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a rejected start hook fails the edit_file card and skips the write", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-hook-edit-reject-"));
+  const path = join(dir, "code.txt");
+  writeFileSync(path, "const a = 1;\n", "utf8");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    dir,
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    createRejectingHookStub()
+  );
+  try {
+    await assert.rejects(
+      exec.execute(
+        "tc1",
+        "edit_file",
+        JSON.stringify({ path, old_text: "const a = 1;", new_text: "const b = 2;" })
+      ),
+      /checkpoint|not start/i
+    );
+    assert.equal(readFileSync(path, "utf8"), "const a = 1;\n");
+    const failed = conn.updates.filter(
+      (u) => (u.update as { status?: string }).status === "failed"
+    );
+    assert.equal(failed.length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a rejected start hook fails the run_command card and never spawns", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-hook-cmd-reject-"));
+  const marker = join(dir, "command-ran");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    dir,
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    createRejectingHookStub()
+  );
+  try {
+    const command = `${shellNodeCommand()} -e 'require("node:fs").writeFileSync(${shellFixturePath(marker, "command-ran")}, "done")'`;
+    await assert.rejects(
+      exec.execute("tc1", "run_command", JSON.stringify({ command })),
+      /checkpoint|not start/i
+    );
+    assert.equal(existsSync(marker), false);
+    const failed = conn.updates.filter(
+      (u) => (u.update as { status?: string }).status === "failed"
+    );
+    assert.equal(failed.length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a rejected start hook fails the web_search card", async () => {
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    process.cwd(),
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    createRejectingHookStub()
+  );
+  await assert.rejects(
+    exec.execute("tc1", "web_search", JSON.stringify({ query: "acp protocol" })),
+    /checkpoint|not start/i
+  );
+  const failed = conn.updates.filter(
+    (u) => (u.update as { status?: string }).status === "failed"
+  );
+  assert.equal(failed.length, 1);
+  const completed = conn.updates.filter(
+    (u) => (u.update as { status?: string }).status === "completed"
+  );
+  assert.equal(completed.length, 0);
+});
+
+test("a rejected start hook fails the web_reader card", async () => {
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    null,
+    process.cwd(),
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    createRejectingHookStub()
+  );
+  await assert.rejects(
+    exec.execute("tc1", "web_reader", JSON.stringify({ url: "https://example.com" })),
+    /checkpoint|not start/i
+  );
+  const failed = conn.updates.filter(
+    (u) => (u.update as { status?: string }).status === "failed"
+  );
+  assert.equal(failed.length, 1);
+  const completed = conn.updates.filter(
+    (u) => (u.update as { status?: string }).status === "completed"
+  );
+  assert.equal(completed.length, 0);
+});
+
+test("a rejected start hook fails the image_analysis card without calling vision", async () => {
+  let visionCalls = 0;
+  const vision = {
+    async callTool() {
+      visionCalls += 1;
+      return {};
+    },
+  };
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    vision as never,
+    null,
+    process.cwd(),
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    createRejectingHookStub()
+  );
+  await assert.rejects(
+    exec.execute("tc1", "image_analysis", JSON.stringify({ image_source: "/tmp/x.png" })),
+    /checkpoint|not start/i
+  );
+  assert.equal(visionCalls, 0);
+  const failed = conn.updates.filter(
+    (u) => (u.update as { status?: string }).status === "failed"
+  );
+  assert.equal(failed.length, 1);
+});
+
+test("a rejected start hook fails the session MCP tool card without calling the tool", async () => {
+  let mcpCalls = 0;
+  const sessionMcpTools = {
+    hasTool: () => true,
+    async callTool() {
+      mcpCalls += 1;
+      return {};
+    },
+  };
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(
+    conn as never,
+    "s1",
+    FULL_CAPS,
+    undefined,
+    null,
+    sessionMcpTools as never,
+    process.cwd(),
+    () => "bypass_permissions",
+    undefined,
+    undefined,
+    null,
+    createRejectingHookStub()
+  );
+  await assert.rejects(
+    exec.execute("tc1", "session_grep", JSON.stringify({ pattern: "x" })),
+    /checkpoint|not start/i
+  );
+  assert.equal(mcpCalls, 0);
+  const failed = conn.updates.filter(
+    (u) => (u.update as { status?: string }).status === "failed"
+  );
+  assert.equal(failed.length, 1);
 });
 
 test("permission-rejected calls never mark started", async () => {
