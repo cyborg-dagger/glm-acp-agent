@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createDeadline, readBoundedBody, readRpcResponse } from "../tools/mcp-transport.js";
+import { createDeadline, readBoundedBody, readDiagnosticBody, readRpcResponse } from "../tools/mcp-transport.js";
 import type { ResourceLimits } from "../tools/resource-limits.js";
 
 const noSignal = new AbortController().signal;
@@ -132,6 +132,41 @@ test("readBoundedBody rejects through an aborted signal and cancels the stream",
   assert.ok(tracked.cancelled());
 });
 
+test("readBoundedBody rejects with the abort reason even when stream cancellation never settles", { timeout: 5_000 }, async () => {
+  let cancelCalled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(new TextEncoder().encode("x".repeat(200)));
+    },
+    cancel() {
+      cancelCalled = true;
+      return new Promise<never>(() => undefined);
+    },
+  });
+  const response = new Response(stream, { status: 200, headers: { "content-type": "application/json" } });
+  const caller = new AbortController();
+  const pending = readBoundedBody(response, 1_000, caller.signal);
+  caller.abort(new Error("MCP call cancelled by the client"));
+  await assert.rejects(() => pending, /cancelled by the client/i);
+  assert.ok(cancelCalled, "cancellation must still be initiated");
+});
+
+test("readBoundedBody rejects early on Content-Length even when cancellation never settles", { timeout: 5_000 }, async () => {
+  const stream = new ReadableStream<Uint8Array>({
+    async pull() {
+      await new Promise(() => undefined);
+    },
+    cancel() {
+      return new Promise<never>(() => undefined);
+    },
+  });
+  const response = new Response(stream, {
+    status: 200,
+    headers: { "content-type": "application/json", "content-length": "5000" },
+  });
+  await assert.rejects(() => readBoundedBody(response, 1_000, noSignal), /exceeded the 1000-byte limit/i);
+});
+
 test("readRpcResponse parses a JSON response with a matching id", async () => {
   const tracked = trackedResponse([JSON.stringify({ jsonrpc: "2.0", id: 7, result: { tools: [] } })], {
     contentType: "application/json",
@@ -216,6 +251,25 @@ test("readRpcResponse rejects a single SSE event that exceeds the event cap with
   );
 });
 
+test("readRpcResponse rejects SSE events whose running size crosses the event cap before any terminator", async () => {
+  // 40 short data lines (27 bytes each) with no blank-line terminator: the
+  // logical event grows to 800 bytes against a 500-byte event cap, while the
+  // stream total (1080 bytes against 1000) alone would not stop it in time.
+  const tracked = trackedResponse(
+    Array.from({ length: 40 }, () => `data: ${"x".repeat(20)}\n`),
+    { contentType: "text/event-stream", neverClose: true },
+  );
+  const deadline = createDeadline(undefined, 2_000);
+  try {
+    await assert.rejects(
+      () => readRpcResponse(tracked.response, 7, limits({ mcpEventBytes: 500 }), deadline.signal),
+      /exceeded the 500-byte event limit/i,
+    );
+  } finally {
+    deadline.dispose();
+  }
+});
+
 test("readRpcResponse bounds the total bytes consumed from an endless SSE stream", async () => {
   const filler = JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: { n: "z".repeat(80) } });
   const tracked = trackedResponse(
@@ -227,6 +281,17 @@ test("readRpcResponse bounds the total bytes consumed from an endless SSE stream
     /exceed|limit|too large/i,
   );
   assert.ok(tracked.cancelled());
+});
+
+test("readRpcResponse rejects a matching SSE response whose chunk exceeds the total byte cap", async () => {
+  // One ~360-byte SSE chunk holding the matching response against a 100-byte
+  // stream cap: acceptance must not bypass the raw byte total.
+  const data = JSON.stringify({ jsonrpc: "2.0", id: 7, result: { ok: true, blob: "z".repeat(300) } });
+  const tracked = trackedResponse([sseEvent(data)], { contentType: "text/event-stream" });
+  await assert.rejects(
+    () => readRpcResponse(tracked.response, 7, limits({ mcpResponseBytes: 100 }), noSignal),
+    /exceeded the 100-byte limit/i,
+  );
 });
 
 test("readRpcResponse times out on a stalled body and cancels the stream (injected budget)", async () => {
@@ -250,4 +315,73 @@ test("readRpcResponse surfaces caller cancellation distinctly from timeout", asy
   caller.abort(new Error("MCP call cancelled by the client"));
   await assert.rejects(() => pending, /cancelled by the client/i);
   assert.ok(tracked.cancelled());
+});
+
+test("readRpcResponse returns the matching SSE envelope even when stream cancellation never settles", { timeout: 5_000 }, async () => {
+  let cancelCalled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(sseEvent(JSON.stringify({ jsonrpc: "2.0", id: 7, result: { ok: true } }))));
+    },
+    cancel() {
+      cancelCalled = true;
+      return new Promise<never>(() => undefined);
+    },
+  });
+  const response = new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+  const envelope = await readRpcResponse(response, 7, limits(), noSignal);
+  assert.deepEqual(envelope.result, { ok: true });
+  assert.ok(cancelCalled, "cancellation must still be initiated");
+});
+
+test("readRpcResponse still surfaces a timeout when the SSE stream's cancellation never settles", { timeout: 5_000 }, async () => {
+  const stream = new ReadableStream<Uint8Array>({
+    async pull() {
+      await new Promise(() => undefined);
+    },
+    cancel() {
+      return new Promise<never>(() => undefined);
+    },
+  });
+  const response = new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+  const deadline = createDeadline(undefined, 20);
+  try {
+    await assert.rejects(() => readRpcResponse(response, 7, limits(), deadline.signal), /timed out after 20ms/i);
+  } finally {
+    deadline.dispose();
+  }
+});
+
+test("readDiagnosticBody rethrows caller cancellation and timeout instead of an empty diagnostic", async () => {
+  const cancelled = trackedResponse(["partial"], { contentType: "text/plain", neverClose: true });
+  const caller = new AbortController();
+  const pending = readDiagnosticBody(cancelled.response, limits(), caller.signal);
+  caller.abort(new Error("MCP call cancelled by the client"));
+  await assert.rejects(() => pending, /cancelled by the client/i);
+
+  const stalled = trackedResponse(["partial"], { contentType: "text/plain", neverClose: true });
+  const deadline = createDeadline(undefined, 20);
+  try {
+    await assert.rejects(
+      () => readDiagnosticBody(stalled.response, limits(), deadline.signal),
+      /timed out after 20ms/i,
+    );
+  } finally {
+    deadline.dispose();
+  }
+});
+
+test("readDiagnosticBody rethrows body-limit errors and still swallows ordinary body failures", async () => {
+  const oversized = trackedResponse(["y".repeat(50)], { contentType: "text/plain", contentLength: "5000" });
+  await assert.rejects(
+    () => readDiagnosticBody(oversized.response, limits({ mcpResponseBytes: 1_000 }), noSignal),
+    /exceeded the 1000-byte limit/i,
+  );
+
+  const broken = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.error(new Error("socket reset"));
+    },
+  });
+  assert.equal(await readDiagnosticBody(new Response(broken, { status: 500 }), limits(), noSignal), "");
 });

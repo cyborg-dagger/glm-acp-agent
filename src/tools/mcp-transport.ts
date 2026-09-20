@@ -50,6 +50,19 @@ function abortError(signal: AbortSignal): unknown {
   return new Error("aborted");
 }
 
+/** Thrown when a response body crosses its configured byte budget. */
+class BodyLimitError extends Error {}
+
+/**
+ * Initiates stream cancellation without awaiting it: a stream whose `cancel()`
+ * never settles must not hold the surrounding result or error hostage. The
+ * underlying source's cancel callback still runs synchronously; only the
+ * settlement of the returned promise is ignored, and rejections are swallowed.
+ */
+function cancelDetached(cancel: Promise<unknown> | undefined): void {
+  void cancel?.catch(() => undefined);
+}
+
 /** A single `reader.read()` raced against the signal, so stalled bodies are cancellable. */
 async function readWithSignal(
   reader: ReadableStreamDefaultReader<Uint8Array>,
@@ -86,8 +99,8 @@ export async function readBoundedBody(
 ): Promise<Uint8Array> {
   const declared = Number(response.headers.get("Content-Length"));
   if (Number.isFinite(declared) && declared > maxBytes) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new Error(`MCP response body exceeded the ${maxBytes}-byte limit (Content-Length: ${declared})`);
+    cancelDetached(response.body?.cancel());
+    throw new BodyLimitError(`MCP response body exceeded the ${maxBytes}-byte limit (Content-Length: ${declared})`);
   }
   const body = response.body;
   if (!body) return new Uint8Array(0);
@@ -102,12 +115,12 @@ export async function readBoundedBody(
       // Count bytes before any decoding: the cap is on wire bytes.
       received += value.byteLength;
       if (received > maxBytes) {
-        throw new Error(`MCP response body exceeded the ${maxBytes}-byte limit after ${received} bytes`);
+        throw new BodyLimitError(`MCP response body exceeded the ${maxBytes}-byte limit after ${received} bytes`);
       }
       chunks.push(value);
     }
   } catch (err) {
-    await reader.cancel(err).catch(() => undefined);
+    cancelDetached(reader.cancel(err));
     throw err;
   }
   const total = new Uint8Array(received);
@@ -168,6 +181,8 @@ function parseJsonRpcEnvelope(text: string, requestId: string | number): RpcResu
 class SseScanner {
   private buffer = "";
   private dataLines: string[] = [];
+  /** Running UTF-8 byte count of the current event's data payload. */
+  private eventBytes = 0;
 
   constructor(private readonly maxEventBytes: number) {}
 
@@ -208,15 +223,19 @@ class SseScanner {
       if (this.dataLines.length === 0) return undefined;
       const data = this.dataLines.join("\n");
       this.dataLines = [];
-      if (Buffer.byteLength(data) > this.maxEventBytes) {
-        throw new Error(`MCP SSE event exceeded the ${this.maxEventBytes}-byte event limit`);
-      }
+      this.eventBytes = 0;
       return data;
     }
     if (line.startsWith(":")) return undefined;
     if (line.startsWith("data:")) {
       let value = line.slice("data:".length);
       if (value.startsWith(" ")) value = value.slice(1);
+      // Count as the event grows, not only at the terminator: a peer that
+      // never sends a blank line must not grow one event without bound.
+      this.eventBytes += Buffer.byteLength(value) + (this.dataLines.length > 0 ? 1 : 0);
+      if (this.eventBytes > this.maxEventBytes) {
+        throw new Error(`MCP SSE event exceeded the ${this.maxEventBytes}-byte event limit`);
+      }
       this.dataLines.push(value);
     }
     // `event:`, `id:` and `retry:` fields are ignored and never accumulated.
@@ -244,7 +263,12 @@ export async function readDiagnosticBody(
       text = `${text.slice(0, DIAGNOSTIC_TEXT_LIMIT)}… [truncated, ${text.length} chars total]`;
     }
     return text;
-  } catch {
+  } catch (err) {
+    // Diagnostics are best-effort: ordinary body failures degrade to empty
+    // text. But the caller's cancellation/timeout and byte-limit violations
+    // must surface, not be replaced by a generic HTTP-status error.
+    if (err instanceof BodyLimitError) throw err;
+    if (signal.aborted) throw abortError(signal);
     return "";
   }
 }
@@ -291,19 +315,27 @@ async function readSseRpcResponse(
     for (;;) {
       const { done, value } = await readWithSignal(reader, signal);
       if (done) break;
+      // Enforce the raw byte total before decoding: only the remaining
+      // response budget is decoded, so an oversized chunk is never expanded
+      // in full. The scanner still sees that bounded prefix, so a single
+      // over-limit event keeps being reported as such even when its chunk
+      // also crosses the stream total.
+      const budgetBefore = limits.mcpResponseBytes - received;
       received += value.byteLength;
-      // Scan first: a single over-limit event must be reported as such even
-      // when its bytes also cross the stream total.
-      for (const data of scanner.feed(decoder.decode(value, { stream: true }))) {
+      const decoded = value.byteLength <= budgetBefore
+        ? decoder.decode(value, { stream: true })
+        : decoder.decode(value.subarray(0, budgetBefore), { stream: true });
+      const events = scanner.feed(decoded);
+      if (received > limits.mcpResponseBytes) {
+        throw new Error(`MCP SSE stream exceeded the ${limits.mcpResponseBytes}-byte limit after ${received} bytes`);
+      }
+      for (const data of events) {
         const envelope = accept(data);
         if (envelope) {
           // A server keeping the stream open must not hold the tool: stop consuming.
-          await reader.cancel().catch(() => undefined);
+          cancelDetached(reader.cancel());
           return envelope;
         }
-      }
-      if (received > limits.mcpResponseBytes) {
-        throw new Error(`MCP SSE stream exceeded the ${limits.mcpResponseBytes}-byte limit after ${received} bytes`);
       }
     }
     for (const data of scanner.flush()) {
@@ -312,7 +344,7 @@ async function readSseRpcResponse(
     }
     throw new Error(`MCP SSE stream ended without a matching response for request id ${String(requestId)}.`);
   } catch (err) {
-    await reader.cancel(err).catch(() => undefined);
+    cancelDetached(reader.cancel(err));
     throw err;
   }
 }
