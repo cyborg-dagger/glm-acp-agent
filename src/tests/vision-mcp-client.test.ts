@@ -561,3 +561,49 @@ test("StdioVisionMcpClient accepts many small frames arriving in one large chunk
   assert.deepEqual(await pending, { ok: 1 });
   await client.dispose();
 });
+
+test("StdioVisionMcpClient bounds the retry rediscovery with one shared deadline", async () => {
+  const harness = makeFakeChild();
+  const client = new StdioVisionMcpClient({
+    apiKey: "k",
+    spawn: () => harness.child as never,
+    requestTimeoutMs: 100,
+    maxPages: 5,
+  });
+  const pending = client.callTool("image_analysis", { image: "x" });
+  await visionTick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } }) + "\n");
+  await visionTick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "image_analysis" }] } }) + "\n");
+  await visionTick();
+  // Retryable failure: the retried call must rediscover tools first.
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 3, error: { code: -32601, message: "Tool not found: image_analysis" } }) + "\n");
+
+  // Each retry tools/list page is answered slowly (55ms) with yet another
+  // cursor. Under one shared requestTimeoutMs budget the rediscovery itself
+  // fails at ~100ms; under a fresh per-page budget every page would fit
+  // (5×55ms) and only a later stage would time out (~275ms+), so the elapsed
+  // bound below is what distinguishes the shared deadline from per-page ones.
+  const started = Date.now();
+  const answered = new Set<number>([2]);
+  const pages = setInterval(() => {
+    for (const line of harness.written) {
+      const body = JSON.parse(line) as { id?: number; method: string };
+      if (body.method !== "tools/list" || body.id === undefined || answered.has(body.id)) continue;
+      answered.add(body.id);
+      harness.pushStdout(JSON.stringify({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: { tools: [{ name: "image_analysis" }], nextCursor: `p${answered.size}` },
+      }) + "\n");
+    }
+  }, 55);
+  try {
+    await assert.rejects(pending, /timed out/i);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 220, `rediscovery must fail within one request budget, took ${elapsed}ms`);
+  } finally {
+    clearInterval(pages);
+    await client.dispose();
+  }
+});

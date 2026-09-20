@@ -107,7 +107,11 @@ export class StdioVisionMcpClient implements VisionMcpClient {
       return await this.request("tools/call", { name: resolvedName, arguments: remappedArgs }, `Vision MCP ${toolName}`, signal);
     } catch (err) {
       if (!isVisionRetryableError(err)) throw err;
-      await this.rediscoverTools(signal);
+      // The rediscovery sequence gets one shared budget, not a fresh
+      // requestTimeoutMs per tools/list page: a slow-loris server answering
+      // one page just inside the per-request timeout must not stretch a
+      // single retry across maxPages × requestTimeoutMs.
+      await this.rediscoverTools(signal, this.opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
       const { name: resolvedName2, args: remappedArgs2 } = this.resolveAndRemap(toolName, args);
       return this.request("tools/call", { name: resolvedName2, arguments: remappedArgs2 }, `Vision MCP ${toolName}`, signal);
     }
@@ -359,6 +363,9 @@ export class StdioVisionMcpClient implements VisionMcpClient {
             : nodeSpawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
                 stdio: "ignore",
                 windowsHide: true,
+                // A stuck taskkill helper must not block the awaited dispose
+                // path (process-supervisor.ts bounds the same helper at 1s).
+                timeout: 1_000,
               }).status === 0;
         if (killed) return true;
       } catch {

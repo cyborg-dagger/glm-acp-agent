@@ -947,6 +947,9 @@ function taskkillTree(pid: number): boolean {
   return nodeSpawnSync("taskkill", ["/pid", String(pid), "/t", "/f"], {
     stdio: "ignore",
     windowsHide: true,
+    // A stuck taskkill helper must not block the awaited dispose path
+    // (process-supervisor.ts bounds the same helper at 1s).
+    timeout: 1_000,
   }).status === 0;
 }
 
