@@ -289,7 +289,22 @@ function isValidActiveTurn(value: unknown): value is PersistedActiveTurn {
   return true;
 }
 
-function parsePersistedSession(value: unknown, expectedSessionId: string): PersistedSession | undefined {
+/**
+ * A record that has passed structural validation, kept in its raw on-disk
+ * shape together with the schema version it carried on disk. Validation is
+ * split from migration so `load()` can observe the raw version — the pre-v5
+ * backup gate must know whether the bytes it read were pre-v5 — while
+ * `parsePersistedSession` keeps its validate-and-migrate contract for callers
+ * that only need a valid current-shape record.
+ */
+interface ValidatedRecord {
+  session: PersistedSession;
+  /** Effective on-disk schema version (records without one are v1). */
+  rawVersion: number;
+}
+
+/** Structural validation of a parsed session file. Pure: no repair, no rewrite. */
+function validatePersistedSession(value: unknown, expectedSessionId: string): ValidatedRecord | undefined {
   if (!isRecord(value)) return undefined;
 
   const rawVersion = value.schemaVersion;
@@ -333,16 +348,23 @@ function parsePersistedSession(value: unknown, expectedSessionId: string): Persi
 
   if (value.activeTurn !== undefined && !isValidActiveTurn(value.activeTurn)) return undefined;
 
-  const parsed = value as unknown as PersistedSession;
-  // A pre-v5 record may end in an assistant tool batch whose results were
-  // never recorded — a crash marker. Repair that tail here, while the record
-  // still carries its on-disk schema version: once the spreads below rewrite
-  // it to 5, the legacy branch of `recoverInterruptedSession` can no longer
-  // fire, which would leave the documented repair unreachable through the
-  // real session/load, session/resume and session/fork path. `messages` has
-  // been fully validated above, so the repair only ever appends well-formed
-  // tool results; settled (v5) records are untouched.
-  const settled = version < SESSION_SCHEMA_VERSION ? repairLegacyTail(parsed) : parsed;
+  return { session: value as unknown as PersistedSession, rawVersion: version };
+}
+
+/**
+ * Repair a legacy crash marker and normalize a validated record to the
+ * current schema. Pure: the input is untouched and nothing is written to
+ * disk. A pre-v5 record may end in an assistant tool batch whose results
+ * were never recorded — a crash marker. Repair that tail here, while the
+ * record still carries its on-disk schema version: once the spreads below
+ * rewrite it to 5, the legacy branch of `recoverInterruptedSession` can no
+ * longer fire, which would leave the documented repair unreachable through
+ * the real session/load, session/resume and session/fork path. `messages`
+ * has been fully validated by `validatePersistedSession`, so the repair only
+ * ever appends well-formed tool results; settled (v5) records are untouched.
+ */
+function migratePersistedSession(session: PersistedSession, version: number): PersistedSession {
+  const settled = version < SESSION_SCHEMA_VERSION ? repairLegacyTail(session) : session;
   if (version === 1) {
     return {
       ...settled,
@@ -362,6 +384,12 @@ function parsePersistedSession(value: unknown, expectedSessionId: string): Persi
     ...settled,
     schemaVersion: SESSION_SCHEMA_VERSION,
   };
+}
+
+function parsePersistedSession(value: unknown, expectedSessionId: string): PersistedSession | undefined {
+  const validated = validatePersistedSession(value, expectedSessionId);
+  if (!validated) return undefined;
+  return migratePersistedSession(validated.session, validated.rawVersion);
 }
 
 /** Resolve the directory we write session files to, honouring overrides. */
@@ -524,8 +552,32 @@ export class SessionStore {
     }
   }
 
-  /** Load a session by id, returning undefined if no such file exists. */
+  /**
+   * Load a session by id, returning undefined if no such file exists (or it
+   * cannot be parsed). A valid pre-v5 record is backed up before it is
+   * migrated: every path that persists a migrated record (session/load,
+   * session/resume, session/fork) flows through here first, so this is where
+   * the durable `.pre-v5.bak` rollback copy is guaranteed. A backup that
+   * cannot be written throws, and a `false` (the record vanished between the
+   * read and the backup) is an error too — either way no migrated record is
+   * handed out to be persisted.
+   */
   load(sessionId: string): PersistedSession | undefined {
+    const found = this.readValidatedRecord(sessionId);
+    if (!found) return undefined;
+    if (found.rawVersion < SESSION_SCHEMA_VERSION && !this.backupPreV5(sessionId)) {
+      throw new Error(`Session record disappeared before its pre-v5 backup: ${sessionId}`);
+    }
+    return migratePersistedSession(found.session, found.rawVersion);
+  }
+
+  /**
+   * Read and structurally validate the record for a session, without
+   * repairing, migrating, or writing anything. Shared by `load()` (which
+   * adds the pre-v5 backup gate) and `listMetadata()` (which must stay a
+   * read-only hot path).
+   */
+  private readValidatedRecord(sessionId: string): ValidatedRecord | undefined {
     let path: string;
     try {
       path = this.pathFor(sessionId);
@@ -546,7 +598,7 @@ export class SessionStore {
     }
     // Handle schema migrations. Valid v1 records have no mode or thought
     // level; v2 added mode, v3 added thoughtLevel, and v4 added displayText.
-    return parsePersistedSession(parsed, sessionId);
+    return validatePersistedSession(parsed, sessionId);
   }
 
   /**
@@ -567,8 +619,12 @@ export class SessionStore {
     for (const name of entries) {
       if (!name.endsWith(".json")) continue;
       const sessionId = name.slice(0, -".json".length);
-      const sess = this.load(sessionId);
-      if (!sess) continue;
+      // Listing stays read-only: no backup side effects, and a record whose
+      // backup gate would fail is simply not listed rather than failing the
+      // whole listing.
+      const found = this.readValidatedRecord(sessionId);
+      if (!found) continue;
+      const sess = migratePersistedSession(found.session, found.rawVersion);
       out.push({
         sessionId: sess.sessionId,
         cwd: sess.cwd,

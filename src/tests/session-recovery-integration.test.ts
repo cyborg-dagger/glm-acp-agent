@@ -20,6 +20,7 @@ import {
   CheckpointError,
   INTERRUPTION_NOTE,
   LEGACY_UNKNOWN_TEXT,
+  NOT_STARTED_TEXT,
   UNKNOWN_OUTCOME_TEXT,
 } from "../protocol/session-recovery.js";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
@@ -677,8 +678,260 @@ test("a partial leftover backup is replaced by a good one and recovery is not bl
     assert.equal(backup.activeTurn?.pendingBatch?.calls?.[0]?.state, "started");
     assert.deepEqual(
       readdirSync(dir).filter((name) => name.includes(".tmp")),
-      []
+      [],
     );
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// F4 composition: plain pre-v5 records (no `activeTurn`) reach the persist
+// path with `recovered === persisted`, so the requirePersisted gate never
+// fires for them — the backup must therefore be guaranteed at load time,
+// before any migrated record reaches the disk.
+// ---------------------------------------------------------------------------
+
+test("a plain v4 record fails session/load and session/resume without its backup, and stays byte-identical", async () => {
+  const { store, dir, cleanup } = makeTempStore();
+  try {
+    const sessionId = "c0de0000-c0de-c0de-c0de-c00000000001";
+    writeSessionRecord(dir, legacyDanglingTail(sessionId));
+    const liveRaw = readFileSync(recordPath(dir, sessionId), "utf8");
+    // A directory occupying the backup path makes any backup attempt throw.
+    mkdirSync(backupPath(dir, sessionId));
+
+    const agent = new GlmAcpAgent(createConnectionStub() as never, { sessionStore: store });
+
+    await assert.rejects(
+      () => agent.loadSession({ sessionId, cwd: "/tmp/project", mcpServers: [] }),
+      /back up session/,
+      "session/load must not proceed without the rollback copy",
+    );
+    await assert.rejects(
+      () => agent.resumeSession({ sessionId, cwd: "/tmp/project", mcpServers: [] }),
+      /back up session/,
+      "session/resume must not proceed without the rollback copy",
+    );
+
+    assert.equal(
+      readFileSync(recordPath(dir, sessionId), "utf8"),
+      liveRaw,
+      "the live record must not be replaced without its backup",
+    );
+    assert.deepEqual(
+      readdirSync(dir).filter((name) => name.includes(".tmp")),
+      [],
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("session/load preserves the raw v4 record in the backup before the migrated v5 record replaces it", async () => {
+  const { store, dir, cleanup } = makeTempStore();
+  try {
+    const sessionId = "c0de0000-c0de-c0de-c0de-c00000000002";
+    writeSessionRecord(dir, legacyDanglingTail(sessionId));
+    const rawBefore = readFileSync(recordPath(dir, sessionId), "utf8");
+
+    const agent = new GlmAcpAgent(createConnectionStub() as never, { sessionStore: store });
+    await agent.loadSession({ sessionId, cwd: "/tmp/project", mcpServers: [] });
+
+    // The backup is byte-identical to the original on-disk v4 record: the
+    // dangling tail is still there, unrepaired, and the schema version is
+    // still 4.
+    assert.equal(readFileSync(backupPath(dir, sessionId), "utf8"), rawBefore);
+    const backup = JSON.parse(rawBefore) as RawRecord;
+    assert.equal(backup.schemaVersion, 4);
+    const backupMessages = backup.messages ?? [];
+    assert.equal(
+      backupMessages.some((m) => m.role === "tool"),
+      false,
+      "the backup must keep the original dangling tail, unrepaired",
+    );
+
+    // The live record is the migrated v5 repaired one.
+    const settled = readRawRecord(dir, sessionId);
+    assert.equal(settled.schemaVersion, SESSION_SCHEMA_VERSION);
+    assert.deepEqual(
+      (settled.messages ?? []).map((m) => m.role),
+      ["system", "user", "assistant", "tool"],
+    );
+    assert.equal(
+      (settled.messages ?? []).find((m) => m.role === "tool")?.content,
+      LEGACY_UNKNOWN_TEXT,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("once migrated, a second session/load attempts no new pre-v5 backup", async () => {
+  const { store, dir, cleanup } = makeTempStore();
+  try {
+    const sessionId = "c0de0000-c0de-c0de-c0de-c00000000003";
+    writeSessionRecord(dir, legacyDanglingTail(sessionId));
+
+    const first = new GlmAcpAgent(createConnectionStub() as never, { sessionStore: store });
+    await first.loadSession({ sessionId, cwd: "/tmp/project", mcpServers: [] });
+    assert.equal(existsSync(backupPath(dir, sessionId)), true, "the first load must back the v4 record up");
+
+    // Remove the backup: if any later load attempted a new backup for the
+    // now-v5 record, the file would reappear — its absence after the second
+    // load proves no attempt was made.
+    rmSync(backupPath(dir, sessionId));
+
+    const second = new GlmAcpAgent(createConnectionStub() as never, { sessionStore: store });
+    await second.loadSession({ sessionId, cwd: "/tmp/project", mcpServers: [] });
+
+    assert.equal(
+      existsSync(backupPath(dir, sessionId)),
+      false,
+      "an already-migrated v5 record must not be backed up again",
+    );
+    const settled = readRawRecord(dir, sessionId);
+    assert.equal(settled.schemaVersion, SESSION_SCHEMA_VERSION);
+    assert.deepEqual(
+      (settled.messages ?? []).map((m) => m.role),
+      ["system", "user", "assistant", "tool"],
+      "the settled record must survive the second load unchanged",
+    );
+    assert.deepEqual(
+      readdirSync(dir).filter((name) => name.includes(".tmp")),
+      [],
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+/**
+ * Out of contract for any single writer, but exactly what a crash between
+ * migration writes can leave behind: a v4 record whose settled history ends
+ * in a dangling legacy tool batch AND whose `activeTurn` (validator accepts
+ * it on any version) carries a staged, never-settled pending batch.
+ */
+function legacyTailPlusActiveTurn(sessionId: string): PersistedSession {
+  return {
+    schemaVersion: 4,
+    sessionId,
+    cwd: "/tmp/project",
+    title: "legacy tail plus active turn",
+    updatedAt: "2026-09-20T10:00:00.000Z",
+    model: "glm-5.3",
+    mode: "default",
+    thoughtLevel: "max",
+    messages: [
+      { role: "user", content: "run the tool" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call-legacy",
+            type: "function",
+            function: { name: "write_file", arguments: "{}" },
+          },
+        ],
+      },
+    ],
+    activeTurn: {
+      turnId: "t-legacy",
+      startedAt: "2026-09-20T10:00:05.000Z",
+      messages: [{ role: "user", content: "and then this" }],
+      pendingBatch: {
+        assistant: {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call-new",
+              type: "function",
+              function: { name: "read_file", arguments: "{}" },
+            },
+          ],
+        },
+        calls: [{ id: "call-new", name: "read_file", arguments: "{}", state: "queued" }],
+      },
+    },
+  };
+}
+
+/** Reject any history where a declared tool call is not answered by its result. */
+function assertProviderSettled(messages: GlmMessage[]): void {
+  let pending: string[] | null = null;
+  for (const message of messages) {
+    if (pending) {
+      assert.equal(
+        message.role,
+        "tool",
+        "a declared tool call must be answered before any other message",
+      );
+      pending = pending.filter((id) => id !== message.tool_call_id);
+      if (pending.length === 0) pending = null;
+      continue;
+    }
+    if (message.role === "tool") {
+      assert.fail(`orphan tool result ${message.tool_call_id}`);
+    }
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      pending = message.tool_calls.map((call) => call.id);
+    }
+  }
+  assert.equal(pending, null, "every declared tool call must be answered");
+}
+
+test("a v4 record with both a dangling tail and an active turn settles into provider-valid history", async () => {
+  const { store, dir, cleanup } = makeTempStore();
+  try {
+    const sessionId = "c0de0000-c0de-c0de-c0de-c00000000004";
+    writeSessionRecord(dir, legacyTailPlusActiveTurn(sessionId));
+
+    const conn = createConnectionStub();
+    const { glm, calls } = makeCapturingGlm();
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await initialize(agent);
+    await agent.loadSession({ sessionId, cwd: "/tmp/project", mcpServers: [] });
+
+    // Both user turns replay, in order.
+    assert.deepEqual(replayedUserTexts(conn), ["run the tool", "and then this"]);
+
+    // The composed on-disk record: the legacy tail repaired (unknown outcome),
+    // then the active turn committed (queued call never started), then one
+    // visible interruption note.
+    const settled = readRawRecord(dir, sessionId);
+    assert.equal(settled.activeTurn, undefined);
+    assert.equal(settled.schemaVersion, SESSION_SCHEMA_VERSION);
+    const messages = settled.messages ?? [];
+    assert.deepEqual(
+      messages.map((m) => m.role),
+      ["system", "user", "assistant", "tool", "user", "assistant", "tool", "assistant"],
+      "the repaired tail must precede the committed active turn",
+    );
+    assert.equal(
+      messages.find((m) => m.role === "tool" && m.tool_call_id === "call-legacy")?.content,
+      LEGACY_UNKNOWN_TEXT,
+    );
+    assert.equal(
+      messages.find((m) => m.role === "tool" && m.tool_call_id === "call-new")?.content,
+      NOT_STARTED_TEXT,
+    );
+    assert.equal(
+      messages[messages.length - 1]?.content,
+      INTERRUPTION_NOTE,
+    );
+    assert.equal(countInterruptionNotes({ messages } as RawRecord), 1);
+
+    // A pre-v5 record, so its backup must exist too.
+    const backup = JSON.parse(readFileSync(backupPath(dir, sessionId), "utf8")) as RawRecord;
+    assert.equal(backup.schemaVersion, 4);
+    assert.ok(backup.activeTurn, "the backup must keep the original combined record");
+
+    // And the history handed to the provider is settled.
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] });
+    assert.ok(calls.length >= 1, "expected the prompt to reach the provider");
+    assertProviderSettled(calls[calls.length - 1] ?? []);
   } finally {
     cleanup();
   }
