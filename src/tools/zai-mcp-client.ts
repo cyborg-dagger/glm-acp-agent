@@ -1,3 +1,4 @@
+import { AGENT_NAME, AGENT_VERSION } from "../version.js";
 import { remapArguments, resolveToolName, type DiscoveredTool } from "./mcp-arg-remap.js";
 import {
   collectToolPages,
@@ -111,8 +112,8 @@ export class ZaiMcpClient {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: {
-            name: "glm-acp-agent",
-            version: "1.0.0",
+            name: AGENT_NAME,
+            version: AGENT_VERSION,
           },
         },
       },

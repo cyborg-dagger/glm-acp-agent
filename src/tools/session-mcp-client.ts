@@ -1,5 +1,6 @@
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { McpServer, McpServerHttp, McpServerStdio } from "@agentclientprotocol/sdk";
+import { AGENT_NAME, AGENT_VERSION } from "../version.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "./definitions.js";
 import {
   collectToolPages,
@@ -314,7 +315,7 @@ export class HttpMcpClient implements ConnectedMcpClient {
         params: {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: {},
-          clientInfo: { name: "glm-acp-agent", version: "1.0.0" },
+          clientInfo: { name: AGENT_NAME, version: AGENT_VERSION },
         },
       },
       "initialize",
@@ -587,7 +588,7 @@ export class StdioMcpClient implements ConnectedMcpClient {
         {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: {},
-          clientInfo: { name: "glm-acp-agent", version: "1.0.0" },
+          clientInfo: { name: AGENT_NAME, version: AGENT_VERSION },
         },
         "initialize",
         undefined,

@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { AGENT_NAME, AGENT_VERSION } from "../version.js";
 import { remapArguments, resolveToolName, type DiscoveredTool } from "./mcp-arg-remap.js";
 import {
   collectToolPages,
@@ -222,7 +223,7 @@ export class StdioVisionMcpClient implements VisionMcpClient {
       await this.request("initialize", {
         protocolVersion: MCP_PROTOCOL_VERSION,
         capabilities: {},
-        clientInfo: { name: "glm-acp-agent", version: "1.0.0" },
+        clientInfo: { name: AGENT_NAME, version: AGENT_VERSION },
       }, "Vision MCP initialize", undefined, remaining());
       this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
       await this.rediscoverTools(undefined, remaining());
