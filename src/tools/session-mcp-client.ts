@@ -344,6 +344,11 @@ export class HttpMcpClient implements ConnectedMcpClient {
   }
 
   private async initialize(signal: AbortSignal): Promise<void> {
+    // One deadline spans the initialize request and the initialized
+    // notification: a server that answers initialize and then stalls the
+    // notification must not get a fresh requestTimeoutMs on top of the
+    // handshake budget.
+    const deadline = Date.now() + (this.opts.initializationTimeoutMs ?? DEFAULT_INITIALIZATION_TIMEOUT_MS);
     const response = await this.fetchJsonRpc(
       "initialize",
       {
@@ -359,13 +364,13 @@ export class HttpMcpClient implements ConnectedMcpClient {
       "initialize",
       signal,
       undefined,
-      this.opts.initializationTimeoutMs ?? DEFAULT_INITIALIZATION_TIMEOUT_MS
+      Math.max(1, deadline - Date.now())
     );
     this.mcpSessionId = response.sessionId;
     await this.sendNotification({
       jsonrpc: "2.0",
       method: "notifications/initialized",
-    }, signal);
+    }, signal, Math.max(1, deadline - Date.now()));
   }
 
   private async request(
@@ -392,7 +397,7 @@ export class HttpMcpClient implements ConnectedMcpClient {
     return response.body.result;
   }
 
-  private async sendNotification(body: JsonRpcRequest, signal?: AbortSignal): Promise<void> {
+  private async sendNotification(body: JsonRpcRequest, signal?: AbortSignal, timeoutMs?: number): Promise<void> {
     await this.fetchWithLifecycle({
       method: "POST",
       headers: this.headers("notifications/initialized"),
@@ -403,7 +408,7 @@ export class HttpMcpClient implements ConnectedMcpClient {
         throw new Error(`MCP ${this.server.name} notifications/initialized failed: HTTP ${response.status}: ${diagnostic}`);
       }
       await response.body?.cancel();
-    }, signal, this.opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+    }, signal, timeoutMs ?? this.opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
   }
 
   private async fetchJsonRpc(
@@ -885,12 +890,15 @@ export class StdioMcpClient implements ConnectedMcpClient {
     this.buffer += chunk;
     let idx: number;
     while ((idx = this.buffer.indexOf("\n")) !== -1) {
-      const line = this.buffer.slice(0, idx).trim();
+      // Measure the raw line before any trimming: only the newline or CRLF
+      // delimiter is excluded. Trimming first would let a server pad a small
+      // payload with whitespace and slip it past the frame cap.
+      const raw = this.buffer.slice(0, idx).replace(/\r$/, "");
       this.buffer = this.buffer.slice(idx + 1);
-      if (!line) continue;
       // One over-limit frame fails the connection even when it arrives inside
-      // a chunk that legitimately holds many small frames.
-      if (Buffer.byteLength(line) > this.limits.mcpFrameBytes) {
+      // a chunk that legitimately holds many small frames — or trims to empty:
+      // whitespace-only padding must not dodge the cap either.
+      if (Buffer.byteLength(raw) > this.limits.mcpFrameBytes) {
         this.failConnection(
           new Error(`MCP stdio frame exceeded the ${String(this.limits.mcpFrameBytes)}-byte limit`),
           this.child as ChildProcessWithoutNullStreams,
@@ -898,6 +906,8 @@ export class StdioMcpClient implements ConnectedMcpClient {
         );
         return;
       }
+      const line = raw.trim();
+      if (!line) continue;
       let parsed: JsonRpcResponse;
       try {
         parsed = JSON.parse(line) as JsonRpcResponse;

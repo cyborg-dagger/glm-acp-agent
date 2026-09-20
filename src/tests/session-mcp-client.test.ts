@@ -1035,7 +1035,7 @@ test("HTTP MCP times out when the server stalls after sending headers", async ()
   });
   try {
     const client = new HttpMcpClient({ type: "http", name: "stalled", url: local.url, headers: [] }, { initializationTimeoutMs: 40 });
-    await assert.rejects(() => client.listTools(), /timed out after 40ms/i);
+    await assert.rejects(() => client.listTools(), /timed out after \d+ms/i);
     await client.dispose();
   } finally {
     await local.close();
@@ -1046,7 +1046,38 @@ test("HTTP MCP times out when the server never sends headers", async () => {
   const local = await startLocalServer(() => { /* accept and hold the connection */ });
   try {
     const client = new HttpMcpClient({ type: "http", name: "silent", url: local.url, headers: [] }, { initializationTimeoutMs: 40 });
-    await assert.rejects(() => client.listTools(), /timed out after 40ms/i);
+    await assert.rejects(() => client.listTools(), /timed out after \d+ms/i);
+    await client.dispose();
+  } finally {
+    await local.close();
+  }
+});
+
+test("HTTP MCP fails a stalled initialized notification within the initialization budget", async () => {
+  const local = await startLocalServer((req, res, raw) => {
+    if (req.method !== "POST" || !raw) { res.writeHead(404); res.end(); return; }
+    const body = JSON.parse(raw) as { method?: string; id?: number };
+    if (body.method === "initialize") {
+      res.writeHead(200, { "content-type": "application/json", "MCP-Session-Id": "local-session" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: {} }));
+      return;
+    }
+    // notifications/initialized: accept the request and never answer. A fresh
+    // per-request timeout would only fire after requestTimeoutMs; the shared
+    // initialization deadline must bound the whole handshake.
+  });
+  try {
+    const client = new HttpMcpClient({ type: "http", name: "stalled-notification", url: local.url, headers: [] }, {
+      initializationTimeoutMs: 20,
+      requestTimeoutMs: 120,
+    });
+    const started = Date.now();
+    await assert.rejects(() => client.listTools(), /timed out after \d+ms/i);
+    const elapsed = Date.now() - started;
+    assert.ok(
+      elapsed < 100,
+      `the 20ms initialization budget must bound the handshake, took ${String(elapsed)}ms (requestTimeoutMs is 120ms)`
+    );
     await client.dispose();
   } finally {
     await local.close();
@@ -1165,6 +1196,64 @@ test("stdio MCP fails the connection on a single complete frame over the cap", a
   const listPromise = client.listTools();
   await tick();
   harness.pushStdout(`${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { blob: "y".repeat(500) } })}\n`);
+  await assert.rejects(listPromise, /frame exceeded/i);
+  assert.ok(harness.getKillCount() >= 1);
+  await client.dispose();
+});
+
+test("stdio MCP excludes the CRLF delimiter from the raw frame measurement", async () => {
+  const harness = makeFakeChild();
+  const { written, pushStdout } = harness;
+  const cap = 346;
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => harness.child as never, limits: tinyLimits(cap) });
+  const listPromise = client.listTools();
+  await tick();
+  const init = JSON.parse(written[0]?.trim() ?? "{}") as { id: number };
+  const payload = JSON.stringify({ jsonrpc: "2.0", id: init.id, result: {} });
+  const pad = " ".repeat((cap - Buffer.byteLength(payload)) / 2);
+  // The raw payload sits exactly at the cap, so this passes only when the
+  // measurement excludes the \r of the \r\n delimiter (and not one byte more).
+  assert.equal(Buffer.byteLength(payload) + 2 * pad.length, cap);
+  pushStdout(`${pad}${payload}${pad}\r\n`);
+  await tick();
+  const list = JSON.parse(written[2]?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: list.id, result: { tools: [] } }) + "\n");
+  await assert.doesNotReject(listPromise);
+  await client.dispose();
+});
+
+for (const eol of ["\n", "\r\n"] as const) {
+  test(`stdio MCP measures the raw frame so whitespace padding fails the cap (${eol === "\n" ? "LF" : "CRLF"})`, async () => {
+    const harness = makeFakeChild();
+    const client = new StdioMcpClient(stdioServer(), {
+      spawn: () => harness.child as never,
+      limits: tinyLimits(100),
+      requestTimeoutMs: 250,
+    });
+    const listPromise = client.listTools();
+    await tick();
+    // Review repro: a 345-byte frame built from a small valid response padded
+    // with whitespace was accepted under a 100-byte cap because the frame was
+    // trimmed before it was measured. The raw line — only the newline or CRLF
+    // delimiter excluded — must govern the limit.
+    const payload = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [] } });
+    const raw = `${" ".repeat(149)}${payload}${" ".repeat(150)}`;
+    assert.ok(Buffer.byteLength(raw) > 100, "padding must push the raw frame over the cap");
+    harness.pushStdout(`${raw}${eol}`);
+    await assert.rejects(listPromise, /frame exceeded/i);
+    assert.ok(harness.getKillCount() >= 1);
+    await client.dispose();
+  });
+}
+
+test("stdio MCP fails a whitespace-only frame that exceeds the cap", async () => {
+  const harness = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => harness.child as never, limits: tinyLimits(100) });
+  const listPromise = client.listTools();
+  await tick();
+  // A frame that trims to empty is still wire bytes: it must hit the same raw
+  // cap as any other complete frame instead of being skipped as a blank line.
+  harness.pushStdout(`${" ".repeat(150)}\n`);
   await assert.rejects(listPromise, /frame exceeded/i);
   assert.ok(harness.getKillCount() >= 1);
   await client.dispose();
