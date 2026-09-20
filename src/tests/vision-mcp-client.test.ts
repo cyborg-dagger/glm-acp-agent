@@ -475,3 +475,43 @@ test("StdioVisionMcpClient rejects a rediscovered catalog with duplicate tool na
   await assert.rejects(callPromise, /duplicate tool name/i);
   await client.dispose();
 });
+
+// --- T11: stdio frame caps -------------------------------------------------------
+
+import { readResourceLimits } from "../tools/resource-limits.js";
+
+const visionTick = () => new Promise((r) => setImmediate(r));
+
+test("StdioVisionMcpClient fails the connection on an over-limit stdio frame", async () => {
+  const harness = makeFakeChild();
+  const client = new StdioVisionMcpClient({
+    apiKey: "k",
+    spawn: () => harness.child as never,
+    limits: { ...readResourceLimits({}), mcpFrameBytes: 200 },
+  });
+  const pending = client.callTool("analyze", { image: "x" });
+  await visionTick();
+  harness.pushStdout(`${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { blob: "z".repeat(500) } })}\n`);
+  await assert.rejects(pending, /frame exceeded/i);
+  assert.ok(harness.getKillCount() >= 1, "the owned child must be terminated");
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient accepts many small frames arriving in one large chunk", async () => {
+  const harness = makeFakeChild();
+  const client = new StdioVisionMcpClient({
+    apiKey: "k",
+    spawn: () => harness.child as never,
+    limits: { ...readResourceLimits({}), mcpFrameBytes: 200 },
+  });
+  const pending = client.callTool("analyze", { image: "x" });
+  await visionTick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
+  await visionTick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [] } }) + "\n");
+  await visionTick();
+  const noise = Array.from({ length: 30 }, (_, i) => JSON.stringify({ jsonrpc: "2.0", id: 100 + i, result: null })).join("\n");
+  harness.pushStdout(`${noise}\n${JSON.stringify({ jsonrpc: "2.0", id: 3, result: { ok: 1 } })}\n`);
+  assert.deepEqual(await pending, { ok: 1 });
+  await client.dispose();
+});

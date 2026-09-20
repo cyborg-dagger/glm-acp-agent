@@ -6,8 +6,13 @@ import {
   DEFAULT_MCP_MAX_SCHEMA_BYTES,
   DEFAULT_MCP_MAX_TOOLS,
 } from "./mcp-pagination.js";
+import { createDeadline, readDiagnosticBody, readRpcResponse } from "./mcp-transport.js";
+import { readResourceLimits, type ResourceLimits } from "./resource-limits.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+/** One deadline for initialization plus every tools/list page. */
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 120_000;
 
 export const ZAI_WEB_SEARCH_MCP_ENDPOINT =
   "https://api.z.ai/api/mcp/web_search_prime/mcp";
@@ -44,17 +49,37 @@ export interface ZaiMcpClientOptions {
   maxPages?: number;
   maxTools?: number;
   maxSchemaBytes?: number;
+  /** Maximum time for a single tools/call request. */
+  requestTimeoutMs?: number;
+  /** Maximum time for one discovery operation: initialization plus every tools/list page. */
+  discoveryTimeoutMs?: number;
+  /** Resource limits applied to response bodies. */
+  limits?: ResourceLimits;
 }
 
 export class ZaiMcpClient {
   private sessions = new Map<string, { sessionId?: string; initialized: boolean; tools: DiscoveredTool[] }>();
-  private nextId = 1;
+  /** JSON-RPC ids only need uniqueness within one server session, so they are counted per session key. */
+  private ids = new Map<string, number>();
+  private limitsCache: ResourceLimits | null = null;
 
   constructor(
     private fetchImpl: typeof fetch = ((...args: Parameters<typeof fetch>) =>
       fetch(...args)) as typeof fetch,
-    private limits: ZaiMcpClientOptions = {}
+    private opts: ZaiMcpClientOptions = {}
   ) {}
+
+  private get resourceLimits(): ResourceLimits {
+    this.limitsCache ??= this.opts.limits ?? readResourceLimits();
+    return this.limitsCache;
+  }
+
+  private nextId(call: ZaiMcpToolCall): number {
+    const key = `${call.endpoint}\n${call.apiKey}`;
+    const id = (this.ids.get(key) ?? 0) + 1;
+    this.ids.set(key, id);
+    return id;
+  }
 
   async callTool(call: ZaiMcpToolCall): Promise<unknown> {
     try {
@@ -68,33 +93,48 @@ export class ZaiMcpClient {
   }
 
   private async callToolInternal(call: ZaiMcpToolCall): Promise<unknown> {
-    const session = await this.ensureInitialized(call);
+    // Two bounded stages: joining initialization (plus discovery) counts as one
+    // deadline, then the tool call runs under its own request deadline.
+    const discoveryDeadline = createDeadline(
+      call.signal,
+      this.opts.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS,
+    );
+    let session: { sessionId?: string; initialized: boolean; tools: DiscoveredTool[] };
+    try {
+      session = await this.ensureInitialized(call, discoveryDeadline.signal);
+    } finally {
+      discoveryDeadline.dispose();
+    }
     const toolNames = session.tools.map((t) => t.name);
     const resolvedName = resolveToolName(call.toolName, toolNames, call.endpoint);
     const toolSchema = session.tools.find((t) => t.name === resolvedName);
     const remappedArgs = remapArguments(call.arguments, toolSchema?.properties ?? []);
-    const result = await this.sendRequest(
-      call.endpoint,
-      call.apiKey,
-      "tools/call",
-      {
-        jsonrpc: "2.0",
-        id: this.nextId++,
-        method: "tools/call",
-        params: {
-          name: resolvedName,
-          arguments: remappedArgs,
+    const callDeadline = createDeadline(call.signal, this.opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+    try {
+      return await this.sendRequest(
+        call.endpoint,
+        call.apiKey,
+        "tools/call",
+        {
+          jsonrpc: "2.0",
+          id: this.nextId(call),
+          method: "tools/call",
+          params: {
+            name: resolvedName,
+            arguments: remappedArgs,
+          },
         },
-      },
-      "tools/call",
-      call.signal,
-      session.sessionId,
-      resolvedName
-    );
-    return result;
+        "tools/call",
+        callDeadline.signal,
+        session.sessionId,
+        resolvedName
+      );
+    } finally {
+      callDeadline.dispose();
+    }
   }
 
-  private async ensureInitialized(call: ZaiMcpToolCall) {
+  private async ensureInitialized(call: ZaiMcpToolCall, signal?: AbortSignal) {
     const cacheKey = `${call.endpoint}\n${call.apiKey}`;
     const cached = this.sessions.get(cacheKey);
     if (cached?.initialized) return cached;
@@ -105,7 +145,7 @@ export class ZaiMcpClient {
       "initialize",
       {
         jsonrpc: "2.0",
-        id: this.nextId++,
+        id: this.nextId(call),
         method: "initialize",
         params: {
           protocolVersion: MCP_PROTOCOL_VERSION,
@@ -117,7 +157,7 @@ export class ZaiMcpClient {
         },
       },
       "initialize",
-      call.signal
+      signal
     );
 
     const sessionId = initializeResponse.sessionId;
@@ -129,15 +169,14 @@ export class ZaiMcpClient {
         method: "notifications/initialized",
       },
       "notifications/initialized",
-      call.signal,
+      signal,
       sessionId
     );
 
     const tools = await this.discoverTools(
-      call.endpoint,
-      call.apiKey,
+      call,
       sessionId,
-      call.signal
+      signal
     );
     const session = { sessionId, initialized: true, tools };
     this.sessions.set(cacheKey, session);
@@ -145,24 +184,23 @@ export class ZaiMcpClient {
   }
 
   private async discoverTools(
-    endpoint: string,
-    apiKey: string,
+    call: ZaiMcpToolCall,
     sessionId: string | undefined,
     signal?: AbortSignal
   ): Promise<DiscoveredTool[]> {
     const rawTools = await collectToolPages({
       signal: signal ?? new AbortController().signal,
-      maxPages: this.limits.maxPages ?? DEFAULT_MCP_MAX_PAGES,
-      maxTools: this.limits.maxTools ?? DEFAULT_MCP_MAX_TOOLS,
-      maxSchemaBytes: this.limits.maxSchemaBytes ?? DEFAULT_MCP_MAX_SCHEMA_BYTES,
+      maxPages: this.opts.maxPages ?? DEFAULT_MCP_MAX_PAGES,
+      maxTools: this.opts.maxTools ?? DEFAULT_MCP_MAX_TOOLS,
+      maxSchemaBytes: this.opts.maxSchemaBytes ?? DEFAULT_MCP_MAX_SCHEMA_BYTES,
       requestPage: async (cursor, pageSignal) => {
         const response = await this.fetchJsonRpc(
-          endpoint,
-          apiKey,
+          call.endpoint,
+          call.apiKey,
           "tools/list",
           {
             jsonrpc: "2.0",
-            id: this.nextId++,
+            id: this.nextId(call),
             method: "tools/list",
             ...(cursor === undefined ? {} : { params: { cursor } }),
           },
@@ -177,7 +215,7 @@ export class ZaiMcpClient {
       name: tool.name,
       properties: tool.inputSchema?.properties ? Object.keys(tool.inputSchema.properties) : [],
     }));
-    assertUniqueToolNames(tools, endpoint);
+    assertUniqueToolNames(tools, call.endpoint);
     return tools;
   }
 
@@ -219,7 +257,7 @@ export class ZaiMcpClient {
       signal,
     });
     if (!response.ok) {
-      const text = await response.text();
+      const text = await readDiagnosticBody(response, this.resourceLimits, signal ?? new AbortController().signal);
       throw new Error(formatMcpError(mcpMethod, response.status, text));
     }
   }
@@ -234,24 +272,25 @@ export class ZaiMcpClient {
     sessionId?: string,
     mcpName?: string
   ): Promise<{ body: JsonRpcResponse; sessionId?: string }> {
+    const requestId = body.id ?? 0;
     const response = await this.fetchImpl(endpoint, {
       method: "POST",
       headers: buildHeaders(apiKey, mcpMethod, sessionId, mcpName),
       body: JSON.stringify(body),
       signal,
     });
-    const text = await response.text();
     if (!response.ok) {
+      const text = await readDiagnosticBody(response, this.resourceLimits, signal ?? new AbortController().signal);
       throw new Error(formatMcpError(stage, response.status, text));
     }
 
-    const parsed = parseMcpResponse(text, response.headers.get("Content-Type") ?? "");
+    const parsed = await readRpcResponse(response, requestId, this.resourceLimits, signal ?? new AbortController().signal);
     if (parsed.error) {
       throw new Error(formatJsonRpcError(stage, parsed.error));
     }
 
     return {
-      body: parsed,
+      body: parsed as unknown as JsonRpcResponse,
       sessionId: response.headers.get("MCP-Session-Id") ?? undefined,
     };
   }
@@ -312,31 +351,6 @@ function buildHeaders(
   if (sessionId) headers.set("MCP-Session-Id", sessionId);
   if (mcpName) headers.set("Mcp-Name", mcpName);
   return headers;
-}
-
-function parseMcpResponse(text: string, contentType: string): JsonRpcResponse {
-  if (!text.trim()) {
-    throw new Error("MCP response was empty.");
-  }
-  if (contentType.toLowerCase().includes("text/event-stream")) {
-    return parseSseJsonRpc(text);
-  }
-  return JSON.parse(text) as JsonRpcResponse;
-}
-
-function parseSseJsonRpc(text: string): JsonRpcResponse {
-  const dataLines: string[] = [];
-  for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith("data:")) {
-      dataLines.push(line.slice("data:".length).trimStart());
-    }
-  }
-  for (const data of dataLines) {
-    if (!data || data === "[DONE]") continue;
-    const parsed = JSON.parse(data) as JsonRpcResponse;
-    if (parsed.result !== undefined || parsed.error !== undefined) return parsed;
-  }
-  throw new Error("MCP SSE response did not contain a JSON-RPC result.");
 }
 
 function formatMcpError(stage: string, status: number, body: string): string {

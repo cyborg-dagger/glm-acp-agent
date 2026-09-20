@@ -574,6 +574,7 @@ test("read_file labels a bounded partial line without reporting an impossible ra
   const conn = createConnectionStub();
   const limits: ResourceLimits = {
     toolResultBytes: 262_144, fileReadBytes: 5, listEntries: 2000, listBytes: 262_144,
+    mcpResponseBytes: 8 * 1024 * 1024, mcpEventBytes: 8 * 1024 * 1024, mcpFrameBytes: 8 * 1024 * 1024,
     fsConcurrency: 16,
   };
   const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir, () => "default", () => undefined, limits);
@@ -620,6 +621,7 @@ test("read_file bounds a real large local result before it can enter model histo
   const conn = createConnectionStub();
   const limits: ResourceLimits = {
     toolResultBytes: 128, fileReadBytes: 8 * 1024 * 1024, listEntries: 2000, listBytes: 262_144,
+    mcpResponseBytes: 8 * 1024 * 1024, mcpEventBytes: 8 * 1024 * 1024, mcpFrameBytes: 8 * 1024 * 1024,
     fsConcurrency: 16,
   };
   const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir, () => "default", () => undefined, limits);
@@ -1597,6 +1599,7 @@ test("list_files caps an oversized empty-directory header and marks it truncated
   const conn = createConnectionStub();
   const limits: ResourceLimits = {
     toolResultBytes: 262_144, fileReadBytes: 8 * 1024 * 1024, listEntries: 2000, listBytes: 128,
+    mcpResponseBytes: 8 * 1024 * 1024, mcpEventBytes: 8 * 1024 * 1024, mcpFrameBytes: 8 * 1024 * 1024,
     fsConcurrency: 16,
   };
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir, () => "default", () => undefined, limits);

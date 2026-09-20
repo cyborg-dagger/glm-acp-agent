@@ -512,3 +512,48 @@ test("ZaiMcpClient rejects a discovered catalog with duplicate tool names", asyn
     /duplicate tool name/i,
   );
 });
+
+// --- T11: bounded, cancellable MCP transport -------------------------------------
+
+test("ZaiMcpClient times out a stalled SSE initialization body", async () => {
+  const stalled = new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: {"jsonrpc":"2.0","id":1,"res`));
+        // never closes
+      },
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  );
+  const client = new ZaiMcpClient(async () => stalled, { discoveryTimeoutMs: 30 });
+  await assert.rejects(
+    () => client.callTool({ endpoint: "https://z.example/mcp", toolName: "search", arguments: {}, apiKey: "k" }),
+    /timed out after 30ms/i,
+  );
+});
+
+test("ZaiMcpClient skips SSE responses with a wrong id and returns the matching one", async () => {
+  let id = 0;
+  const client = new ZaiMcpClient(async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string; id?: number };
+    if (body.method === "initialize") {
+      return jsonResponse({ jsonrpc: "2.0", id: body.id, result: {} }, { sessionId: "sess" });
+    }
+    if (body.method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+    if (body.method === "tools/list") {
+      // A response for someone else's request arrives first and must be skipped.
+      id = body.id ?? 0;
+      return new Response(
+        `data: ${JSON.stringify({ jsonrpc: "2.0", id: body.id === 2 ? 41 : 99, result: { tools: [{ name: "wrong" }] } })}\n\n` +
+          `data: ${JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "search" }] } })}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }
+    return jsonResponse({ jsonrpc: "2.0", id: body.id, result: { matched: true } });
+  }, { requestTimeoutMs: 2_000, discoveryTimeoutMs: 2_000 });
+  const result = await client.callTool({ endpoint: "https://z.example/mcp", toolName: "search", arguments: {}, apiKey: "k" });
+  assert.deepEqual(result, { matched: true });
+  assert.ok(id > 0);
+});

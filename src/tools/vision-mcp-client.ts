@@ -1,5 +1,7 @@
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { Buffer } from "node:buffer";
 import { remapArguments, resolveToolName, type DiscoveredTool } from "./mcp-arg-remap.js";
+import { readResourceLimits, type ResourceLimits } from "./resource-limits.js";
 import {
   collectToolPages,
   assertValidToolPage,
@@ -31,6 +33,8 @@ export interface StdioVisionMcpClientOptions {
   maxPages?: number;
   maxTools?: number;
   maxSchemaBytes?: number;
+  /** Resource limits; `mcpFrameBytes` bounds one newline-delimited stdio frame. */
+  limits?: ResourceLimits;
   /** Platform override for tests. */
   platform?: NodeJS.Platform;
   /** Windows command interpreter override for tests. */
@@ -69,8 +73,14 @@ export class StdioVisionMcpClient implements VisionMcpClient {
   private exitReason: string | null = null;
   private discoveredTools: DiscoveredTool[] = [];
   private stderrTail = "";
+  private limitsCache: ResourceLimits | null = null;
 
   constructor(private opts: StdioVisionMcpClientOptions) {}
+
+  private get limits(): ResourceLimits {
+    this.limitsCache ??= this.opts.limits ?? readResourceLimits();
+    return this.limitsCache;
+  }
 
   async callTool(toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     if (signal?.aborted) throw new Error("Vision MCP call cancelled");
@@ -299,6 +309,7 @@ export class StdioVisionMcpClient implements VisionMcpClient {
     this.exited = true;
     this.exitReason = error.message;
     this.initialized = null;
+    this.buffer = "";
     this.rejectAllPending(error);
     if (kill) {
       this.terminateChild(child);
@@ -388,6 +399,14 @@ export class StdioVisionMcpClient implements VisionMcpClient {
       const line = this.buffer.slice(0, idx).trim();
       this.buffer = this.buffer.slice(idx + 1);
       if (!line) continue;
+      if (Buffer.byteLength(line) > this.limits.mcpFrameBytes) {
+        this.failConnection(
+          new Error(`Vision MCP stdio frame exceeded the ${String(this.limits.mcpFrameBytes)}-byte limit`),
+          this.child as ChildProcessWithoutNullStreams,
+          true,
+        );
+        return;
+      }
       let parsed: { id?: number; result?: unknown; error?: { code?: number; message?: string } };
       try {
         parsed = JSON.parse(line) as typeof parsed;
@@ -403,6 +422,13 @@ export class StdioVisionMcpClient implements VisionMcpClient {
       } else {
         pending.resolve(parsed.result);
       }
+    }
+    if (Buffer.byteLength(this.buffer) > this.limits.mcpFrameBytes && this.child) {
+      this.failConnection(
+        new Error(`Vision MCP stdio frame exceeded the ${String(this.limits.mcpFrameBytes)}-byte limit`),
+        this.child,
+        true,
+      );
     }
   }
 }

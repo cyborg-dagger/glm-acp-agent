@@ -191,6 +191,9 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_READ_FILE_LIMIT_BYTES` | No | `8388608` | Maximum local bytes consumed while reading a page or whole file for `edit_file`. A bounded scan may not know the total line count. |
 | `ACP_GLM_LIST_FILES_MAX_ENTRIES` | No | `2000` | Maximum entries collected by `list_files`; larger directories return a disclosed subset. |
 | `ACP_GLM_LIST_FILES_LIMIT_BYTES` | No | `262144` | Maximum bytes assembled for a `list_files` result before its truncation marker. |
+| `ACP_GLM_MCP_RESPONSE_LIMIT_BYTES` | No | `8388608` | Maximum bytes read from one MCP HTTP response body (JSON or SSE stream). Oversized or stalled bodies are rejected and the connection is cancelled. Invalid values fall back to the default with a stderr warning. |
+| `ACP_GLM_MCP_EVENT_LIMIT_BYTES` | No | `8388608` | Maximum UTF-8 bytes for a single MCP SSE event payload; an over-limit event fails the request instead of being truncated. |
+| `ACP_GLM_MCP_FRAME_LIMIT_BYTES` | No | `8388608` | Maximum UTF-8 bytes for one newline-delimited stdio JSON-RPC frame; an over-limit frame fails the MCP server connection. |
 | `ACP_GLM_THINKING` | No | auto-detected | Force thinking mode `true` / `false` |
 | `ACP_GLM_STREAM_THINKING` | No | `true` | Forward reasoning tokens to the client as `agent_thought_chunk`; set `false` to keep reasoning off the wire (the model still thinks — only the client-side stream is silenced) |
 | `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |

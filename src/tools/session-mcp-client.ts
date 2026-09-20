@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { Buffer } from "node:buffer";
 import type { McpServer, McpServerHttp, McpServerStdio } from "@agentclientprotocol/sdk";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "./definitions.js";
 import {
@@ -8,11 +9,15 @@ import {
   DEFAULT_MCP_MAX_SCHEMA_BYTES,
   DEFAULT_MCP_MAX_TOOLS,
 } from "./mcp-pagination.js";
+import { createDeadline, readDiagnosticBody, readRpcResponse } from "./mcp-transport.js";
+import { readResourceLimits, type ResourceLimits } from "./resource-limits.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 /** Generous: a cold `npx -y` fetch on Windows Defender can take well over a minute. */
 const DEFAULT_INITIALIZATION_TIMEOUT_MS = 120_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+/** One deadline for the whole discovery operation: initialization plus every page. */
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 120_000;
 const STDERR_TAIL_LIMIT = 16_384;
 const STDERR_MESSAGE_LIMIT = 2_000;
 /** Extensionless launchers that resolve to a `.cmd` shim on Windows, which Node cannot spawn directly. */
@@ -173,6 +178,17 @@ function createClient(server: McpServer): ConnectedMcpClient {
   return new StdioMcpClient(server);
 }
 
+export interface HttpMcpClientOptions {
+  /** Maximum time for the initialize handshake. */
+  initializationTimeoutMs?: number;
+  /** Maximum time for a single tools/call request. */
+  requestTimeoutMs?: number;
+  /** Maximum time for one discovery operation: initialization plus every tools/list page. */
+  discoveryTimeoutMs?: number;
+  /** Resource limits applied to response bodies. Defaults to the environment-derived limits. */
+  limits?: ResourceLimits;
+}
+
 export class HttpMcpClient implements ConnectedMcpClient {
   private nextId = 1;
   private initialized: Promise<void> | null = null;
@@ -181,31 +197,54 @@ export class HttpMcpClient implements ConnectedMcpClient {
   private mcpSessionId: string | undefined;
   private activeRequests = new Set<AbortController>();
   private disposed = false;
+  private limitsCache: ResourceLimits | null = null;
 
-  constructor(private server: McpServerHttp & { type: "http" }) {}
+  constructor(
+    private server: McpServerHttp & { type: "http" },
+    private opts: HttpMcpClientOptions = {}
+  ) {}
+
+  private get limits(): ResourceLimits {
+    this.limitsCache ??= this.opts.limits ?? readResourceLimits();
+    return this.limitsCache;
+  }
 
   async listTools(signal?: AbortSignal): Promise<McpTool[]> {
-    await this.awaitInitialization(signal);
-    return collectToolPages({
-      signal: signal ?? new AbortController().signal,
-      maxPages: DEFAULT_MCP_MAX_PAGES,
-      maxTools: DEFAULT_MCP_MAX_TOOLS,
-      maxSchemaBytes: DEFAULT_MCP_MAX_SCHEMA_BYTES,
-      requestPage: async (cursor, pageSignal) => {
-        const result = await this.request(
-          "tools/list",
-          cursor === undefined ? {} : { cursor },
-          "tools/list",
-          pageSignal,
-        );
-        return extractToolPage(result);
-      },
-    });
+    // One deadline spans initialization and every page; a per-page reset would
+    // let a slow server hold discovery open indefinitely.
+    const deadline = createDeadline(signal, this.opts.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+    try {
+      await this.awaitInitialization(deadline.signal);
+      // `return await` keeps the finally-block (and the deadline alive) until
+      // every page has settled; a bare `return` would dispose the deadline
+      // while discovery is still running.
+      return await collectToolPages({
+        signal: deadline.signal,
+        maxPages: DEFAULT_MCP_MAX_PAGES,
+        maxTools: DEFAULT_MCP_MAX_TOOLS,
+        maxSchemaBytes: DEFAULT_MCP_MAX_SCHEMA_BYTES,
+        requestPage: async (cursor, pageSignal) => {
+          const result = await this.request(
+            "tools/list",
+            cursor === undefined ? {} : { cursor },
+            "tools/list",
+            pageSignal,
+          );
+          return extractToolPage(result);
+        },
+      });
+    } finally {
+      deadline.dispose();
+    }
   }
 
   async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+    // Two bounded stages for a fresh invocation that joins initialization:
+    // the shared initialize handshake has its own deadline, then the call runs
+    // under its own request deadline.
     await this.awaitInitialization(signal);
-    return this.request("tools/call", { name, arguments: args }, "tools/call", signal, name);
+    return this.request("tools/call", { name, arguments: args }, "tools/call", signal, name,
+      this.opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
   }
 
   async dispose(): Promise<void> {
@@ -318,7 +357,9 @@ export class HttpMcpClient implements ConnectedMcpClient {
         },
       },
       "initialize",
-      signal
+      signal,
+      undefined,
+      this.opts.initializationTimeoutMs ?? DEFAULT_INITIALIZATION_TIMEOUT_MS
     );
     this.mcpSessionId = response.sessionId;
     await this.sendNotification({
@@ -332,7 +373,8 @@ export class HttpMcpClient implements ConnectedMcpClient {
     params: Record<string, unknown>,
     stage: string,
     signal?: AbortSignal,
-    mcpName?: string
+    mcpName?: string,
+    timeoutMs?: number
   ): Promise<unknown> {
     const response = await this.fetchJsonRpc(
       method,
@@ -344,7 +386,8 @@ export class HttpMcpClient implements ConnectedMcpClient {
       },
       stage,
       signal,
-      mcpName
+      mcpName,
+      timeoutMs
     );
     return response.body.result;
   }
@@ -354,12 +397,13 @@ export class HttpMcpClient implements ConnectedMcpClient {
       method: "POST",
       headers: this.headers("notifications/initialized"),
       body: JSON.stringify(body),
-    }, async response => {
+    }, async (response, deadlineSignal) => {
       if (!response.ok) {
-        throw new Error(`MCP ${this.server.name} notifications/initialized failed: HTTP ${response.status}: ${await response.text()}`);
+        const diagnostic = await readDiagnosticBody(response, this.limits, deadlineSignal);
+        throw new Error(`MCP ${this.server.name} notifications/initialized failed: HTTP ${response.status}: ${diagnostic}`);
       }
       await response.body?.cancel();
-    }, signal);
+    }, signal, this.opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
   }
 
   private async fetchJsonRpc(
@@ -367,42 +411,55 @@ export class HttpMcpClient implements ConnectedMcpClient {
     body: JsonRpcRequest,
     stage: string,
     signal?: AbortSignal,
-    mcpName?: string
+    mcpName?: string,
+    timeoutMs?: number
   ): Promise<{ body: JsonRpcResponse; sessionId?: string }> {
+    const requestId = body.id ?? 0;
     return this.fetchWithLifecycle({
       method: "POST",
       headers: this.headers(mcpMethod, mcpName),
       body: JSON.stringify(body),
-    }, async response => {
-      const text = await response.text();
+    }, async (response, deadlineSignal) => {
       if (!response.ok) {
-        throw new Error(`MCP ${this.server.name} ${stage} failed: HTTP ${response.status}: ${text}`);
+        const diagnostic = await readDiagnosticBody(response, this.limits, deadlineSignal);
+        throw new Error(`MCP ${this.server.name} ${stage} failed: HTTP ${response.status}: ${diagnostic}`);
       }
-      const parsed = parseMcpResponse(text, response.headers.get("Content-Type") ?? "");
+      const parsed = await readRpcResponse(response, requestId, this.limits, deadlineSignal);
       if (parsed.error) {
         throw new Error(`MCP ${this.server.name} ${stage} failed: ${JSON.stringify(parsed.error)}`);
       }
       return {
-        body: parsed,
+        body: parsed as unknown as JsonRpcResponse,
         sessionId: response.headers.get("MCP-Session-Id") ?? undefined,
       };
-    }, signal);
+    }, signal, timeoutMs);
   }
 
   private async fetchWithLifecycle<T>(
-    init: RequestInit, consume: (response: Response) => Promise<T>, signal?: AbortSignal,
+    init: RequestInit,
+    consume: (response: Response, signal: AbortSignal) => Promise<T>,
+    signal?: AbortSignal,
+    timeoutMs?: number,
   ): Promise<T> {
     if (this.disposed) throw new Error(`MCP ${this.server.name} client disposed`);
     const controller = new AbortController();
     this.activeRequests.add(controller);
-    const onAbort = () => controller.abort();
+    // Propagate the caller's abort reason: a deadline's "timed out after …ms"
+    // must survive the hop into the fetch's signal.
+    const onAbort = () => controller.abort(signal?.reason);
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) controller.abort();
+    const deadline = timeoutMs === undefined ? undefined : createDeadline(controller.signal, timeoutMs);
+    const effectiveSignal = deadline?.signal ?? controller.signal;
     try {
-      const response = await fetch(this.server.url, { ...init, signal: controller.signal });
-      // Keep cancellation and disposal ownership until body consumption ends.
-      return await consume(response);
+      const response = await fetch(this.server.url, { ...init, signal: effectiveSignal });
+      // Keep cancellation and disposal ownership until body consumption ends;
+      // the deadline covers the fetch and the consumption of its body.
+      return await consume(response, effectiveSignal);
+    } catch (err) {
+      throw mapTransportError(err, controller.signal, deadline, timeoutMs);
     } finally {
+      deadline?.dispose();
       signal?.removeEventListener("abort", onAbort);
       this.activeRequests.delete(controller);
     }
@@ -428,6 +485,8 @@ export interface StdioMcpClientOptions {
   initializationTimeoutMs?: number;
   /** Maximum time for an individual JSON-RPC request. */
   requestTimeoutMs?: number;
+  /** Resource limits; `mcpFrameBytes` bounds one newline-delimited stdio frame. */
+  limits?: ResourceLimits;
   /** Platform override for tests. */
   platform?: NodeJS.Platform;
   /** Windows command interpreter override for tests. */
@@ -465,6 +524,7 @@ export class StdioMcpClient implements ConnectedMcpClient {
   private disposed = false;
   private secrets: string[] = [];
   private readonly killProcessTree: (pid: number) => boolean;
+  private limitsCache: ResourceLimits | null = null;
 
   constructor(
     private server: McpServerStdio,
@@ -473,10 +533,18 @@ export class StdioMcpClient implements ConnectedMcpClient {
     this.killProcessTree = opts.killProcessTree ?? taskkillTree;
   }
 
+  private get limits(): ResourceLimits {
+    this.limitsCache ??= this.opts.limits ?? readResourceLimits();
+    return this.limitsCache;
+  }
+
   async listTools(signal?: AbortSignal): Promise<McpTool[]> {
     // Counted as an initialization waiter too, so a concurrent callTool abort cannot
     // tear down the handshake this call is still waiting on.
     await this.awaitInitialization(signal);
+    // One discovery deadline spans every page: each page request gets the
+    // remaining budget instead of a fresh timeout.
+    const deadlineEnd = Date.now() + (this.opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
     return collectToolPages({
       signal: signal ?? new AbortController().signal,
       maxPages: DEFAULT_MCP_MAX_PAGES,
@@ -488,6 +556,7 @@ export class StdioMcpClient implements ConnectedMcpClient {
           cursor === undefined ? {} : { cursor },
           "tools/list",
           pageSignal,
+          Math.max(1, deadlineEnd - Date.now()),
         )
       ),
     });
@@ -735,6 +804,7 @@ export class StdioMcpClient implements ConnectedMcpClient {
     this.exited = true;
     this.exitReason = error.message;
     this.initialized = null;
+    this.buffer = "";
     this.rejectAllPending(error);
     if (kill) this.terminateChild(child);
   }
@@ -818,6 +888,16 @@ export class StdioMcpClient implements ConnectedMcpClient {
       const line = this.buffer.slice(0, idx).trim();
       this.buffer = this.buffer.slice(idx + 1);
       if (!line) continue;
+      // One over-limit frame fails the connection even when it arrives inside
+      // a chunk that legitimately holds many small frames.
+      if (Buffer.byteLength(line) > this.limits.mcpFrameBytes) {
+        this.failConnection(
+          new Error(`MCP stdio frame exceeded the ${String(this.limits.mcpFrameBytes)}-byte limit`),
+          this.child as ChildProcessWithoutNullStreams,
+          true,
+        );
+        return;
+      }
       let parsed: JsonRpcResponse;
       try {
         parsed = JSON.parse(line) as JsonRpcResponse;
@@ -833,6 +913,16 @@ export class StdioMcpClient implements ConnectedMcpClient {
       } else {
         pending.resolve(parsed.result);
       }
+    }
+    // Complete frames were processed above; the remainder is one unfinished
+    // frame. An unfinished frame larger than the cap must fail the connection
+    // instead of growing the buffer without bound.
+    if (Buffer.byteLength(this.buffer) > this.limits.mcpFrameBytes && this.child) {
+      this.failConnection(
+        new Error(`MCP stdio frame exceeded the ${String(this.limits.mcpFrameBytes)}-byte limit`),
+        this.child,
+        true,
+      );
     }
   }
 }
@@ -951,31 +1041,25 @@ function normalizeSchema(schema: Record<string, unknown> | undefined): Record<st
   return schema;
 }
 
-function parseMcpResponse(text: string, contentType: string): JsonRpcResponse {
-  if (!text.trim()) {
-    throw new Error("MCP response was empty.");
-  }
-  if (contentType.toLowerCase().includes("text/event-stream")) {
-    return parseSseJsonRpc(text);
-  }
-  return JSON.parse(text) as JsonRpcResponse;
-}
-
-function parseSseJsonRpc(text: string): JsonRpcResponse {
-  const dataLines: string[] = [];
-  for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith("data:")) {
-      dataLines.push(line.slice("data:".length).trimStart());
-    }
-  }
-  for (const data of dataLines) {
-    if (!data || data === "[DONE]") continue;
-    const parsed = JSON.parse(data) as JsonRpcResponse;
-    if (parsed.result !== undefined || parsed.error !== undefined) return parsed;
-  }
-  throw new Error("MCP SSE response did not contain a JSON-RPC result.");
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/**
+ * Keeps timeout distinguishable from caller cancellation regardless of how the
+ * platform surfaces an aborted fetch: a caller/dispose abort passes through
+ * untouched; a deadline abort that lost its reason becomes an explicit timeout.
+ */
+function mapTransportError(
+  err: unknown,
+  callerSignal: AbortSignal,
+  deadline: { signal: AbortSignal } | undefined,
+  timeoutMs: number | undefined,
+): unknown {
+  if (callerSignal.aborted) return err;
+  if (err instanceof Error && /timed out after/.test(err.message)) return err;
+  if (deadline?.signal.aborted && timeoutMs !== undefined) {
+    return new Error(`timed out after ${timeoutMs}ms`, { cause: err });
+  }
+  return err;
 }

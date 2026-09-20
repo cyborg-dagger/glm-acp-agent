@@ -971,3 +971,201 @@ for (const scenario of ["within a page", "across pages"] as const) {
     } finally { globalThis.fetch = savedFetch; }
   });
 }
+
+// --- T11: bounded, cancellable MCP transport -----------------------------------
+
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { readResourceLimits } from "../tools/resource-limits.js";
+
+function tinyLimits(frameBytes: number) {
+  return { ...readResourceLimits({}), mcpFrameBytes: frameBytes };
+}
+
+interface LocalHttpServer {
+  url: string;
+  server: Server;
+  close: () => Promise<void>;
+}
+
+function startLocalServer(handler: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse, body: string) => void): Promise<LocalHttpServer> {
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk: Buffer) => { raw += chunk.toString("utf8"); });
+    req.on("end", () => handler(req, res, raw));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { address, port } = server.address() as AddressInfo;
+      resolve({
+        url: `http://${address}:${port}`,
+        server,
+        close: () => new Promise((done) => server.close(() => done(undefined))),
+      });
+    });
+  });
+}
+
+function instantInitialize(req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse, raw: string): boolean {
+  if (req.method !== "POST" || !raw) return false;
+  const body = JSON.parse(raw) as { method?: string; id?: number };
+  if (body.method === "initialize") {
+    res.writeHead(200, { "content-type": "application/json", "MCP-Session-Id": "local-session" });
+    res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: {} }));
+    return true;
+  }
+  if (body.method === "notifications/initialized") {
+    res.writeHead(202);
+    res.end();
+    return true;
+  }
+  return false;
+}
+
+test("HTTP MCP times out when the server stalls after sending headers", async () => {
+  const local = await startLocalServer((_req, res, raw) => {
+    const body = JSON.parse(raw) as { method?: string; id?: number };
+    if (body.method === "initialize") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write(`{"jsonrpc":"2.0","id":${String(body.id)},"res`);
+      // never ends
+    } else {
+      res.writeHead(404); res.end();
+    }
+  });
+  try {
+    const client = new HttpMcpClient({ type: "http", name: "stalled", url: local.url, headers: [] }, { initializationTimeoutMs: 40 });
+    await assert.rejects(() => client.listTools(), /timed out after 40ms/i);
+    await client.dispose();
+  } finally {
+    await local.close();
+  }
+});
+
+test("HTTP MCP times out when the server never sends headers", async () => {
+  const local = await startLocalServer(() => { /* accept and hold the connection */ });
+  try {
+    const client = new HttpMcpClient({ type: "http", name: "silent", url: local.url, headers: [] }, { initializationTimeoutMs: 40 });
+    await assert.rejects(() => client.listTools(), /timed out after 40ms/i);
+    await client.dispose();
+  } finally {
+    await local.close();
+  }
+});
+
+test("HTTP MCP returns promptly from an SSE stream left open after the matching result", async () => {
+  const local = await startLocalServer((req, res, raw) => {
+    if (instantInitialize(req, res, raw)) return;
+    const body = JSON.parse(raw || "{}") as { method?: string; id?: number };
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(`event: message\ndata: {"jsonrpc":"2.0","method":"notifications/message","params":{}}\n\n`);
+    res.write(`data: {"jsonrpc":"2.0","id":${String(body.id)},"result":{"ok":true}}\n\n`);
+    // stream deliberately left open
+  });
+  try {
+    const client = new HttpMcpClient({ type: "http", name: "sse-open", url: local.url, headers: [] }, { initializationTimeoutMs: 2_000, requestTimeoutMs: 2_000 });
+    const watchdog = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("open SSE stream held the tool call")), 1_000).unref();
+    });
+    const result = await Promise.race([client.callTool("search", {}), watchdog]);
+    assert.deepEqual(result, { ok: true });
+    await client.dispose();
+  } finally {
+    await local.close();
+  }
+});
+
+test("HTTP MCP keeps one discovery deadline across every page instead of resetting it per page", async () => {
+  const local = await startLocalServer((req, res, raw) => {
+    if (instantInitialize(req, res, raw)) return;
+    const body = JSON.parse(raw || "{}") as { method?: string; id?: number; params?: { cursor?: string } };
+    if (body.params?.cursor === undefined) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "alpha" }], nextCursor: "p2" } }));
+    } else {
+      // Slow second page: a per-page deadline reset would let discovery finish.
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "beta" }] } }));
+      }, 200);
+    }
+  });
+  try {
+    const client = new HttpMcpClient({ type: "http", name: "paged", url: local.url, headers: [] }, { initializationTimeoutMs: 2_000, discoveryTimeoutMs: 80 });
+    await assert.rejects(() => client.listTools(), /timed out after 80ms/i);
+    await client.dispose();
+  } finally {
+    await local.close();
+  }
+});
+
+test("HTTP MCP bounds error diagnostics instead of allocating the whole error body", async () => {
+  const local = await startLocalServer((_req, res, raw) => {
+    const body = JSON.parse(raw || "{}") as { method?: string };
+    if (body.method === "initialize") {
+      res.writeHead(500, { "content-type": "text/plain" });
+      res.end("E".repeat(100_000));
+    } else {
+      res.writeHead(404); res.end();
+    }
+  });
+  try {
+    const client = new HttpMcpClient({ type: "http", name: "loud", url: local.url, headers: [] }, { initializationTimeoutMs: 2_000 });
+    const failure = await client.listTools().then(() => undefined, (err: Error) => err);
+    assert.ok(failure instanceof Error);
+    assert.match(failure.message, /HTTP 500/);
+    assert.ok(failure.message.length < 3_000, `diagnostic must stay small, got ${String(failure.message.length)} chars`);
+    await client.dispose();
+  } finally {
+    await local.close();
+  }
+});
+
+test("stdio MCP accepts a large chunk containing many small frames", async () => {
+  const harness = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => harness.child as never, limits: tinyLimits(300) });
+  const listPromise = client.listTools();
+  await tick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "search" }] } }) + "\n");
+  await tick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [] } }) + "\n");
+  await listPromise;
+  const calls = [client.callTool("search", { q: "a" }), client.callTool("search", { q: "b" }), client.callTool("search", { q: "c" })];
+  await tick();
+  // One chunk far larger than the frame cap, holding only complete small frames
+  // plus noise for requests that were never sent.
+  const noise = Array.from({ length: 40 }, (_, i) => JSON.stringify({ jsonrpc: "2.0", id: 1_000 + i, result: null })).join("\n");
+  harness.pushStdout(`${noise}\n${JSON.stringify({ jsonrpc: "2.0", id: 3, result: { value: "a" } })}\n${JSON.stringify({ jsonrpc: "2.0", id: 4, result: { value: "b" } })}\n${JSON.stringify({ jsonrpc: "2.0", id: 5, result: { value: "c" } })}\n`);
+  assert.deepEqual(await calls[0], { value: "a" });
+  assert.deepEqual(await calls[1], { value: "b" });
+  assert.deepEqual(await calls[2], { value: "c" });
+  await client.dispose();
+});
+
+test("stdio MCP fails the connection on an unfinished frame larger than the frame cap", async () => {
+  const harness = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => harness.child as never, limits: tinyLimits(200) });
+  const listPromise = client.listTools();
+  await tick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [] } }) + "\n");
+  await tick();
+  harness.pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [] } }) + "\n");
+  await listPromise;
+  const call = client.callTool("search", { q: "x" });
+  await tick();
+  harness.pushStdout(`{"jsonrpc":"2.0","id":3,"result":"${"x".repeat(500)}`);
+  await assert.rejects(call, /frame exceeded/i);
+  assert.ok(harness.getKillCount() >= 1, "the owned child must be terminated");
+  await client.dispose();
+});
+
+test("stdio MCP fails the connection on a single complete frame over the cap", async () => {
+  const harness = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => harness.child as never, limits: tinyLimits(200) });
+  const listPromise = client.listTools();
+  await tick();
+  harness.pushStdout(`${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { blob: "y".repeat(500) } })}\n`);
+  await assert.rejects(listPromise, /frame exceeded/i);
+  assert.ok(harness.getKillCount() >= 1);
+  await client.dispose();
+});

@@ -4,6 +4,12 @@ export interface ResourceLimits {
   listEntries: number;
   listBytes: number;
   fsConcurrency: number;
+  /** Total bytes readable from one MCP HTTP response body (JSON or SSE stream). */
+  mcpResponseBytes: number;
+  /** Maximum UTF-8 bytes of a single SSE event's data payload. */
+  mcpEventBytes: number;
+  /** Maximum UTF-8 bytes of one newline-delimited stdio JSON-RPC frame. */
+  mcpFrameBytes: number;
 }
 
 type Environment = Record<string, string | undefined>;
@@ -13,6 +19,9 @@ export const DEFAULT_TOOL_RESULT_BYTES = 262_144;
 export const DEFAULT_FILE_READ_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_LIST_ENTRIES = 2_000;
 export const DEFAULT_LIST_BYTES = 262_144;
+export const DEFAULT_MCP_RESPONSE_BYTES = 8 * 1024 * 1024;
+export const DEFAULT_MCP_EVENT_BYTES = 8 * 1024 * 1024;
+export const DEFAULT_MCP_FRAME_BYTES = 8 * 1024 * 1024;
 
 function positiveInteger(env: Environment, name: string, fallback: number, minimum: number, maximum: number, warn: Warn): number {
   const raw = env[name];
@@ -35,5 +44,8 @@ export function readResourceLimits(
     listEntries: positiveInteger(env, "ACP_GLM_LIST_FILES_MAX_ENTRIES", DEFAULT_LIST_ENTRIES, 1, DEFAULT_LIST_ENTRIES, warn),
     listBytes: positiveInteger(env, "ACP_GLM_LIST_FILES_LIMIT_BYTES", DEFAULT_LIST_BYTES, 128, Number.MAX_SAFE_INTEGER, warn),
     fsConcurrency: 16,
+    mcpResponseBytes: positiveInteger(env, "ACP_GLM_MCP_RESPONSE_LIMIT_BYTES", DEFAULT_MCP_RESPONSE_BYTES, 1_024, Number.MAX_SAFE_INTEGER, warn),
+    mcpEventBytes: positiveInteger(env, "ACP_GLM_MCP_EVENT_LIMIT_BYTES", DEFAULT_MCP_EVENT_BYTES, 1_024, Number.MAX_SAFE_INTEGER, warn),
+    mcpFrameBytes: positiveInteger(env, "ACP_GLM_MCP_FRAME_LIMIT_BYTES", DEFAULT_MCP_FRAME_BYTES, 1_024, Number.MAX_SAFE_INTEGER, warn),
   };
 }
