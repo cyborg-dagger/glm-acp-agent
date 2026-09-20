@@ -155,11 +155,8 @@ async function acpSmoke(npmCli, tarball, workingDirectory) {
     if (typeof agentInfo?.name !== "string" || agentInfo.name !== packageJson.name) {
       throw new Error(`ACP initialize reported unexpected agent name: ${JSON.stringify(agentInfo)}`);
     }
-    // The ACP handshake identity must be a real package version. (Exact
-    // equality with package.json is asserted here via the semver shape until
-    // the ACP agentInfo site consumes AGENT_VERSION — see src/version.ts.)
-    if (typeof agentInfo?.version !== "string" || !/^\d+\.\d+\.\d+/u.test(agentInfo.version)) {
-      throw new Error(`ACP initialize reported a non-package version: ${JSON.stringify(agentInfo)}`);
+    if (typeof agentInfo?.version !== "string" || agentInfo.version !== packageJson.version) {
+      throw new Error(`ACP initialize reported a version that differs from package.json: ${JSON.stringify(agentInfo)}`);
     }
 
     send({

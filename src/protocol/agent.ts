@@ -37,6 +37,7 @@ import type {
   Usage,
 } from "@agentclientprotocol/sdk";
 import { PROTOCOL_VERSION as VERSION } from "@agentclientprotocol/sdk";
+import { AGENT_NAME, AGENT_VERSION } from "../version.js";
 import {
   GlmClient,
   getAvailableModels,
@@ -363,8 +364,8 @@ export class GlmAcpAgent implements Agent {
     return {
       protocolVersion: negotiatedVersion,
       agentInfo: {
-        name: "glm-acp-agent",
-        version: "1.0.0",
+        name: AGENT_NAME,
+        version: AGENT_VERSION,
       },
       // Advertise auth methods so the ACP registry verifier and capable
       // clients can discover how to configure us. The `agent`-default method
