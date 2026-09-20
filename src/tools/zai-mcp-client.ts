@@ -6,7 +6,7 @@ import {
   DEFAULT_MCP_MAX_SCHEMA_BYTES,
   DEFAULT_MCP_MAX_TOOLS,
 } from "./mcp-pagination.js";
-import { createDeadline, readDiagnosticBody, readRpcResponse } from "./mcp-transport.js";
+import { cancelDetached, createDeadline, readDiagnosticBody, readRpcResponse } from "./mcp-transport.js";
 import { readResourceLimits, type ResourceLimits } from "./resource-limits.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
@@ -263,7 +263,7 @@ export class ZaiMcpClient {
     // A successful notification carries no protocol payload: release the body
     // so a non-empty or indefinitely open response cannot retain its fetch and
     // socket resources across initializations and retries.
-    await response.body?.cancel().catch(() => undefined);
+    cancelDetached(response.body?.cancel());
   }
 
   private async fetchJsonRpc(

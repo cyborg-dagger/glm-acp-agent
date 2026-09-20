@@ -568,6 +568,9 @@ test("ZaiMcpClient releases the notification body after a successful initializat
     },
     cancel() {
       cancelCount += 1;
+      // Never settles: releasing the body must not bet the handshake on the
+      // cancel promise's settlement.
+      return new Promise<void>(() => { /* pending forever */ });
     },
   });
   const client = new ZaiMcpClient(async (_url: RequestInfo | URL, init?: RequestInit) => {

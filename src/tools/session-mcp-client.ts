@@ -9,7 +9,7 @@ import {
   DEFAULT_MCP_MAX_SCHEMA_BYTES,
   DEFAULT_MCP_MAX_TOOLS,
 } from "./mcp-pagination.js";
-import { createDeadline, readDiagnosticBody, readRpcResponse } from "./mcp-transport.js";
+import { cancelDetached, createDeadline, readDiagnosticBody, readRpcResponse } from "./mcp-transport.js";
 import { readResourceLimits, type ResourceLimits } from "./resource-limits.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
@@ -407,7 +407,8 @@ export class HttpMcpClient implements ConnectedMcpClient {
         const diagnostic = await readDiagnosticBody(response, this.limits, deadlineSignal);
         throw new Error(`MCP ${this.server.name} notifications/initialized failed: HTTP ${response.status}: ${diagnostic}`);
       }
-      await response.body?.cancel();
+      // Release the body without betting the handshake on its cancel settling.
+      cancelDetached(response.body?.cancel());
     }, signal, timeoutMs ?? this.opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
   }
 

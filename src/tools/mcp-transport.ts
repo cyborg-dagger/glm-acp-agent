@@ -59,7 +59,7 @@ class BodyLimitError extends Error {}
  * underlying source's cancel callback still runs synchronously; only the
  * settlement of the returned promise is ignored, and rejections are swallowed.
  */
-function cancelDetached(cancel: Promise<unknown> | undefined): void {
+export function cancelDetached(cancel: Promise<unknown> | undefined): void {
   void cancel?.catch(() => undefined);
 }
 
