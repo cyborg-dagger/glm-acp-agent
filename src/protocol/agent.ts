@@ -2300,6 +2300,18 @@ export class GlmAcpAgent implements Agent {
       return replacement;
     });
     assertValidHistory(messages);
+    // Compaction evicts whole exchanges from the front, which shifts every
+    // later index: the active turn's split point must move with them or the
+    // persisted projection would swallow the admitted turn into the prefix.
+    if (session.activeTurn) {
+      const removed = session.messages.length - messages.length;
+      if (removed > 0) {
+        session.activeTurn = {
+          ...session.activeTurn,
+          startIndex: Math.max(1, session.activeTurn.startIndex - removed),
+        };
+      }
+    }
     session.messages = messages;
     debug(`context budget: heuristic=${result.estimatedTokens} schemas=${budget.toolSchemaTokens} output=${budget.maxOutputTokens} removed=${result.removedExchanges} reducedTools=${result.reducedToolResults}`);
     return true;

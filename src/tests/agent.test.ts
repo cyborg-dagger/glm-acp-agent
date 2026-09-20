@@ -2979,6 +2979,69 @@ type SessionUpdateEnvelope = {
   update?: { sessionUpdate?: string; content?: { text?: string } };
 };
 
+test("batch staging after mid-turn compaction splits at the admitted user message", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    const stagedSnapshots: Array<Record<string, unknown>> = [];
+    const capturingStore = {
+      save(session: Record<string, unknown>) {
+        const active = session.activeTurn as { pendingBatch?: unknown } | undefined;
+        if (active?.pendingBatch) stagedSnapshots.push(structuredClone(session));
+        return store.save(session as never);
+      },
+      load: (id: string) => store.load(id),
+      listMetadata: () => store.listMetadata(),
+      backupPreV5: (id: string) => store.backupPreV5(id),
+    };
+    let callCount = 0;
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        callCount++;
+        if (callCount === 1) {
+          yield {
+            toolCall: { id: "split-1", name: "list_files", arguments: JSON.stringify({ path: "/tmp" }) },
+          };
+          yield { done: true, stopReason: "tool_calls" };
+        } else {
+          yield { text: "listed." };
+          yield { done: true, stopReason: "stop" };
+        }
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: capturingStore as never });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    await agent.unstable_setSessionModel({ sessionId, modelId: "glm-5-turbo" });
+    const session = (agent as unknown as {
+      sessions: Map<string, { messages: Array<{ role: string; content?: string }> }>;
+    }).sessions.get(sessionId);
+    assert.ok(session, "expected in-memory session to exist");
+    for (let i = 0; i < 50; i++) {
+      session.messages.push({ role: "user", content: "Very long message filler ".repeat(1000) });
+      session.messages.push({ role: "assistant", content: "Intermediate response filler ".repeat(1000) });
+    }
+
+    const result = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "Final trigger" }] });
+    assert.equal(result.stopReason, "end_turn");
+    assert.ok(stagedSnapshots.length > 0, "expected a staged-batch checkpoint to be captured");
+    for (const staged of stagedSnapshots) {
+      const prefix = staged.messages as Array<{ role: string; content?: string }>;
+      const suffix = (staged.activeTurn as { messages: Array<{ role: string; content?: string }> }).messages;
+      assert.ok(
+        String(suffix[0]?.content ?? "").includes("Final trigger"),
+        "the active suffix must begin at the admitted user message",
+      );
+      assert.ok(
+        !prefix.some((message) => String(message.content ?? "").includes("Final trigger")),
+        "the committed prefix must not contain the admitted turn",
+      );
+    }
+  } finally {
+    cleanup();
+  }
+});
+
 test("prompt performs emergency compaction and retries on 1261 error", async () => {
   const conn = createConnectionStub();
   let callCount = 0;
