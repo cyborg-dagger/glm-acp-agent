@@ -159,10 +159,34 @@ export class ToolExecutor {
   /**
    * Required crash-recovery checkpoint: record that this call is starting
    * (after validation and permission, before any effect) and persist it.
-   * A rejection must prevent the effect that follows it.
+   * A rejection must prevent the effect that follows it. Handlers that have
+   * already announced a client tool card must call `markStartedOrMarkFailed`
+   * instead, so a rejection cannot leave that card non-terminal.
    */
   private async markStarted(toolCallId: string, toolName: string): Promise<void> {
     await this.executionHooks?.onExecutionStart({ id: toolCallId, name: toolName });
+  }
+
+  /**
+   * Start checkpoint for handlers that already published a client tool card
+   * (pending/in_progress): if the persistence hook rejects, land a best-effort
+   * terminal `failed` update before the checkpoint error propagates, so the
+   * card cannot stay in-progress forever. Best-effort means a failure while
+   * reporting the failure is swallowed — the original checkpoint error is
+   * still what the caller sees.
+   */
+  private async markStartedOrMarkFailed(toolCallId: string, toolName: string): Promise<void> {
+    try {
+      await this.markStarted(toolCallId, toolName);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      try {
+        await this.markFailed(toolCallId, message);
+      } catch {
+        // The failed update is advisory; never mask the checkpoint error.
+      }
+      throw err;
+    }
   }
 
   private async readFile(
@@ -394,7 +418,7 @@ export class ToolExecutor {
       },
     });
 
-    await this.markStarted(toolCallId, "write_file");
+    await this.markStartedOrMarkFailed(toolCallId, "write_file");
     try {
       if (this.signal?.aborted) {
         await this.markFailed(toolCallId, "Cancelled by turn.");
@@ -618,7 +642,7 @@ export class ToolExecutor {
       };
     }
 
-    await this.markStarted(toolCallId, "edit_file");
+    await this.markStartedOrMarkFailed(toolCallId, "edit_file");
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
       update: {
@@ -820,7 +844,7 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, "Cancelled by turn.");
       return { content: "Command cancelled by turn." };
     }
-    await this.markStarted(toolCallId, "run_command");
+    await this.markStartedOrMarkFailed(toolCallId, "run_command");
 
     try {
       const limits = readCommandLimits();
@@ -898,7 +922,7 @@ export class ToolExecutor {
       },
     });
 
-    await this.markStarted(toolCallId, "web_search");
+    await this.markStartedOrMarkFailed(toolCallId, "web_search");
     try {
       const apiKey = requireResolvedApiKey();
       const toolArgs: Record<string, unknown> = { query };
@@ -961,7 +985,7 @@ export class ToolExecutor {
       },
     });
 
-    await this.markStarted(toolCallId, "web_reader");
+    await this.markStartedOrMarkFailed(toolCallId, "web_reader");
     try {
       const apiKey = requireResolvedApiKey();
 
@@ -1030,7 +1054,7 @@ export class ToolExecutor {
       },
     });
 
-    await this.markStarted(toolCallId, "image_analysis");
+    await this.markStartedOrMarkFailed(toolCallId, "image_analysis");
     try {
       const visionArgs: Record<string, unknown> = { image_source: imageSource };
       if (prompt) visionArgs["prompt"] = prompt;
@@ -1073,7 +1097,7 @@ export class ToolExecutor {
       },
     });
 
-    await this.markStarted(toolCallId, toolName);
+    await this.markStartedOrMarkFailed(toolCallId, toolName);
     try {
       const mcpResult = await this.sessionMcpTools!.callTool(toolName, args, this.signal);
       const text = unwrapToolText(mcpResult);
