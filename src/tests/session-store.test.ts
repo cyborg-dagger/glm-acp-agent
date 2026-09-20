@@ -13,9 +13,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { GlmMessage } from "../llm/glm-client.js";
 import {
   SESSION_SCHEMA_VERSION,
   SessionStore,
+  type PendingToolBatch,
+  type PendingToolCall,
+  type PendingToolCallState,
+  type PersistedActiveTurn,
   type PersistedSession,
 } from "../protocol/session-store.js";
 
@@ -47,6 +52,41 @@ function validSession(overrides: Partial<PersistedSession> = {}): PersistedSessi
 
 function writeRaw(dir: string, sessionId: string, value: unknown): void {
   writeFileSync(join(dir, `${sessionId}.json`), JSON.stringify(value), "utf8");
+}
+
+function assistantWithToolCalls(ids: string[]): GlmMessage {
+  return {
+    role: "assistant",
+    content: null,
+    tool_calls: ids.map((id) => ({
+      id,
+      type: "function" as const,
+      function: { name: "run_tool", arguments: "{}" },
+    })),
+  };
+}
+
+function pendingToolCall(
+  id: string,
+  state: PendingToolCallState,
+  result?: string,
+): PendingToolCall {
+  return result === undefined
+    ? { id, name: "run_tool", arguments: "{}", state }
+    : { id, name: "run_tool", arguments: "{}", state, result };
+}
+
+function validActiveTurn(overrides: Partial<PersistedActiveTurn> = {}): PersistedActiveTurn {
+  return {
+    turnId: "turn-1",
+    startedAt: "2026-09-20T10:00:01.000Z",
+    messages: [{ role: "user", content: "run the tools" }],
+    pendingBatch: {
+      assistant: assistantWithToolCalls(["a", "b"]),
+      calls: [pendingToolCall("a", "recorded", "ok"), pendingToolCall("b", "started")],
+    },
+    ...overrides,
+  };
 }
 
 test("load and listMetadata skip null, primitive, and array JSON roots", () => {
@@ -287,6 +327,177 @@ test("save preserves the prior record when serializing the replacement fails", (
     );
     assert.equal(readFileSync(path, "utf8"), before);
     assert.deepEqual(readdirSync(dir).filter((name) => name.includes(".tmp")), []);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("v5 roundtrip preserves an in-flight activeTurn with a mixed-state pending batch", () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const record: PersistedSession = {
+      ...validSession({ sessionId: "active-turn-roundtrip" }),
+      schemaVersion: SESSION_SCHEMA_VERSION,
+      activeTurn: validActiveTurn(),
+    };
+
+    store.save(record);
+    const loaded = store.load(record.sessionId);
+    assert.deepEqual(loaded, { ...record, schemaVersion: SESSION_SCHEMA_VERSION });
+    assert.deepEqual(loaded?.activeTurn, record.activeTurn);
+    assert.deepEqual(
+      loaded?.activeTurn?.pendingBatch?.calls,
+      [pendingToolCall("a", "recorded", "ok"), pendingToolCall("b", "started")],
+      "the ledger's mixed states and its recorded result must survive the roundtrip exactly"
+    );
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("malformed activeTurn records are rejected, not partially loaded", () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+
+    // Positive control: the unmutated record loads, so every rejection below
+    // is attributable to its single defect.
+    const sound = validSession({ sessionId: "active-turn-sound", activeTurn: validActiveTurn() });
+    writeRaw(dir, sound.sessionId, { ...sound, schemaVersion: 5 });
+    assert.notEqual(store.load(sound.sessionId), undefined, "the intact base record must load");
+
+    const defects: Array<[string, (turn: PersistedActiveTurn) => void]> = [
+      [
+        "active-turn-bad-state",
+        (turn) => {
+          ((turn.pendingBatch as PendingToolBatch).calls[0] as { state: string }).state = "finished";
+        },
+      ],
+      [
+        "active-turn-recorded-without-result",
+        (turn) => {
+          delete (turn.pendingBatch as PendingToolBatch).calls[0].result;
+        },
+      ],
+      [
+        "active-turn-queued-with-result",
+        (turn) => {
+          ((turn.pendingBatch as PendingToolBatch).calls[1] as { result?: string }).result = "early";
+        },
+      ],
+      [
+        "active-turn-undeclared-ledger-id",
+        (turn) => {
+          ((turn.pendingBatch as PendingToolBatch).calls[1] as { id: string }).id = "c";
+        },
+      ],
+      [
+        "active-turn-assistant-without-tool-calls",
+        (turn) => {
+          (turn.pendingBatch as PendingToolBatch).assistant = { role: "assistant", content: "no tools here" };
+        },
+      ],
+      [
+        "active-turn-message-is-primitive",
+        (turn) => {
+          turn.messages = ["not-a-message" as unknown as GlmMessage];
+        },
+      ],
+      [
+        "active-turn-bad-started-at",
+        (turn) => {
+          turn.startedAt = "not-a-date";
+        },
+      ],
+    ];
+
+    for (const [id, mutate] of defects) {
+      const turn = validActiveTurn();
+      mutate(turn);
+      writeRaw(dir, id, { ...validSession({ sessionId: id }), schemaVersion: 5, activeTurn: turn });
+      assert.equal(store.load(id), undefined, `load should reject ${id}`);
+    }
+
+    assert.deepEqual(
+      store.listMetadata().map((entry) => entry.sessionId),
+      [sound.sessionId],
+      "no record with a malformed activeTurn may surface in listings"
+    );
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("legacy v4 records load unchanged through the v5 parser; dangling tool calls are not repaired", () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const v4: PersistedSession = validSession({
+      sessionId: "v4-dangling-tool-calls",
+      schemaVersion: 4,
+      displayText: { "1": "run the tools" },
+      messages: [
+        { role: "user", content: "run the tools" },
+        assistantWithToolCalls(["a", "b"]),
+      ],
+    });
+
+    writeRaw(dir, v4.sessionId, v4);
+    const loaded = store.load(v4.sessionId);
+    assert.equal(loaded?.schemaVersion, SESSION_SCHEMA_VERSION);
+    assert.deepEqual(
+      loaded?.messages,
+      v4.messages,
+      "the store must not repair or drop a dangling tool-call tail"
+    );
+    assert.deepEqual(loaded?.displayText, { "1": "run the tools" });
+    assert.equal(loaded?.mode, "default");
+    assert.equal(loaded?.thoughtLevel, "max");
+    assert.equal(loaded?.activeTurn, undefined);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("backupPreV5 writes a private exclusive backup exactly once", () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const first = validSession({ sessionId: "backup-once", updatedAt: "2026-09-16T10:00:00.000Z" });
+    store.save(first);
+    const livePath = join(dir, `${first.sessionId}.json`);
+    const backupPath = join(dir, `.${first.sessionId}.json.pre-v5.bak`);
+    const originalRaw = readFileSync(livePath, "utf8");
+
+    assert.equal(store.backupPreV5(first.sessionId), true, "the first backup must be written");
+    assert.equal(existsSync(backupPath), true);
+    assert.equal(readFileSync(backupPath, "utf8"), originalRaw);
+    // POSIX exposes the mode bits; Windows does not provide this permission
+    // contract, while the exclusivity and content assertions remain meaningful
+    // on every supported platform.
+    if ((process.platform as string) !== "win32") {
+      assert.equal(statSync(backupPath).mode & 0o777, 0o600);
+    }
+
+    store.save(validSession({
+      sessionId: first.sessionId,
+      title: "Replaced after the backup",
+      updatedAt: "2026-09-16T11:00:00.000Z",
+    }));
+    assert.equal(
+      store.backupPreV5(first.sessionId),
+      false,
+      "a second backup must not overwrite the first"
+    );
+    assert.equal(
+      readFileSync(backupPath, "utf8"),
+      originalRaw,
+      "the backup must still hold the original pre-v5 content"
+    );
+
+    assert.equal(store.backupPreV5("never-saved"), false, "a missing source means no backup");
+    assert.equal(store.backupPreV5("../escaped"), false, "unsafe ids are refused, not thrown");
   } finally {
     cleanup(dir);
   }
