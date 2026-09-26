@@ -100,6 +100,62 @@ test("preprocessImageBlocks skips vision when no client is given and notes the i
   assert.equal(result.cleanups.length, 0);
 });
 
+
+test("preprocessImageBlocks bounds parallel analysis while preserving original block order", async () => {
+  let active = 0;
+  let peak = 0;
+  const images = Array.from({ length: 5 }, (_, index) => ({
+    type: "image" as const,
+    data: "",
+    mimeType: "image/png",
+    uri: `fixture://image-${index + 1}`,
+  }));
+  const result = await preprocessImageBlocks(
+    [{ type: "text", text: "before" }, ...images, { type: "text", text: "after" }],
+    makeClient(async (_name, args) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      const source = String(args["image_source"]);
+      const index = Number(source.at(-1));
+      await new Promise((resolve) => setTimeout(resolve, (6 - index) * 5));
+      active -= 1;
+      return { content: [{ type: "text", text: source }] };
+    }),
+  );
+  assert.equal(peak, 3);
+  assert.equal(result.blocks.length, 7);
+  assert.deepEqual(result.blocks.slice(0, 1), [{ type: "text", text: "before" }]);
+  const annotations = result.blocks.slice(1, 6).map((block) => (block as { text: string }).text);
+  assert.deepEqual(annotations, images.map((_, index) =>
+    `<image_analysis index="${index + 1}">\nfixture://image-${index + 1}\n</image_analysis>`));
+  assert.deepEqual(result.blocks.slice(6), [{ type: "text", text: "after" }]);
+});
+
+test("preprocessImageBlocks waits for aborted parallel calls and cleans up every image file", async () => {
+  const controller = new AbortController();
+  let started = 0;
+  let cleaned = 0;
+  const result = preprocessImageBlocks(
+    Array.from({ length: 5 }, () => ({ type: "image" as const, data: "AAAA", mimeType: "image/png" })),
+    makeClient(async (_name, _args, signal) => {
+      started += 1;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("fixture cancelled")), { once: true });
+      });
+    }),
+    controller.signal,
+    {
+      mkdtemp: async () => `/tmp/phase5-image-${started}`,
+      writeFile: async () => {},
+      rm: async () => { cleaned += 1; },
+    },
+  );
+  while (started < 3) await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(result, /cancelled/);
+  assert.equal(started, 3, "cancellation must not schedule more analyses");
+  assert.equal(cleaned, 3, "all materialized image directories must be removed");
+});
 // ---------------------------------------------------------------------------
 // buildPromptBlockDiagnosticLines
 // ---------------------------------------------------------------------------
