@@ -71,6 +71,22 @@ The agent process needs network access to `api.z.ai` for chat completions and We
 
 Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` (and in the `read_file` content preview) are elided to a short head plus a character count. Model-facing tool results are also capped at a UTF-8 byte boundary; write payloads and permission requests remain complete. Progress narration lives in the `todowrite` task list rather than prose, and reasoning tokens are only forwarded as `agent_thought_chunk` when `ACP_GLM_STREAM_THINKING` is not `false` (the default preserves streaming).
 
+## Client MCP, context, and trust boundary
+
+### Client-provided MCP servers
+
+ACP clients may attach MCP server definitions when creating or loading a session. The agent supports client-configured **stdio** and **HTTP** MCP servers. **SSE is unsupported and rejected** when the agent tries to connect. In the ACP SDK capability schema, `mcpCapabilities.http` advertises HTTP support and `mcpCapabilities.sse` advertises SSE support. This agent advertises only `http: true` and does not advertise SSE; the capability object has no stdio flag.
+
+A stdio MCP child starts with a copy of the agent process environment, then the server's configured environment entries override matching inherited values. This can pass credentials such as `Z_AI_API_KEY` to that child. Review client-supplied MCP commands and environment values as trusted code/configuration.
+
+### Context compaction
+
+Before provider requests, the agent estimates context use with a heuristic rather than the provider's tokenizer. When history exceeds the model budget, it can remove older complete exchanges and shorten tool results; the system context and latest user request are retained. If those, the tool schemas, and reserved output/safety space still exceed the model's context window, the request fails with guidance to narrow it or choose a larger-context model. Earlier conversation details may therefore not remain verbatim in model context.
+
+### Trust boundary
+
+The agent does not run tools inside an OS or container sandbox. Shell commands and local filesystem fallbacks run with the agent process's OS-user permissions; shell children inherit its environment, and commands can access the network available to that user. ACP permission prompts and session modes govern consent behavior but do not provide process isolation. Treat workspaces, prompts, and MCP configurations as trusted, and use external OS/container isolation when you need a stronger boundary.
+
 ---
 
 ## Available Tools
