@@ -54,6 +54,7 @@ const EDITOR_EOF_PROBE_LINE = 0xffffffff;
 /** Strings longer than this are elided in client-facing previews (UI cards), never in tool results. */
 const PREVIEW_STRING_LIMIT = 240;
 const PREVIEW_HEAD = 120;
+const PREVIEW_PAYLOAD_LIMIT_BYTES = 16_384;
 
 /**
  * Elide a single long string for client-facing display (UI cards, read
@@ -70,14 +71,21 @@ function elideStringForPreview(value: string): string {
  * The full payload still reaches the model through the tool result channel.
  */
 function elideForPreview(value: unknown): unknown {
-  if (typeof value === "string") {
-    return elideStringForPreview(value);
+  const preview = elidePreviewStrings(value);
+  const serialized = JSON.stringify(preview);
+  if (serialized !== undefined && Buffer.byteLength(serialized, "utf8") > PREVIEW_PAYLOAD_LIMIT_BYTES) {
+    return { truncated: `Preview exceeds ${PREVIEW_PAYLOAD_LIMIT_BYTES}-byte limit` };
   }
-  if (Array.isArray(value)) return value.map(elideForPreview);
+  return preview;
+}
+
+function elidePreviewStrings(value: unknown): unknown {
+  if (typeof value === "string") return elideStringForPreview(value);
+  if (Array.isArray(value)) return value.map(elidePreviewStrings);
   if (typeof value === "object" && value !== null) {
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = elideForPreview(item);
+      out[key] = elidePreviewStrings(item);
     }
     return out;
   }
@@ -905,7 +913,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text: output } }],
+          content: [{ type: "content", content: { type: "text", text: elideStringForPreview(output) } }],
           rawOutput: elideForPreview({ resultCount }),
         },
       });
@@ -965,7 +973,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text: output } }],
+          content: [{ type: "content", content: { type: "text", text: elideStringForPreview(output) } }],
           rawOutput: elideForPreview({ title, url: resultUrl }),
         },
       });
@@ -1026,7 +1034,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text } }],
+          content: [{ type: "content", content: { type: "text", text: elideStringForPreview(text) } }],
           rawOutput: elideForPreview({ text }),
         },
       });
@@ -1065,8 +1073,8 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text } }],
-          rawOutput: mcpResult,
+          content: [{ type: "content", content: { type: "text", text: elideStringForPreview(text) } }],
+          rawOutput: elideForPreview(mcpResult),
         },
       });
       return { content: text };
@@ -1169,16 +1177,13 @@ export class ToolExecutor {
   private permissionOutcome(permissionResponse: {
     outcome: { outcome: string; optionId?: string };
   }): { type: "allow" } | { type: "reject" } | { type: "cancelled" } {
-    if (permissionResponse.outcome.outcome === "cancelled") {
+    if (permissionResponse?.outcome?.outcome === "cancelled") {
       return { type: "cancelled" };
     }
-    if (
-      permissionResponse.outcome.outcome === "selected" &&
-      permissionResponse.outcome.optionId === "reject"
-    ) {
-      return { type: "reject" };
-    }
-    return { type: "allow" };
+    return permissionResponse?.outcome?.outcome === "selected" &&
+      permissionResponse.outcome.optionId === "allow"
+      ? { type: "allow" }
+      : { type: "reject" };
   }
 
   /** Mark an in-progress tool call as failed. */
