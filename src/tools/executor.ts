@@ -1194,7 +1194,7 @@ export class ToolExecutor {
         sessionUpdate: "tool_call_update",
         toolCallId,
         status: "failed",
-        rawOutput: { error: message },
+        rawOutput: elideForPreview({ error: message }),
       },
     });
   }
@@ -1218,8 +1218,8 @@ export class ToolExecutor {
         kind: "other",
         status: "failed",
         locations: [],
-        rawInput,
-        rawOutput: { error: message },
+        rawInput: elideForPreview(rawInput),
+        rawOutput: elideForPreview({ error: message }),
       },
     });
   }

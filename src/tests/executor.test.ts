@@ -766,6 +766,20 @@ test("session MCP notifications elide large content and aggregate small fields",
   assert.ok(final.content[0]?.content.text.length < 240);
   assert.notDeepEqual(final.rawOutput, raw);
 });
+test("failed tool cards bound both invalid arguments and upstream error bodies", async () => {
+  const text = "z".repeat(50_000);
+  const conn = createConnectionStub();
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const invalid = await executor.execute("invalid", "write_file", JSON.stringify({ path: "", content: text }));
+  assert.match(invalid.content, /path.*required/i);
+  const tools = { hasTool: () => true, callTool: async () => { throw new Error(text); } };
+  const mcpExecutor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, tools as never);
+  const failed = await mcpExecutor.execute("error", "custom_tool", "{}");
+  assert.match(failed.content, /Error calling MCP tool/);
+  for (const event of conn.updates) {
+    assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
+  }
+});
 test("write_file cancelled by user marks call failed", async () => {
   const conn = createConnectionStub({ permission: "cancelled" });
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
