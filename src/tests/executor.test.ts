@@ -780,6 +780,26 @@ test("failed tool cards bound both invalid arguments and upstream error bodies",
     assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
   }
 });
+test("tool-card titles and locations stay bounded without shortening approval payloads", async () => {
+  const path = "p".repeat(50_000);
+  const command = "echo " + "c".repeat(50_000);
+  const conn = createConnectionStub({ permission: "reject" });
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  await executor.execute("read", "read_file", JSON.stringify({ path }));
+  await executor.execute("write", "write_file", JSON.stringify({ path, content: "body" }));
+  await executor.execute("run", "run_command", JSON.stringify({ command }));
+  for (const event of conn.updates) {
+    assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
+  }
+  const first = conn.updates[0]?.update as { locations?: unknown[] };
+  assert.deepEqual(first.locations, []);
+  const writeApproval = conn.permissionRequests[0] as { toolCall: { title: string; rawInput: { path: string } } };
+  assert.equal(writeApproval.toolCall.title, `Write file: ${path}`);
+  assert.equal(writeApproval.toolCall.rawInput.path, path);
+  const executeApproval = conn.permissionRequests[1] as { toolCall: { title: string; rawInput: { command: string } } };
+  assert.equal(executeApproval.toolCall.title, `Run command: ${command}`);
+  assert.equal(executeApproval.toolCall.rawInput.command, command);
+});
 test("write_file cancelled by user marks call failed", async () => {
   const conn = createConnectionStub({ permission: "cancelled" });
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);

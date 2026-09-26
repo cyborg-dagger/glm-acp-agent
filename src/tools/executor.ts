@@ -183,10 +183,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Read file: ${path}`,
+        title: elideStringForPreview(`Read file: ${path}`),
         kind: "read",
         status: "in_progress",
-        locations: [{ path }],
+        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -310,9 +310,9 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: todos.some((t) => t.status === "in_progress")
+        title: elideStringForPreview(todos.some((t) => t.status === "in_progress")
           ? `Task list: ${todos.find((t) => t.status === "in_progress")?.activeForm ?? todos.find((t) => t.status === "in_progress")?.content ?? ""}`
-          : `Task list: ${todos.length} item${todos.length === 1 ? "" : "s"}`,
+          : `Task list: ${todos.length} item${todos.length === 1 ? "" : "s"}`),
         kind: "other",
         status: "completed",
         rawInput: elideForPreview(args),
@@ -340,10 +340,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Write file: ${path}`,
+        title: elideStringForPreview(`Write file: ${path}`),
         kind: "edit",
         status: "pending",
-        locations: [{ path }],
+        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -528,10 +528,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Edit file: ${path}`,
+        title: elideStringForPreview(`Edit file: ${path}`),
         kind: "edit",
         status: "pending",
-        locations: [{ path }],
+        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -669,10 +669,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `List files: ${path}`,
+        title: elideStringForPreview(`List files: ${path}`),
         kind: "read",
         status: "in_progress",
-        locations: [{ path }],
+        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -759,7 +759,7 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Run command: ${command}`,
+        title: elideStringForPreview(`Run command: ${command}`),
         kind: "execute",
         status: "pending",
         locations: [],
@@ -884,7 +884,7 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Web search: ${query}`,
+        title: elideStringForPreview(`Web search: ${query}`),
         kind: "fetch",
         status: "in_progress",
         locations: [],
@@ -946,10 +946,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Read URL: ${url}`,
+        title: elideStringForPreview(`Read URL: ${url}`),
         kind: "fetch",
         status: "in_progress",
-        locations: [{ path: url }],
+        locations: url.length <= PREVIEW_STRING_LIMIT ? [{ path: url }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -1014,10 +1014,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Analyze image: ${imageSource}`,
+        title: elideStringForPreview(`Analyze image: ${imageSource}`),
         kind: "fetch",
         status: "in_progress",
-        locations: [{ path: imageSource }],
+        locations: imageSource.length <= PREVIEW_STRING_LIMIT ? [{ path: imageSource }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -1056,7 +1056,7 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: toolName,
+        title: elideStringForPreview(toolName),
         kind: "other",
         status: "in_progress",
         locations: [],
@@ -1214,7 +1214,7 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: toolName,
+        title: elideStringForPreview(toolName),
         kind: "other",
         status: "failed",
         locations: [],
