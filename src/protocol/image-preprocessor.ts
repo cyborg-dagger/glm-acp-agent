@@ -51,6 +51,7 @@ export async function preprocessImageBlocks(
     if (block.type === "image") imageIndexes.set(blockIndex, ++imageIndex);
   });
   let nextBlockIndex = 0;
+  let fatalFailure = false;
 
   const processBlock = async (blockIndex: number): Promise<void> => {
     const block = blocks[blockIndex];
@@ -108,10 +109,17 @@ export async function preprocessImageBlocks(
 
   const runWorker = async (): Promise<void> => {
     while (true) {
+      if (fatalFailure) return;
       throwIfAborted(signal);
       const blockIndex = nextBlockIndex++;
       if (blockIndex >= blocks.length) return;
-      await processBlock(blockIndex);
+      try {
+        await processBlock(blockIndex);
+      } catch (err) {
+        // Any unexpected preparation failure makes this batch unusable. Let current work drain, but do not schedule more blocks.
+        fatalFailure = true;
+        throw err;
+      }
     }
   };
 

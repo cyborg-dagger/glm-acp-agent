@@ -131,6 +131,53 @@ test("preprocessImageBlocks bounds parallel analysis while preserving original b
   assert.deepEqual(result.blocks.slice(6), [{ type: "text", text: "after" }]);
 });
 
+test("preprocessImageBlocks stops scheduling after inline preparation fails and drains in-flight URI analyses", async () => {
+  let visionCalls = 0;
+  let cleaned = 0;
+  let resolveTwoAnalysesStarted!: () => void;
+  const twoAnalysesStarted = new Promise<void>((resolve) => { resolveTwoAnalysesStarted = resolve; });
+  let releaseAnalyses!: () => void;
+  const analysesReleased = new Promise<void>((resolve) => { releaseAnalyses = resolve; });
+  let resolvePreparationAttempted!: () => void;
+  const preparationAttempted = new Promise<void>((resolve) => { resolvePreparationAttempted = resolve; });
+  const preparationError = new Error("cannot materialize inline image");
+
+  const result = preprocessImageBlocks(
+    [
+      { type: "image", data: "AAAA", mimeType: "image/png" },
+      { type: "image", data: "", mimeType: "image/png", uri: "fixture://uri-1" },
+      { type: "image", data: "", mimeType: "image/png", uri: "fixture://uri-2" },
+      { type: "image", data: "", mimeType: "image/png", uri: "fixture://uri-3" },
+    ],
+    makeClient(async () => {
+      visionCalls += 1;
+      if (visionCalls === 2) resolveTwoAnalysesStarted();
+      await analysesReleased;
+      return { content: [{ type: "text", text: "analysis" }] };
+    }),
+    undefined,
+    {
+      mkdtemp: async () => "/tmp/phase5-image-preparation-failure",
+      writeFile: async () => {
+        await twoAnalysesStarted;
+        resolvePreparationAttempted();
+        throw preparationError;
+      },
+      rm: async () => { cleaned += 1; },
+    },
+  );
+
+  await preparationAttempted;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(visionCalls, 2, "only the already-running URI analyses should have started");
+  assert.equal(cleaned, 0, "temporary files must remain until in-flight analyses drain");
+
+  releaseAnalyses();
+  await assert.rejects(result, (error: unknown) => error === preparationError);
+  assert.equal(visionCalls, 2, "queued URI images must not be analyzed after preparation fails");
+  assert.equal(cleaned, 1, "the failed inline image directory must be cleaned after draining");
+});
+
 test("preprocessImageBlocks waits for aborted parallel calls and cleans up every image file", async () => {
   const controller = new AbortController();
   let started = 0;
