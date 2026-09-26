@@ -398,7 +398,7 @@ If `Z_AI_API_KEY` is set in the environment **and** a credentials file exists, t
 2. Open the **agent panel** (use the command palette: `agent panel: toggle focus`).
 3. In the agent picker, select **glm** — Zed labels external agents by their `agent_servers` key.
 4. Start a new thread and send a small prompt that exercises a tool, e.g. `Read package.json and tell me the project name.`
-5. You should see streaming text, a `read_file` tool call awaiting permission, and (with a thinking-capable model like `glm-5.3`) reasoning surfaced as a separate thought block.
+5. You should see streaming text, a `read_file` tool call that runs without a permission prompt, and (with a thinking-capable model like `glm-5.3`) reasoning surfaced as a separate thought block. Writes and shell commands require approval in the default mode.
 
 #### 5. Iterating on the agent
 
