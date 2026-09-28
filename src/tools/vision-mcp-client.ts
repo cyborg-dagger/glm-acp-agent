@@ -7,6 +7,7 @@ import {
   DEFAULT_MCP_MAX_SCHEMA_BYTES,
   DEFAULT_MCP_MAX_TOOLS,
 } from "./mcp-pagination.js";
+import { exceedsMcpResponseLimit } from "./mcp-response-limit.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_INITIALIZATION_TIMEOUT_MS = 30_000;
@@ -299,6 +300,7 @@ export class StdioVisionMcpClient implements VisionMcpClient {
     this.exited = true;
     this.exitReason = error.message;
     this.initialized = null;
+    this.buffer = "";
     this.rejectAllPending(error);
     if (kill) {
       this.terminateChild(child);
@@ -385,8 +387,14 @@ export class StdioVisionMcpClient implements VisionMcpClient {
     this.buffer += chunk;
     let idx: number;
     while ((idx = this.buffer.indexOf("\n")) !== -1) {
-      const line = this.buffer.slice(0, idx).trim();
+      const raw = this.buffer.slice(0, idx);
+      if (exceedsMcpResponseLimit(raw)) {
+        const child = this.child;
+        if (child) this.failConnection(new Error("Vision MCP response exceeds byte limit"), child, true);
+        return;
+      }
       this.buffer = this.buffer.slice(idx + 1);
+      const line = raw.trim();
       if (!line) continue;
       let parsed: { id?: number; result?: unknown; error?: { code?: number; message?: string } };
       try {
@@ -403,6 +411,10 @@ export class StdioVisionMcpClient implements VisionMcpClient {
       } else {
         pending.resolve(parsed.result);
       }
+    }
+    if (exceedsMcpResponseLimit(this.buffer)) {
+      const child = this.child;
+      if (child) this.failConnection(new Error("Vision MCP response exceeds byte limit"), child, true);
     }
   }
 }
