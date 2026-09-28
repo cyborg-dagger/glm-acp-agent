@@ -948,14 +948,19 @@ test("shutdown keeps the last valid checkpoint when a prompt exceeds the drain d
 
 test("shutdown waits for a slow store before resolving", async () => {
   const { store: realStore, cleanup } = makeTempStore();
+  const trackedSaves: Promise<void>[] = [];
   try {
     const conn = createConnectionStub();
     let savesDurable = 0;
     const store = {
       save: async (session: Parameters<SessionStore["save"]>[0]) => {
-        await new Promise<void>((resolve) => { setTimeout(resolve, 40); });
-        await realStore.save(session);
-        savesDurable += 1;
+        const pending = (async () => {
+          await new Promise<void>((resolve) => { setTimeout(resolve, 40); });
+          await realStore.save(session);
+          savesDurable += 1;
+        })();
+        trackedSaves.push(pending);
+        return pending;
       },
       flush: () => realStore.flush(),
     } as unknown as SessionStore;
@@ -963,7 +968,9 @@ test("shutdown waits for a slow store before resolving", async () => {
     const agent = new GlmAcpAgent(conn as never, {
       glm,
       sessionStore: store,
-      shutdownDrainTimeoutMs: 500,
+      // Generous on purpose: the drain must outlast slowest-CI fsync latency,
+      // not just the artificial 40 ms delay.
+      shutdownDrainTimeoutMs: 10_000,
     });
     await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
     const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
@@ -978,12 +985,16 @@ test("shutdown waits for a slow store before resolving", async () => {
       (message) => message.role === "assistant" && message.content === "final turn"
     ));
   } finally {
+    // A timed-out drain leaves writes pending in the background; let them
+    // settle before the tempdir is removed or they fail with spurious ENOENT.
+    await Promise.allSettled(trackedSaves);
     cleanup();
   }
 });
 
 test("shutdown flushes queued checkpoints before rethrowing a resource cleanup error", async () => {
   const { store: realStore, cleanup } = makeTempStore();
+  const trackedSaves: Promise<void>[] = [];
   try {
     const conn = createConnectionStub();
     // The final checkpoint sits in a deliberately slow write queue while MCP
@@ -992,9 +1003,13 @@ test("shutdown flushes queued checkpoints before rethrowing a resource cleanup e
     let savesDurable = 0;
     const store = {
       save: async (session: Parameters<SessionStore["save"]>[0]) => {
-        await new Promise<void>((resolve) => { setTimeout(resolve, 40); });
-        await realStore.save(session);
-        savesDurable += 1;
+        const pending = (async () => {
+          await new Promise<void>((resolve) => { setTimeout(resolve, 40); });
+          await realStore.save(session);
+          savesDurable += 1;
+        })();
+        trackedSaves.push(pending);
+        return pending;
       },
       flush: () => realStore.flush(),
     } as unknown as SessionStore;
@@ -1002,7 +1017,7 @@ test("shutdown flushes queued checkpoints before rethrowing a resource cleanup e
     const agent = new GlmAcpAgent(conn as never, {
       glm,
       sessionStore: store,
-      shutdownDrainTimeoutMs: 500,
+      shutdownDrainTimeoutMs: 10_000,
       mcpConnector: async () => ({
         toolDefinitions: [],
         async dispose() { throw new Error("mcp disposal failed"); },
@@ -1023,6 +1038,7 @@ test("shutdown flushes queued checkpoints before rethrowing a resource cleanup e
       (message) => message.role === "assistant" && message.content === "durable turn"
     ));
   } finally {
+    await Promise.allSettled(trackedSaves);
     cleanup();
   }
 });

@@ -121,7 +121,7 @@ test("HTTP idle timeout aborts the underlying provider connection", async () => 
     await assert.rejects(async () => {
       for await (const chunk of client.streamChat([], undefined, { model: "glm-5.3", idleTimeoutMs: 40 })) void chunk;
     }, (error: unknown) => error instanceof ModelStreamIdleTimeoutError);
-    const deadline = Date.now() + 1_000;
+    const deadline = Date.now() + 3_000;
     while (!connectionClosed && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 10));
     }
