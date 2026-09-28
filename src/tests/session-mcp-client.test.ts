@@ -275,6 +275,33 @@ test("HTTP MCP rejects an oversized discovery response before JSON parsing", asy
     globalThis.fetch = previous;
   }
 });
+
+test("HTTP MCP clamps an oversized error body in failure messages", async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = (async (_url, init) => {
+    const request = JSON.parse(String(init?.body ?? "{}")) as { method?: string };
+    if (request.method === "initialize") {
+      return new Response("a".repeat(1024 * 1024), {
+        status: 502,
+        headers: { "Content-Type": "text/plain" },
+      });
+    }
+    throw new Error(`unexpected method ${String(request.method)}`);
+  }) as typeof fetch;
+  const client = new HttpMcpClient(httpServer());
+  try {
+    await assert.rejects(client.listTools(), (error: Error) => {
+      assert.match(error.message, /initialize failed: HTTP 502/);
+      assert.ok(error.message.length < 4_000, `clamped message should stay well under 4 KB, got ${error.message.length}`);
+      assert.ok(error.message.endsWith("…"), "clamped message should end with an ellipsis marker");
+      assert.ok(!error.message.includes("a".repeat(3_000)), "the full oversized body must not be interpolated");
+      return true;
+    });
+  } finally {
+    await client.dispose();
+    globalThis.fetch = previous;
+  }
+});
 test("HTTP MCP retries initialization for a caller started immediately after cancellation", async () => {
   const originalFetch = globalThis.fetch;
   let initializeCalls = 0;
@@ -1046,6 +1073,53 @@ test("StdioMcpClient terminates an oversized newline-less server frame", async (
   const pending = client.callTool("search", {});
   await tick();
   pushStdout("x".repeat(MCP_RESPONSE_LIMIT_BYTES + 1));
+  await assert.rejects(pending, /byte limit/);
+  await tick();
+  assert.ok(getKillCount() > 0);
+  await client.dispose();
+});
+
+test("StdioMcpClient keeps an under-limit frame arriving in many small chunks alive", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+  const list = client.listTools();
+  await completeHandshake(written, pushStdout);
+  await list;
+  const pending = client.callTool("search", {});
+  await tick();
+
+  // Just under the limit and delivered in many small chunks: the cheap
+  // character-count fast path must not misfire on any partial buffer, and the
+  // consumed line must leave the connection usable for the real response.
+  const frame = "x".repeat(MCP_RESPONSE_LIMIT_BYTES - 1);
+  for (let offset = 0; offset < frame.length; offset += 32_768) {
+    pushStdout(frame.slice(offset, offset + 32_768));
+  }
+  pushStdout("\n");
+  await tick();
+
+  const callBody = JSON.parse(written.at(-1)?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: callBody.id, result: { content: [{ type: "text", text: "ok" }] } }) + "\n");
+  await assert.doesNotReject(pending);
+  assert.equal(getKillCount(), 0);
+  await client.dispose();
+});
+
+test("StdioMcpClient terminates a frame that crosses the limit across many small chunks", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+  const list = client.listTools();
+  await completeHandshake(written, pushStdout);
+  await list;
+  const pending = client.callTool("search", {});
+  await tick();
+
+  // Crossing the character-count limit chunk by chunk must still trip the
+  // oversize kill rather than slipping past the fast path.
+  const frame = "x".repeat(MCP_RESPONSE_LIMIT_BYTES + 1);
+  for (let offset = 0; offset < frame.length; offset += 32_768) {
+    pushStdout(frame.slice(offset, offset + 32_768));
+  }
   await assert.rejects(pending, /byte limit/);
   await tick();
   assert.ok(getKillCount() > 0);

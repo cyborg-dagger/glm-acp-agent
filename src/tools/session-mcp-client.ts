@@ -8,7 +8,11 @@ import {
   DEFAULT_MCP_MAX_SCHEMA_BYTES,
   DEFAULT_MCP_MAX_TOOLS,
 } from "./mcp-pagination.js";
-import { MCP_RESPONSE_LIMIT_BYTES, readMcpResponseText } from "./mcp-response-limit.js";
+import {
+  clampMcpHttpErrorBody,
+  exceedsMcpResponseLimit,
+  readMcpResponseText,
+} from "./mcp-response-limit.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 /** Generous: a cold `npx -y` fetch on Windows Defender can take well over a minute. */
@@ -383,7 +387,8 @@ export class HttpMcpClient implements ConnectedMcpClient {
       body: JSON.stringify(body),
     }, async response => {
       if (!response.ok) {
-        throw new Error(`MCP ${this.server.name} notifications/initialized failed: HTTP ${response.status}: ${await readMcpResponseText(response)}`);
+        const body = await readMcpResponseText(response);
+        throw new Error(`MCP ${this.server.name} notifications/initialized failed: HTTP ${response.status}: ${clampMcpHttpErrorBody(body)}`);
       }
       await response.body?.cancel();
     }, signal);
@@ -403,11 +408,11 @@ export class HttpMcpClient implements ConnectedMcpClient {
     }, async response => {
       const text = await readMcpResponseText(response);
       if (!response.ok) {
-        throw new Error(`MCP ${this.server.name} ${stage} failed: HTTP ${response.status}: ${text}`);
+        throw new Error(`MCP ${this.server.name} ${stage} failed: HTTP ${response.status}: ${clampMcpHttpErrorBody(text)}`);
       }
       const parsed = parseMcpResponse(text, response.headers.get("Content-Type") ?? "");
       if (parsed.error) {
-        throw new Error(`MCP ${this.server.name} ${stage} failed: ${JSON.stringify(parsed.error)}`);
+        throw new Error(`MCP ${this.server.name} ${stage} failed: ${clampMcpHttpErrorBody(JSON.stringify(parsed.error))}`);
       }
       return {
         body: parsed,
@@ -843,13 +848,14 @@ export class StdioMcpClient implements ConnectedMcpClient {
     this.buffer += chunk;
     let idx: number;
     while ((idx = this.buffer.indexOf("\n")) !== -1) {
-      if (Buffer.byteLength(this.buffer.slice(0, idx), "utf8") > MCP_RESPONSE_LIMIT_BYTES) {
+      const raw = this.buffer.slice(0, idx);
+      if (exceedsMcpResponseLimit(raw)) {
         const child = this.child;
         if (child) this.failConnection(new Error("MCP response exceeds byte limit"), child, true);
         return;
       }
-      const line = this.buffer.slice(0, idx).trim();
       this.buffer = this.buffer.slice(idx + 1);
+      const line = raw.trim();
       if (!line) continue;
       let parsed: JsonRpcResponse;
       try {
@@ -867,7 +873,7 @@ export class StdioMcpClient implements ConnectedMcpClient {
         pending.resolve(parsed.result);
       }
     }
-    if (Buffer.byteLength(this.buffer, "utf8") > MCP_RESPONSE_LIMIT_BYTES) {
+    if (exceedsMcpResponseLimit(this.buffer)) {
       const child = this.child;
       if (child) this.failConnection(new Error("MCP response exceeds byte limit"), child, true);
     }

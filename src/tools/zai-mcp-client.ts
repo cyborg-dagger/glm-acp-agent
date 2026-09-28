@@ -6,7 +6,7 @@ import {
   DEFAULT_MCP_MAX_SCHEMA_BYTES,
   DEFAULT_MCP_MAX_TOOLS,
 } from "./mcp-pagination.js";
-import { readMcpResponseText } from "./mcp-response-limit.js";
+import { clampMcpHttpErrorBody, readMcpResponseText } from "./mcp-response-limit.js";
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
@@ -341,18 +341,19 @@ function parseSseJsonRpc(text: string): JsonRpcResponse {
 }
 
 function formatMcpError(stage: string, status: number, body: string): string {
+  const shown = clampMcpHttpErrorBody(body);
   if (isCodingPlanEligibilityError(body)) {
-    return `MCP ${stage} failed: HTTP ${status}. Coding Plan quota/base URL/tool eligibility likely is not being met (business code 1113). ${body}`;
+    return `MCP ${stage} failed: HTTP ${status}. Coding Plan quota/base URL/tool eligibility likely is not being met (business code 1113). ${shown}`;
   }
-  return `MCP ${stage} failed: HTTP ${status}: ${body}`;
+  return `MCP ${stage} failed: HTTP ${status}: ${shown}`;
 }
 
 function formatJsonRpcError(stage: string, error: NonNullable<JsonRpcResponse["error"]>): string {
   const details = JSON.stringify(error);
   if (isCodingPlanEligibilityError(details)) {
-    return `MCP ${stage} failed: Coding Plan quota/base URL/tool eligibility likely is not being met (business code 1113). ${details}`;
+    return `MCP ${stage} failed: Coding Plan quota/base URL/tool eligibility likely is not being met (business code 1113). ${clampMcpHttpErrorBody(details)}`;
   }
-  return `MCP ${stage} failed: ${details}`;
+  return `MCP ${stage} failed: ${clampMcpHttpErrorBody(details)}`;
 }
 
 function isCodingPlanEligibilityError(body: string): boolean {
