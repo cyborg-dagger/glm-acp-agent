@@ -107,6 +107,27 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * Remove a tempdir that spawned children ran in. On Windows a just-exited
+ * child's cwd handle (or an antivirus scan) can hold the directory for a
+ * moment, so a bare rmSync intermittently fails with EBUSY/ENOTEMPTY — retry
+ * briefly before giving up.
+ */
+function rmTempDir(dir: string): void {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (attempt >= 5 || (code !== "EBUSY" && code !== "ENOTEMPTY" && code !== "EPERM")) {
+        throw err;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * attempt);
+    }
+  }
+}
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
@@ -1352,7 +1373,7 @@ test("run_command runs through sh -c so quoting/pipes work", async () => {
   assert.match(result.content, /MIXED/);
   assert.match(result.content, new RegExp(escapeRegExp(basename(dir))));
   assert.equal(conn.terminalCalls.length, 0);
-  rmSync(dir, { recursive: true, force: true });
+  rmTempDir(dir);
 });
 
 test("run_command includes stderr and non-zero exit code in the tool result", async () => {
@@ -1622,7 +1643,7 @@ test(
         assert.match(stdout, /SETTLED 15/, `helper ${attempt}/${PROBE_ATTEMPTS} output`);
       }
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmTempDir(dir);
     }
   }
 );
