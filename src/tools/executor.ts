@@ -55,6 +55,11 @@ const EDITOR_EOF_PROBE_LINE = 0xffffffff;
 const PREVIEW_STRING_LIMIT = 240;
 const PREVIEW_HEAD = 120;
 const PREVIEW_PAYLOAD_LIMIT_BYTES = 16_384;
+/**
+ * Location entries survive well past preview-string lengths so file/URL links
+ * keep working; only absurd paths are dropped from the card.
+ */
+const LOCATION_STRING_LIMIT = 4096;
 /** Depth at which the preview walker stops descending and emits "[nested]" instead. */
 const PREVIEW_MAX_DEPTH = 32;
 /** Marker replacing anything below PREVIEW_MAX_DEPTH or beyond the walk budget. */
@@ -288,7 +293,7 @@ export class ToolExecutor {
         title: elideStringForPreview(`Read file: ${path}`),
         kind: "read",
         status: "in_progress",
-        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
+        locations: path.length <= LOCATION_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -445,7 +450,7 @@ export class ToolExecutor {
         title: elideStringForPreview(`Write file: ${path}`),
         kind: "edit",
         status: "pending",
-        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
+        locations: path.length <= LOCATION_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -621,7 +626,7 @@ export class ToolExecutor {
         title: elideStringForPreview(`Edit file: ${path}`),
         kind: "edit",
         status: "pending",
-        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
+        locations: path.length <= LOCATION_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -750,7 +755,7 @@ export class ToolExecutor {
         title: elideStringForPreview(`List files: ${path}`),
         kind: "read",
         status: "in_progress",
-        locations: path.length <= PREVIEW_STRING_LIMIT ? [{ path }] : [],
+        locations: path.length <= LOCATION_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -1003,7 +1008,7 @@ export class ToolExecutor {
         title: elideStringForPreview(`Read URL: ${url}`),
         kind: "fetch",
         status: "in_progress",
-        locations: url.length <= PREVIEW_STRING_LIMIT ? [{ path: url }] : [],
+        locations: url.length <= LOCATION_STRING_LIMIT ? [{ path: url }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -1071,7 +1076,7 @@ export class ToolExecutor {
         title: elideStringForPreview(`Analyze image: ${imageSource}`),
         kind: "fetch",
         status: "in_progress",
-        locations: imageSource.length <= PREVIEW_STRING_LIMIT ? [{ path: imageSource }] : [],
+        locations: imageSource.length <= LOCATION_STRING_LIMIT ? [{ path: imageSource }] : [],
         rawInput: elideForPreview(args),
       },
     });
