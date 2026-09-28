@@ -238,6 +238,56 @@ test("StdioVisionMcpClient terminates an oversized newline-less server frame", a
   assert.ok(getKillCount() > 0);
   await client.dispose();
 });
+
+test("StdioVisionMcpClient keeps an under-limit frame arriving in many small chunks alive", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  const pending = client.callTool("image_analysis", { image_source: "demo" });
+  await new Promise((resolve) => setImmediate(resolve));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "image_analysis" }] } }) + "\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(written.length >= 4);
+
+  // Just under the limit in many small chunks: the cheap character-count fast
+  // path must not misfire, and the connection must stay usable afterwards.
+  const frame = "x".repeat(MCP_RESPONSE_LIMIT_BYTES - 1);
+  for (let offset = 0; offset < frame.length; offset += 32_768) {
+    pushStdout(frame.slice(offset, offset + 32_768));
+  }
+  pushStdout("\n");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const callBody = JSON.parse(written.at(-1)?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: callBody.id, result: { content: [{ type: "text", text: "ok" }] } }) + "\n");
+  await assert.doesNotReject(pending);
+  assert.equal(getKillCount(), 0);
+  await client.dispose();
+});
+
+test("StdioVisionMcpClient terminates a frame that crosses the limit across many small chunks", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const client = new StdioVisionMcpClient({ apiKey: "k", spawn: () => child as never });
+  const pending = client.callTool("image_analysis", { image_source: "demo" });
+  await new Promise((resolve) => setImmediate(resolve));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "image_analysis" }] } }) + "\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(written.length >= 4);
+
+  // Crossing the character-count limit chunk by chunk must still trip the
+  // oversize kill rather than slipping past the fast path.
+  const frame = "x".repeat(MCP_RESPONSE_LIMIT_BYTES + 1);
+  for (let offset = 0; offset < frame.length; offset += 32_768) {
+    pushStdout(frame.slice(offset, offset + 32_768));
+  }
+  await assert.rejects(pending, /byte limit/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(getKillCount() > 0);
+  await client.dispose();
+});
 test("StdioVisionMcpClient launches npx through cmd.exe on Windows", async () => {
   const { child } = makeFakeChild();
   let command = "";

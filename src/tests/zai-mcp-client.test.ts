@@ -512,3 +512,20 @@ test("ZaiMcpClient rejects a discovered catalog with duplicate tool names", asyn
     /duplicate tool name/i,
   );
 });
+
+test("ZaiMcpClient clamps an oversized HTTP error body in failure messages", async () => {
+  const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+  const { fetchStub } = createFetchStub([new Response("a".repeat(1024 * 1024), { status: 502 })]);
+
+  const client = new ZaiMcpClient(fetchStub as typeof fetch);
+  await assert.rejects(
+    () => client.callTool({ endpoint, toolName: "webSearchPrime", arguments: { query: "glm" }, apiKey: "test-key" }),
+    (error: Error) => {
+      assert.match(error.message, /initialize failed: HTTP 502/);
+      assert.ok(error.message.length < 4_000, `clamped message should stay well under 4 KB, got ${error.message.length}`);
+      assert.ok(error.message.endsWith("…"), "clamped message should end with an ellipsis marker");
+      assert.ok(!error.message.includes("a".repeat(3_000)), "the full oversized body must not be interpolated");
+      return true;
+    }
+  );
+});
