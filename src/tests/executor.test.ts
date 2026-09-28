@@ -20,7 +20,7 @@ interface StubTerminal {
 }
 
 function createConnectionStub(opts: {
-  permission?: "allow" | "reject" | "cancelled" | "missing" | "unoffered" | "unknown";
+  permission?: "allow" | "reject" | "cancelled" | "missing" | "unoffered" | "unknown" | "null" | "empty" | "nonstring";
   readError?: boolean;
   writeError?: boolean;
   terminalOutput?: string;
@@ -87,6 +87,12 @@ function createConnectionStub(opts: {
           return { outcome: { outcome: "selected", optionId: "allow_always" } };
         case "unknown":
           return { outcome: { outcome: "unknown" } };
+        case "null":
+          return null;
+        case "empty":
+          return {};
+        case "nonstring":
+          return { outcome: { outcome: "selected", optionId: 42 } };
       }
     },
   };
@@ -595,7 +601,7 @@ test("read_file labels a bounded partial line without reporting an impossible ra
   }
 });
 
-test("read_file elides the client content channel while the tool result stays full", async () => {
+test("read_file keeps small card content fully readable while the tool result stays full", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-elide-content-"));
   const path = join(dir, "long.txt");
   writeFileSync(path, `${"a".repeat(400)}\nsecond line`, "utf8");
@@ -606,15 +612,16 @@ test("read_file elides the client content channel while the tool result stays fu
     // The model receives the full page through the tool result...
     assert.ok(result.content.startsWith("a".repeat(400)));
     assert.match(result.content, /second line/);
-    // ...but the client-facing content channel is elided.
+    // ...and the client-facing content channel now carries the same full
+    // text: boundCardText is a passthrough within the 16 KiB preview budget.
     const completed = conn.updates.find(
       (u) =>
         (u.update as { sessionUpdate?: string }).sessionUpdate === "tool_call_update" &&
         Array.isArray((u.update as { content?: unknown[] }).content)
     ) as { update: { content: Array<{ content: { text: string } }> } };
     const text = completed.update.content[0]?.content.text ?? "";
-    assert.match(text, /chars\]$/);
-    assert.ok(text.length < 300);
+    assert.equal(text, result.content);
+    assert.doesNotMatch(text, /bytes elided in preview/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -732,7 +739,9 @@ test("write_file rejected by user marks call failed and skips writing", async ()
   }
 });
 
-for (const permission of ["missing", "unoffered", "unknown"] as const) {
+for (const permission of [
+  "missing", "unoffered", "unknown", "null", "empty", "nonstring",
+] as const) {
   test(`unexpected ${permission} permission outcome never writes or executes`, async () => {
     const dir = mkdtempSync(join(tmpdir(), "glm-permission-invalid-"));
     try {
@@ -764,9 +773,41 @@ test("session MCP notifications elide large content and aggregate small fields",
     assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
   }
   const final = conn.updates.at(-1)?.update as { rawOutput: unknown; content: Array<{ content: { text: string } }> };
-  assert.ok(final.content[0]?.content.text.length < 240);
+  // The card carries the 16 KiB UTF-8 prefix plus the elision marker, while
+  // the model-facing tool result keeps the full 50,000-byte text.
+  const cardText = final.content[0]?.content.text ?? "";
+  assert.ok(cardText.startsWith("x".repeat(16_384)));
+  assert.match(cardText, /\[… 33616 bytes elided in preview; full result sent to model\]$/);
+  assert.ok(Buffer.byteLength(cardText, "utf8") <= 16_384 + 200);
   assert.notDeepEqual(final.rawOutput, raw);
 });
+
+test("completed cards over 16 KiB keep a readable UTF-8 prefix while the model result stays full", async () => {
+  const conn = createConnectionStub();
+  // Multibyte tail proves the prefix cut is UTF-8-safe (no replacement chars).
+  const full = `${"y".repeat(20_000)}结尾`;
+  const vision = fakeVisionClient(async () => ({ content: [{ type: "text", text: full }] }));
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
+  const result = await executor.execute(
+    "tc1",
+    "image_analysis",
+    JSON.stringify({ image_source: "/tmp/big.png" })
+  );
+  // The model-facing tool result keeps the complete text.
+  assert.equal(result.content, full);
+  const completed = conn.updates.find(
+    (u) =>
+      (u.update as { sessionUpdate?: string }).sessionUpdate === "tool_call_update" &&
+      Array.isArray((u.update as { content?: unknown[] }).content)
+  ) as { update: { status?: string; content: Array<{ content: { text: string } }> } };
+  assert.equal(completed.update.status, "completed");
+  const cardText = completed.update.content[0]?.content.text ?? "";
+  assert.ok(cardText.startsWith("y".repeat(16_384)));
+  assert.doesNotMatch(cardText, /\uFFFD/);
+  assert.match(cardText, /\[… 3622 bytes elided in preview; full result sent to model\]$/);
+  assert.ok(Buffer.byteLength(cardText, "utf8") <= 16_384 + 200);
+});
+
 test("failed tool cards bound both invalid arguments and upstream error bodies", async () => {
   const text = "z".repeat(50_000);
   const conn = createConnectionStub();
