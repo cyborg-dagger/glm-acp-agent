@@ -208,7 +208,7 @@ async function withStoredApiKey<T>(fn: () => Promise<T>): Promise<T> {
     else process.env["Z_AI_API_KEY"] = oldEnv;
     if (oldXdg === undefined) delete process.env["XDG_CONFIG_HOME"];
     else process.env["XDG_CONFIG_HOME"] = oldXdg;
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 }
 
@@ -271,7 +271,7 @@ test("invalid roots and write/edit arguments fail before permissions or filesyst
     }
     assert.equal(readFileSync(path, "utf8"), "remove this");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -296,7 +296,7 @@ test("explicit empty write and edit text remain valid destructive operations", a
     assert.equal(readFileSync(editPath, "utf8"), "before  after");
     assert.equal(conn.permissionRequests.length, 2);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -331,7 +331,7 @@ test("read_file reads from the agent process without fs.readTextFile capability"
     const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
     assert.equal(result.content, "from disk");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -346,7 +346,7 @@ test("read_file reads the client's unsaved buffer when both fs capabilities are 
     assert.equal(result.content, "unsaved buffer");
     assert.deepEqual(conn.readTextFileCalls.map((call) => call.path), [path]);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -365,7 +365,7 @@ test("write_file writes from the agent process without fs.writeTextFile capabili
     assert.equal(readFileSync(path, "utf8"), "hi");
     assert.equal(conn.writeTextFileCalls.length, 0);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -387,7 +387,7 @@ test("write_file routes through fs.writeTextFile when the client advertises it",
       [{ path, content: "via client" }]
     );
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -403,7 +403,7 @@ test("list_files and run_command execute in the agent process without terminal c
     assert.match(rc.content, new RegExp(escapeRegExp(basename(dir))));
     assert.equal(conn.terminalCalls.length, 0);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -435,7 +435,7 @@ test("read_file truncates large files with a range marker", async () => {
     assert.match(second.content, /line-5/);
     assert.doesNotMatch(second.content, /line-4\b/);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -471,7 +471,7 @@ test("read_file treats editor line pagination as pagination, not byte truncation
     assert.match(next.content, /^line-3\nline-4(?:\n|$)/);
     assert.doesNotMatch(next.content, /line-1|line-2/);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -498,7 +498,7 @@ test("read_file renders EOF for a conforming editor at a short or empty offset",
     const farPast = await exec.execute("tc3", "read_file", JSON.stringify({ path, offset: 100, limit: 2 }));
     assert.match(farPast.content, /end of file: offset 100 is beyond the end of/);
     assert.doesNotMatch(farPast.content, /99 lines/);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmTempDir(dir); }
 });
 
 test("read_file paginates a legacy editor full buffer for a short offset page", async () => {
@@ -524,7 +524,7 @@ test("read_file paginates a legacy editor full buffer for a short offset page", 
     assert.doesNotMatch(result.content, /^line-1\n/);
     assert.match(result.content, /showing lines 2-3 .*end of file/);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -550,7 +550,7 @@ test("read_file treats a one-line legacy editor buffer as EOF past its only line
     assert.match(result.content, /offset 2 is beyond the last line of .* \(1 line\)/);
     assert.doesNotMatch(result.content, /only-line/);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -573,7 +573,7 @@ test("read_file final page reports end of file without a next-offset hint", asyn
     // offset there sent the model into an endless last-line loop.
     assert.doesNotMatch(last.content, /pass offset=/);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -597,7 +597,7 @@ test("read_file offset beyond EOF returns an EOF result without clamping or a hi
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "completed");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -618,7 +618,7 @@ test("read_file labels a bounded partial line without reporting an impossible ra
     assert.doesNotMatch(result.content, /complete lines 2-1/);
     assert.match(result.content, /^d\n/);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -644,7 +644,7 @@ test("read_file keeps small card content fully readable while the tool result st
     assert.equal(text, result.content);
     assert.doesNotMatch(text, /bytes elided in preview/);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -664,7 +664,7 @@ test("read_file bounds a real large local result before it can enter model histo
     assert.match(result.content, /bytes omitted/);
     assert.ok(!result.content.includes("\uFFFD"));
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -689,7 +689,7 @@ test("read_file success path emits in_progress and completed updates", async () 
       { type: "tool_call_update", status: "completed" },
     ]);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -703,7 +703,7 @@ test("read_file failure is reported with status=failed and an error message", as
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "failed");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -736,7 +736,7 @@ test("write_file requests permission, then transitions through pending → in_pr
       { type: "tool_call_update", status: "completed" },
     ]);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -756,7 +756,7 @@ test("write_file rejected by user marks call failed and skips writing", async ()
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "failed");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -777,7 +777,7 @@ for (const permission of [
       assert.deepEqual(conn.terminalCalls, []);
       assert.equal(conn.permissionRequests.length, 2);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmTempDir(dir);
     }
   });
 }
@@ -910,7 +910,7 @@ test("edit_file replaces a unique snippet and goes through the permission flow",
       { type: "tool_call_update", status: "completed" },
     ]);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -931,7 +931,7 @@ test("edit_file replaces a unique blank-line snippet through the permission flow
     assert.equal(readFileSync(path, "utf8"), "before\ninserted\nafter\n");
     assert.equal(conn.permissionRequests.length, 1);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -951,7 +951,7 @@ test("edit_file inserts replacement text literally when it contains replace toke
     assert.match(result.content, /edited successfully/);
     assert.equal(readFileSync(path, "utf8"), `before ${newText} after`);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -994,7 +994,7 @@ test("write_file does not mutate after the turn aborts while permission is pendi
     assert.equal(writeCalls, 0);
     assert.equal(existsSync(path), false);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1038,7 +1038,7 @@ test("edit_file does not mutate after the turn aborts while permission is pendin
     assert.equal(writeCalls, 0);
     assert.equal(readFileSync(path, "utf8"), "before");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1070,7 +1070,7 @@ test("write_file settles when a pending permission request never responds", asyn
     const result = await pending;
     assert.match(result.content, /cancelled/i);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1092,7 +1092,7 @@ test("edit_file fails fast when old_text is absent, without requesting permissio
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "failed");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1112,7 +1112,7 @@ test("edit_file refuses ambiguous old_text matches", async () => {
     assert.equal(readFileSync(path, "utf8"), "return 1;\nreturn 1;\n");
     assert.equal(conn.permissionRequests.length, 0);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1133,7 +1133,7 @@ test("edit_file rejected by user leaves the file untouched", async () => {
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "failed");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1157,7 +1157,7 @@ test("edit_file computes the edit against the client's buffer, not stale disk", 
       ["const a = 1;\nconst b = 3;\n"]
     );
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1180,7 +1180,7 @@ test("edit_file falls back to agent-process disk I/O without the writeTextFile c
     assert.equal(conn.writeTextFileCalls.length, 0);
     assert.equal(conn.readTextFileCalls.length, 0);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1207,7 +1207,7 @@ test("edit_file re-validates after the permission prompt and refuses a file chan
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "failed");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1227,7 +1227,7 @@ test("write_file surfaces client writeTextFile failures as a failed tool result"
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "failed");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1294,7 +1294,7 @@ test("write_file elides long content in client previews but writes the full file
     assert.match(announce.update.rawInput.content, /5000 chars\]$/);
     assert.ok(announce.update.rawInput.content.length < 300);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1339,7 +1339,7 @@ test("permission prompts receive the full payload while UI cards stay elided", a
     assert.match(announce.update.rawInput.content, /5000 chars\]$/);
     assert.ok(announce.update.rawInput.content.length < 300);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -1459,7 +1459,7 @@ test(
       await new Promise((resolve) => setTimeout(resolve, 1_400));
       assert.equal(existsSync(marker), false);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmTempDir(dir);
     }
   }
 );
@@ -1513,7 +1513,7 @@ test(
       await new Promise((resolve) => setTimeout(resolve, 900));
       assert.equal(existsSync(marker), false);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmTempDir(dir);
     }
   }
 );
@@ -1762,7 +1762,7 @@ test("list_files resolves relative paths against the session cwd", async () => {
   );
   assert.match(result.content, /with space\.txt/);
   assert.equal(conn.terminalCalls.length, 0);
-  rmSync(dir, { recursive: true, force: true });
+  rmTempDir(dir);
 });
 
 test("list_files rejects empty path", async () => {
@@ -1785,7 +1785,7 @@ test("list_files caps an oversized empty-directory header and marks it truncated
     assert.ok(Buffer.byteLength(result.content, "utf8") <= limits.listBytes);
     assert.match(result.content, /\[listing truncated:/);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -2041,7 +2041,7 @@ test("write_file skips permission prompt in accept_edits mode", async () => {
     assert.match(result.content, /written successfully/);
     assert.equal(readFileSync(path, "utf8"), "hi");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
@@ -2060,7 +2060,7 @@ test("write_file skips permission prompt in bypass_permissions mode", async () =
     assert.match(result.content, /written successfully/);
     assert.equal(readFileSync(path, "utf8"), "hi");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTempDir(dir);
   }
 });
 
