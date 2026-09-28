@@ -787,7 +787,10 @@ test("close aborts stalled restore MCP setup and disposes a late empty-catalog r
     await Promise.race([
       close,
       new Promise<never>((_resolve, reject) => {
-        setTimeout(() => reject(new Error("close waited for stalled MCP setup")), 50);
+        // Generous bound: the raced close resolves through a real fsync'd
+        // session write, which can exceed 100 ms on slow CI runners. The
+        // property under test is that close never blocks on the held stall.
+        setTimeout(() => reject(new Error("close waited for stalled MCP setup")), 2_000);
       }),
     ]);
     assert.equal(abortObserved, true, "close must abort the restore connector");
@@ -1339,7 +1342,10 @@ test("close cancels stalled fork MCP setup and disposes its late result once", a
     assert.equal(setupSignal?.aborted, true, "close must abort the fork connector");
     await forkRejected;
     const watchdog = new Promise<never>((_resolve, reject) => {
-      setTimeout(() => reject(new Error("close waited for stalled fork MCP setup")), 100).unref();
+      // Generous bound: the raced close resolves through a real fsync'd
+      // session write, which can exceed 100 ms on slow CI runners. The
+      // property under test is that close never blocks on the held stall.
+      setTimeout(() => reject(new Error("close waited for stalled fork MCP setup")), 2_000).unref();
     });
     await Promise.race([closing, watchdog]);
     assert.equal(disposed, 0, "the late setup result is not available yet");
@@ -1630,7 +1636,10 @@ test("close interrupts a stalled unloaded restore replay", async () => {
     const close = agent.closeSession({ sessionId });
     await Promise.race([
       close,
-      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("close waited for replay")), 50)),
+      // Generous bound: the raced close resolves through a real fsync'd
+      // session write, which can exceed 100 ms on slow CI runners. The
+      // property under test is that close never blocks on the held replay.
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("close waited for replay")), 2_000)),
     ]);
     await assert.rejects(load, /cancelled/i);
   } finally {
