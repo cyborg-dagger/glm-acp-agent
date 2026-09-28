@@ -55,6 +55,14 @@ const EDITOR_EOF_PROBE_LINE = 0xffffffff;
 const PREVIEW_STRING_LIMIT = 240;
 const PREVIEW_HEAD = 120;
 const PREVIEW_PAYLOAD_LIMIT_BYTES = 16_384;
+/** Depth at which the preview walker stops descending and emits "[nested]" instead. */
+const PREVIEW_MAX_DEPTH = 32;
+/** Marker replacing anything below PREVIEW_MAX_DEPTH or beyond the walk budget. */
+const PREVIEW_DEPTH_MARKER = "[nested]";
+/** Running charge (approximate bytes of visited material) after which the preview walk stops early. */
+const PREVIEW_WALK_BUDGET_BYTES = 262_144;
+/** Marker charged into objects/arrays when the walk budget is exhausted mid-container. */
+const PREVIEW_ELIDED_KEY = "[elided]";
 
 /** Format a bounded listing while measuring each candidate line only once. */
 export function formatDirectoryListing(
@@ -102,24 +110,63 @@ function elideStringForPreview(value: string): string {
  * The full payload still reaches the model through the tool result channel.
  */
 function elideForPreview(value: unknown): unknown {
-  const preview = elidePreviewStrings(value);
-  const serialized = JSON.stringify(preview);
-  if (serialized !== undefined && Buffer.byteLength(serialized, "utf8") > PREVIEW_PAYLOAD_LIMIT_BYTES) {
-    return { truncated: `Preview exceeds ${PREVIEW_PAYLOAD_LIMIT_BYTES}-byte limit` };
+  try {
+    const preview = elidePreviewStrings(value, 0, { remaining: PREVIEW_WALK_BUDGET_BYTES });
+    const serialized = JSON.stringify(preview);
+    if (serialized !== undefined && Buffer.byteLength(serialized, "utf8") > PREVIEW_PAYLOAD_LIMIT_BYTES) {
+      return { truncated: `Preview exceeds ${PREVIEW_PAYLOAD_LIMIT_BYTES}-byte limit` };
+    }
+    return preview;
+  } catch {
+    // Preview construction is best-effort display data: a pathological input
+    // (throwing getter, exotic proxy, …) must never flip a tool call that
+    // already executed to "failed", so degrade to the same `truncated` shape.
+    return { truncated: "Preview unavailable" };
   }
-  return preview;
 }
 
-function elidePreviewStrings(value: unknown): unknown {
-  if (typeof value === "string") return elideStringForPreview(value);
-  if (Array.isArray(value)) return value.map(elidePreviewStrings);
-  if (typeof value === "object" && value !== null) {
-    const out: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = elidePreviewStrings(item);
+/**
+ * Walk `value` for preview rendering, eliding long strings. The walk is bounded
+ * so an untrusted result can never drive unbounded recursion or CPU:
+ * - deeper than PREVIEW_MAX_DEPTH, or any visit once the running byte budget
+ *   is spent, collapses to PREVIEW_DEPTH_MARKER;
+ * - each visited node charges the budget (elided string characters, keys,
+ *   scalar/element nodes) and the walk stops early once it is exhausted.
+ * The PREVIEW_PAYLOAD_LIMIT_BYTES check in elideForPreview still decides
+ * whether the finished preview fits; the bounds here only stop the work.
+ */
+function elidePreviewStrings(value: unknown, depth: number, budget: { remaining: number }): unknown {
+  if (depth > PREVIEW_MAX_DEPTH || budget.remaining <= 0) return PREVIEW_DEPTH_MARKER;
+  if (typeof value === "string") {
+    const out = elideStringForPreview(value);
+    budget.remaining -= out.length + 2;
+    return out;
+  }
+  if (Array.isArray(value)) {
+    const out: unknown[] = [];
+    for (const item of value) {
+      out.push(elidePreviewStrings(item, depth + 1, budget));
+      budget.remaining -= 1;
+      if (budget.remaining <= 0) {
+        out.push(PREVIEW_DEPTH_MARKER);
+        break;
+      }
     }
     return out;
   }
+  if (typeof value === "object" && value !== null) {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = elidePreviewStrings(item, depth + 1, budget);
+      budget.remaining -= key.length + 2;
+      if (budget.remaining <= 0) {
+        out[PREVIEW_ELIDED_KEY] = PREVIEW_DEPTH_MARKER;
+        break;
+      }
+    }
+    return out;
+  }
+  budget.remaining -= 8;
   return value;
 }
 

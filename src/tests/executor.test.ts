@@ -2117,3 +2117,43 @@ test("image_analysis is unavailable when no vision client is configured", async 
   );
   assert.match(result.content, /vision[^.]*not configured/i);
 });
+
+test("session MCP tool with ~10k-deep result completes with bounded preview markers", async () => {
+  const conn = createConnectionStub();
+  let deep: Record<string, unknown> = { leaf: "end" };
+  for (let i = 0; i < 10_000; i++) deep = { nested: deep };
+  const raw = { content: [{ type: "text", text: "deep ok" }], data: deep };
+  const tools = { hasTool: () => true, callTool: async () => raw };
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, tools as never);
+  const result = await executor.execute("mcp-deep", "custom_tool", JSON.stringify({ q: 1 }));
+  // The tool already ran — the preview walk must not flip it to failed.
+  assert.equal(result.content, "deep ok");
+  const failed = conn.updates.filter((u) => (u.update as { status?: string }).status === "failed");
+  assert.equal(failed.length, 0);
+  const completed = conn.updates.filter((u) => (u.update as { status?: string }).status === "completed");
+  assert.equal(completed.length, 1);
+  const final = completed[0]!.update as { rawOutput: unknown };
+  const serialized = JSON.stringify(final.rawOutput)!;
+  assert.ok(serialized.includes("[nested]"), "depth marker present");
+  assert.ok((serialized.match(/"nested"/g) ?? []).length <= 40, "walk did not descend the full depth");
+  for (const event of conn.updates) {
+    assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
+  }
+});
+
+test("session MCP preview construction failure cannot fail an executed tool call", async () => {
+  const conn = createConnectionStub();
+  const raw: Record<string, unknown> = {
+    content: [{ type: "text", text: "computed fine" }],
+    get data(): never {
+      throw new Error("preview exploded");
+    },
+  };
+  const tools = { hasTool: () => true, callTool: async () => raw };
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, tools as never);
+  const result = await executor.execute("mcp-throw", "custom_tool", "{}");
+  assert.equal(result.content, "computed fine");
+  const last = conn.updates.at(-1)?.update as { status?: string; rawOutput: unknown };
+  assert.equal(last.status, "completed");
+  assert.deepEqual(last.rawOutput, { truncated: "Preview unavailable" });
+});
