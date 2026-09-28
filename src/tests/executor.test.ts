@@ -20,7 +20,7 @@ interface StubTerminal {
 }
 
 function createConnectionStub(opts: {
-  permission?: "allow" | "reject" | "cancelled";
+  permission?: "allow" | "reject" | "cancelled" | "missing" | "unoffered" | "unknown" | "null" | "empty" | "nonstring";
   readError?: boolean;
   writeError?: boolean;
   terminalOutput?: string;
@@ -81,6 +81,18 @@ function createConnectionStub(opts: {
           return { outcome: { outcome: "selected", optionId: "reject" } };
         case "cancelled":
           return { outcome: { outcome: "cancelled" } };
+        case "missing":
+          return { outcome: { outcome: "selected" } };
+        case "unoffered":
+          return { outcome: { outcome: "selected", optionId: "allow_always" } };
+        case "unknown":
+          return { outcome: { outcome: "unknown" } };
+        case "null":
+          return null;
+        case "empty":
+          return {};
+        case "nonstring":
+          return { outcome: { outcome: "selected", optionId: 42 } };
       }
     },
   };
@@ -93,6 +105,27 @@ const FULL_CAPS = {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Remove a tempdir that spawned children ran in. On Windows a just-exited
+ * child's cwd handle (or an antivirus scan) can hold the directory for a
+ * moment, so a bare rmSync intermittently fails with EBUSY/ENOTEMPTY — retry
+ * briefly before giving up.
+ */
+function rmTempDir(dir: string): void {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (attempt >= 5 || (code !== "EBUSY" && code !== "ENOTEMPTY" && code !== "EPERM")) {
+        throw err;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * attempt);
+    }
+  }
 }
 
 function shellQuote(value: string): string {
@@ -589,7 +622,7 @@ test("read_file labels a bounded partial line without reporting an impossible ra
   }
 });
 
-test("read_file elides the client content channel while the tool result stays full", async () => {
+test("read_file keeps small card content fully readable while the tool result stays full", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-elide-content-"));
   const path = join(dir, "long.txt");
   writeFileSync(path, `${"a".repeat(400)}\nsecond line`, "utf8");
@@ -600,15 +633,16 @@ test("read_file elides the client content channel while the tool result stays fu
     // The model receives the full page through the tool result...
     assert.ok(result.content.startsWith("a".repeat(400)));
     assert.match(result.content, /second line/);
-    // ...but the client-facing content channel is elided.
+    // ...and the client-facing content channel now carries the same full
+    // text: boundCardText is a passthrough within the 16 KiB preview budget.
     const completed = conn.updates.find(
       (u) =>
         (u.update as { sessionUpdate?: string }).sessionUpdate === "tool_call_update" &&
         Array.isArray((u.update as { content?: unknown[] }).content)
     ) as { update: { content: Array<{ content: { text: string } }> } };
     const text = completed.update.content[0]?.content.text ?? "";
-    assert.match(text, /chars\]$/);
-    assert.ok(text.length < 300);
+    assert.equal(text, result.content);
+    assert.doesNotMatch(text, /bytes elided in preview/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -726,6 +760,109 @@ test("write_file rejected by user marks call failed and skips writing", async ()
   }
 });
 
+for (const permission of [
+  "missing", "unoffered", "unknown", "null", "empty", "nonstring",
+] as const) {
+  test(`unexpected ${permission} permission outcome never writes or executes`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-permission-invalid-"));
+    try {
+      const path = join(dir, "denied.txt");
+      const conn = createConnectionStub({ permission });
+      const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+      const write = await executor.execute("write", "write_file", JSON.stringify({ path, content: "secret" }));
+      assert.match(write.content, /rejected/i);
+      assert.equal(existsSync(path), false);
+      const command = await executor.execute("command", "run_command", JSON.stringify({ command: "echo unsafe" }));
+      assert.match(command.content, /rejected/i);
+      assert.deepEqual(conn.terminalCalls, []);
+      assert.equal(conn.permissionRequests.length, 2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("session MCP notifications elide large content and aggregate small fields", async () => {
+  const conn = createConnectionStub();
+  const text = "x".repeat(50_000);
+  const raw = { content: [{ type: "text", text }], metadata: Array.from({ length: 1_000 }, (_, i) => ({ key: i, value: "v".repeat(30) })) };
+  const tools = { hasTool: () => true, callTool: async () => raw };
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, tools as never);
+  const result = await executor.execute("mcp", "custom_tool", JSON.stringify({ fields: Array.from({ length: 1_000 }, (_, i) => ({ key: i })) }));
+  assert.equal(result.content, text);
+  for (const event of conn.updates) {
+    assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
+  }
+  const final = conn.updates.at(-1)?.update as { rawOutput: unknown; content: Array<{ content: { text: string } }> };
+  // The card carries the 16 KiB UTF-8 prefix plus the elision marker, while
+  // the model-facing tool result keeps the full 50,000-byte text.
+  const cardText = final.content[0]?.content.text ?? "";
+  assert.ok(cardText.startsWith("x".repeat(16_384)));
+  assert.match(cardText, /\[… 33616 bytes elided in preview; full result sent to model\]$/);
+  assert.ok(Buffer.byteLength(cardText, "utf8") <= 16_384 + 200);
+  assert.notDeepEqual(final.rawOutput, raw);
+});
+
+test("completed cards over 16 KiB keep a readable UTF-8 prefix while the model result stays full", async () => {
+  const conn = createConnectionStub();
+  // Multibyte tail proves the prefix cut is UTF-8-safe (no replacement chars).
+  const full = `${"y".repeat(20_000)}结尾`;
+  const vision = fakeVisionClient(async () => ({ content: [{ type: "text", text: full }] }));
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
+  const result = await executor.execute(
+    "tc1",
+    "image_analysis",
+    JSON.stringify({ image_source: "/tmp/big.png" })
+  );
+  // The model-facing tool result keeps the complete text.
+  assert.equal(result.content, full);
+  const completed = conn.updates.find(
+    (u) =>
+      (u.update as { sessionUpdate?: string }).sessionUpdate === "tool_call_update" &&
+      Array.isArray((u.update as { content?: unknown[] }).content)
+  ) as { update: { status?: string; content: Array<{ content: { text: string } }> } };
+  assert.equal(completed.update.status, "completed");
+  const cardText = completed.update.content[0]?.content.text ?? "";
+  assert.ok(cardText.startsWith("y".repeat(16_384)));
+  assert.doesNotMatch(cardText, /\uFFFD/);
+  assert.match(cardText, /\[… 3622 bytes elided in preview; full result sent to model\]$/);
+  assert.ok(Buffer.byteLength(cardText, "utf8") <= 16_384 + 200);
+});
+
+test("failed tool cards bound both invalid arguments and upstream error bodies", async () => {
+  const text = "z".repeat(50_000);
+  const conn = createConnectionStub();
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const invalid = await executor.execute("invalid", "write_file", JSON.stringify({ path: "", content: text }));
+  assert.match(invalid.content, /path.*required/i);
+  const tools = { hasTool: () => true, callTool: async () => { throw new Error(text); } };
+  const mcpExecutor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, tools as never);
+  const failed = await mcpExecutor.execute("error", "custom_tool", "{}");
+  assert.match(failed.content, /Error calling MCP tool/);
+  for (const event of conn.updates) {
+    assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
+  }
+});
+test("tool-card titles and locations stay bounded without shortening approval payloads", async () => {
+  const path = "p".repeat(50_000);
+  const command = "echo " + "c".repeat(50_000);
+  const conn = createConnectionStub({ permission: "reject" });
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  await executor.execute("read", "read_file", JSON.stringify({ path }));
+  await executor.execute("write", "write_file", JSON.stringify({ path, content: "body" }));
+  await executor.execute("run", "run_command", JSON.stringify({ command }));
+  for (const event of conn.updates) {
+    assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
+  }
+  const first = conn.updates[0]?.update as { locations?: unknown[] };
+  assert.deepEqual(first.locations, []);
+  const writeApproval = conn.permissionRequests[0] as { toolCall: { title: string; rawInput: { path: string } } };
+  assert.equal(writeApproval.toolCall.title, `Write file: ${path}`);
+  assert.equal(writeApproval.toolCall.rawInput.path, path);
+  const executeApproval = conn.permissionRequests[1] as { toolCall: { title: string; rawInput: { command: string } } };
+  assert.equal(executeApproval.toolCall.title, `Run command: ${command}`);
+  assert.equal(executeApproval.toolCall.rawInput.command, command);
+});
 test("write_file cancelled by user marks call failed", async () => {
   const conn = createConnectionStub({ permission: "cancelled" });
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
@@ -1236,7 +1373,7 @@ test("run_command runs through sh -c so quoting/pipes work", async () => {
   assert.match(result.content, /MIXED/);
   assert.match(result.content, new RegExp(escapeRegExp(basename(dir))));
   assert.equal(conn.terminalCalls.length, 0);
-  rmSync(dir, { recursive: true, force: true });
+  rmTempDir(dir);
 });
 
 test("run_command includes stderr and non-zero exit code in the tool result", async () => {
@@ -1506,7 +1643,7 @@ test(
         assert.match(stdout, /SETTLED 15/, `helper ${attempt}/${PROBE_ATTEMPTS} output`);
       }
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmTempDir(dir);
     }
   }
 );
@@ -2041,4 +2178,44 @@ test("image_analysis is unavailable when no vision client is configured", async 
     JSON.stringify({ image_source: "/tmp/x.png" })
   );
   assert.match(result.content, /vision[^.]*not configured/i);
+});
+
+test("session MCP tool with ~10k-deep result completes with bounded preview markers", async () => {
+  const conn = createConnectionStub();
+  let deep: Record<string, unknown> = { leaf: "end" };
+  for (let i = 0; i < 10_000; i++) deep = { nested: deep };
+  const raw = { content: [{ type: "text", text: "deep ok" }], data: deep };
+  const tools = { hasTool: () => true, callTool: async () => raw };
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, tools as never);
+  const result = await executor.execute("mcp-deep", "custom_tool", JSON.stringify({ q: 1 }));
+  // The tool already ran — the preview walk must not flip it to failed.
+  assert.equal(result.content, "deep ok");
+  const failed = conn.updates.filter((u) => (u.update as { status?: string }).status === "failed");
+  assert.equal(failed.length, 0);
+  const completed = conn.updates.filter((u) => (u.update as { status?: string }).status === "completed");
+  assert.equal(completed.length, 1);
+  const final = completed[0]!.update as { rawOutput: unknown };
+  const serialized = JSON.stringify(final.rawOutput)!;
+  assert.ok(serialized.includes("[nested]"), "depth marker present");
+  assert.ok((serialized.match(/"nested"/g) ?? []).length <= 40, "walk did not descend the full depth");
+  for (const event of conn.updates) {
+    assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 18_000);
+  }
+});
+
+test("session MCP preview construction failure cannot fail an executed tool call", async () => {
+  const conn = createConnectionStub();
+  const raw: Record<string, unknown> = {
+    content: [{ type: "text", text: "computed fine" }],
+    get data(): never {
+      throw new Error("preview exploded");
+    },
+  };
+  const tools = { hasTool: () => true, callTool: async () => raw };
+  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, tools as never);
+  const result = await executor.execute("mcp-throw", "custom_tool", "{}");
+  assert.equal(result.content, "computed fine");
+  const last = conn.updates.at(-1)?.update as { status?: string; rawOutput: unknown };
+  assert.equal(last.status, "completed");
+  assert.deepEqual(last.rawOutput, { truncated: "Preview unavailable" });
 });

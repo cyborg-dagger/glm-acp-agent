@@ -54,6 +54,20 @@ const EDITOR_EOF_PROBE_LINE = 0xffffffff;
 /** Strings longer than this are elided in client-facing previews (UI cards), never in tool results. */
 const PREVIEW_STRING_LIMIT = 240;
 const PREVIEW_HEAD = 120;
+const PREVIEW_PAYLOAD_LIMIT_BYTES = 16_384;
+/**
+ * Location entries survive well past preview-string lengths so file/URL links
+ * keep working; only absurd paths are dropped from the card.
+ */
+const LOCATION_STRING_LIMIT = 4096;
+/** Depth at which the preview walker stops descending and emits "[nested]" instead. */
+const PREVIEW_MAX_DEPTH = 32;
+/** Marker replacing anything below PREVIEW_MAX_DEPTH or beyond the walk budget. */
+const PREVIEW_DEPTH_MARKER = "[nested]";
+/** Running charge (approximate bytes of visited material) after which the preview walk stops early. */
+const PREVIEW_WALK_BUDGET_BYTES = 262_144;
+/** Marker charged into objects/arrays when the walk budget is exhausted mid-container. */
+const PREVIEW_ELIDED_KEY = "[elided]";
 
 /** Format a bounded listing while measuring each candidate line only once. */
 export function formatDirectoryListing(
@@ -101,19 +115,89 @@ function elideStringForPreview(value: string): string {
  * The full payload still reaches the model through the tool result channel.
  */
 function elideForPreview(value: unknown): unknown {
-  if (typeof value === "string") {
-    return elideStringForPreview(value);
+  try {
+    const preview = elidePreviewStrings(value, 0, { remaining: PREVIEW_WALK_BUDGET_BYTES });
+    const serialized = JSON.stringify(preview);
+    if (serialized !== undefined && Buffer.byteLength(serialized, "utf8") > PREVIEW_PAYLOAD_LIMIT_BYTES) {
+      return { truncated: `Preview exceeds ${PREVIEW_PAYLOAD_LIMIT_BYTES}-byte limit` };
+    }
+    return preview;
+  } catch {
+    // Preview construction is best-effort display data: a pathological input
+    // (throwing getter, exotic proxy, …) must never flip a tool call that
+    // already executed to "failed", so degrade to the same `truncated` shape.
+    return { truncated: "Preview unavailable" };
   }
-  if (Array.isArray(value)) return value.map(elideForPreview);
-  if (typeof value === "object" && value !== null) {
-    const out: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = elideForPreview(item);
+}
+
+/**
+ * Walk `value` for preview rendering, eliding long strings. The walk is bounded
+ * so an untrusted result can never drive unbounded recursion or CPU:
+ * - deeper than PREVIEW_MAX_DEPTH, or any visit once the running byte budget
+ *   is spent, collapses to PREVIEW_DEPTH_MARKER;
+ * - each visited node charges the budget (elided string characters, keys,
+ *   scalar/element nodes) and the walk stops early once it is exhausted.
+ * The PREVIEW_PAYLOAD_LIMIT_BYTES check in elideForPreview still decides
+ * whether the finished preview fits; the bounds here only stop the work.
+ */
+function elidePreviewStrings(value: unknown, depth: number, budget: { remaining: number }): unknown {
+  if (depth > PREVIEW_MAX_DEPTH || budget.remaining <= 0) return PREVIEW_DEPTH_MARKER;
+  if (typeof value === "string") {
+    const out = elideStringForPreview(value);
+    budget.remaining -= out.length + 2;
+    return out;
+  }
+  if (Array.isArray(value)) {
+    const out: unknown[] = [];
+    for (const item of value) {
+      out.push(elidePreviewStrings(item, depth + 1, budget));
+      budget.remaining -= 1;
+      if (budget.remaining <= 0) {
+        out.push(PREVIEW_DEPTH_MARKER);
+        break;
+      }
     }
     return out;
   }
+  if (typeof value === "object" && value !== null) {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = elidePreviewStrings(item, depth + 1, budget);
+      budget.remaining -= key.length + 2;
+      if (budget.remaining <= 0) {
+        out[PREVIEW_ELIDED_KEY] = PREVIEW_DEPTH_MARKER;
+        break;
+      }
+    }
+    return out;
+  }
+  budget.remaining -= 8;
   return value;
 }
+
+/**
+ * One budget for every completed/failed tool-card `content` text (the text a
+ * user reads in the client UI). Within PREVIEW_PAYLOAD_LIMIT_BYTES the text
+ * passes through unchanged so results stay readable; beyond it a UTF-8-safe
+ * prefix is kept plus an elision marker. The full, unbounded text still
+ * reaches the model through the tool result channel (boundToolResult at the
+ * execute() boundary).
+ */
+function boundCardText(text: string): string {
+  const totalBytes = Buffer.byteLength(text, "utf8");
+  if (totalBytes <= PREVIEW_PAYLOAD_LIMIT_BYTES) return text;
+  const prefix = takeUtf8Prefix(text, PREVIEW_PAYLOAD_LIMIT_BYTES);
+  const elidedBytes = totalBytes - Buffer.byteLength(prefix, "utf8");
+  return `${prefix}\n\n[… ${elidedBytes} bytes elided in preview; full result sent to model]`;
+}
+
+/** Decision returned by a permission request. */
+type PermissionDecision =
+  | { type: "allow" }
+  | { type: "reject" }
+  | { type: "cancelled" }
+  | { type: "aborted" }
+  | { type: "error"; message: string };
 
 export class ToolExecutor {
   constructor(
@@ -206,10 +290,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Read file: ${path}`,
+        title: elideStringForPreview(`Read file: ${path}`),
         kind: "read",
         status: "in_progress",
-        locations: [{ path }],
+        locations: path.length <= LOCATION_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -224,7 +308,7 @@ export class ToolExecutor {
             sessionUpdate: "tool_call_update",
             toolCallId,
             status: "completed",
-            content: [{ type: "content", content: { type: "text", text: content } }],
+            content: [{ type: "content", content: { type: "text", text: boundCardText(content) } }],
             rawOutput: elideForPreview({ content }),
           },
         });
@@ -238,7 +322,7 @@ export class ToolExecutor {
             sessionUpdate: "tool_call_update",
             toolCallId,
             status: "completed",
-            content: [{ type: "content", content: { type: "text", text: content } }],
+            content: [{ type: "content", content: { type: "text", text: boundCardText(content) } }],
             rawOutput: elideForPreview({ content }),
           },
         });
@@ -266,7 +350,7 @@ export class ToolExecutor {
           toolCallId,
           status: "completed",
           content: [
-            { type: "content", content: { type: "text", text: elideStringForPreview(content) } },
+            { type: "content", content: { type: "text", text: boundCardText(content) } },
           ],
           rawOutput: elideForPreview({ content }),
         },
@@ -333,9 +417,9 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: todos.some((t) => t.status === "in_progress")
+        title: elideStringForPreview(todos.some((t) => t.status === "in_progress")
           ? `Task list: ${todos.find((t) => t.status === "in_progress")?.activeForm ?? todos.find((t) => t.status === "in_progress")?.content ?? ""}`
-          : `Task list: ${todos.length} item${todos.length === 1 ? "" : "s"}`,
+          : `Task list: ${todos.length} item${todos.length === 1 ? "" : "s"}`),
         kind: "other",
         status: "completed",
         rawInput: elideForPreview(args),
@@ -363,10 +447,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Write file: ${path}`,
+        title: elideStringForPreview(`Write file: ${path}`),
         kind: "edit",
         status: "pending",
-        locations: [{ path }],
+        locations: path.length <= LOCATION_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -382,22 +466,10 @@ export class ToolExecutor {
       locations: [{ path }],
     });
 
-    if (permissionResult.type === "error") {
-      const message = `Error requesting permission: ${permissionResult.message}`;
-      await this.markFailed(toolCallId, message);
-      return { content: message };
-    }
-    if (permissionResult.type === "cancelled") {
-      await this.markFailed(toolCallId, "Cancelled by user.");
-      return { content: "Write cancelled by user." };
-    }
-    if (permissionResult.type === "aborted") {
-      await this.markFailed(toolCallId, "Cancelled by turn.");
-      return { content: "Write cancelled by turn." };
-    }
-    if (permissionResult.type === "reject") {
-      await this.markFailed(toolCallId, "Rejected by user.");
-      return { content: "Write rejected by user." };
+    // Fail closed: every outcome that is not an explicit allow (including any
+    // future variant) stops here instead of reaching the write below.
+    if (permissionResult.type !== "allow") {
+      return this.permissionDenialResult(toolCallId, "Write", permissionResult);
     }
     if (this.signal?.aborted) {
       await this.markFailed(toolCallId, "Cancelled by turn.");
@@ -551,10 +623,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Edit file: ${path}`,
+        title: elideStringForPreview(`Edit file: ${path}`),
         kind: "edit",
         status: "pending",
-        locations: [{ path }],
+        locations: path.length <= LOCATION_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -592,22 +664,10 @@ export class ToolExecutor {
       locations: [{ path }],
     });
 
-    if (permissionResult.type === "error") {
-      const message = `Error requesting permission: ${permissionResult.message}`;
-      await this.markFailed(toolCallId, message);
-      return { content: message };
-    }
-    if (permissionResult.type === "cancelled") {
-      await this.markFailed(toolCallId, "Cancelled by user.");
-      return { content: "Edit cancelled by user." };
-    }
-    if (permissionResult.type === "aborted") {
-      await this.markFailed(toolCallId, "Cancelled by turn.");
-      return { content: "Edit cancelled by turn." };
-    }
-    if (permissionResult.type === "reject") {
-      await this.markFailed(toolCallId, "Rejected by user.");
-      return { content: "Edit rejected by user." };
+    // Fail closed: every outcome that is not an explicit allow (including any
+    // future variant) stops here instead of reaching the write below.
+    if (permissionResult.type !== "allow") {
+      return this.permissionDenialResult(toolCallId, "Edit", permissionResult);
     }
     if (this.signal?.aborted) {
       await this.markFailed(toolCallId, "Cancelled by turn.");
@@ -692,10 +752,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `List files: ${path}`,
+        title: elideStringForPreview(`List files: ${path}`),
         kind: "read",
         status: "in_progress",
-        locations: [{ path }],
+        locations: path.length <= LOCATION_STRING_LIMIT ? [{ path }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -737,7 +797,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text: output } }],
+          content: [{ type: "content", content: { type: "text", text: boundCardText(output) } }],
           rawOutput: elideForPreview({ output }),
         },
       });
@@ -770,7 +830,7 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Run command: ${command}`,
+        title: elideStringForPreview(`Run command: ${command}`),
         kind: "execute",
         status: "pending",
         locations: [],
@@ -788,22 +848,10 @@ export class ToolExecutor {
       locations: [],
     });
 
-    if (permissionResult.type === "error") {
-      const message = `Error requesting permission: ${permissionResult.message}`;
-      await this.markFailed(toolCallId, message);
-      return { content: message };
-    }
-    if (permissionResult.type === "cancelled") {
-      await this.markFailed(toolCallId, "Cancelled by user.");
-      return { content: "Command cancelled by user." };
-    }
-    if (permissionResult.type === "aborted") {
-      await this.markFailed(toolCallId, "Cancelled by turn.");
-      return { content: "Command cancelled by turn." };
-    }
-    if (permissionResult.type === "reject") {
-      await this.markFailed(toolCallId, "Rejected by user.");
-      return { content: "Command rejected by user." };
+    // Fail closed: every outcome that is not an explicit allow (including any
+    // future variant) stops here instead of reaching the command below.
+    if (permissionResult.type !== "allow") {
+      return this.permissionDenialResult(toolCallId, "Command", permissionResult);
     }
 
     return this.runLocalCommand(toolCallId, command);
@@ -845,7 +893,7 @@ export class ToolExecutor {
             sessionUpdate: "tool_call_update",
             toolCallId,
             status: "failed",
-            content: [{ type: "content", content: { type: "text", text: output } }],
+            content: [{ type: "content", content: { type: "text", text: boundCardText(output) } }],
             rawOutput: elideForPreview(result),
           },
         });
@@ -858,7 +906,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text: output } }],
+          content: [{ type: "content", content: { type: "text", text: boundCardText(output) } }],
           rawOutput: elideForPreview(result),
         },
       });
@@ -895,7 +943,7 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Web search: ${query}`,
+        title: elideStringForPreview(`Web search: ${query}`),
         kind: "fetch",
         status: "in_progress",
         locations: [],
@@ -924,7 +972,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text: output } }],
+          content: [{ type: "content", content: { type: "text", text: boundCardText(output) } }],
           rawOutput: elideForPreview({ resultCount }),
         },
       });
@@ -957,10 +1005,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Read URL: ${url}`,
+        title: elideStringForPreview(`Read URL: ${url}`),
         kind: "fetch",
         status: "in_progress",
-        locations: [{ path: url }],
+        locations: url.length <= LOCATION_STRING_LIMIT ? [{ path: url }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -984,7 +1032,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text: output } }],
+          content: [{ type: "content", content: { type: "text", text: boundCardText(output) } }],
           rawOutput: elideForPreview({ title, url: resultUrl }),
         },
       });
@@ -1025,10 +1073,10 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: `Analyze image: ${imageSource}`,
+        title: elideStringForPreview(`Analyze image: ${imageSource}`),
         kind: "fetch",
         status: "in_progress",
-        locations: [{ path: imageSource }],
+        locations: imageSource.length <= LOCATION_STRING_LIMIT ? [{ path: imageSource }] : [],
         rawInput: elideForPreview(args),
       },
     });
@@ -1045,7 +1093,7 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text } }],
+          content: [{ type: "content", content: { type: "text", text: boundCardText(text) } }],
           rawOutput: elideForPreview({ text }),
         },
       });
@@ -1067,7 +1115,7 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: toolName,
+        title: elideStringForPreview(toolName),
         kind: "other",
         status: "in_progress",
         locations: [],
@@ -1084,8 +1132,8 @@ export class ToolExecutor {
           sessionUpdate: "tool_call_update",
           toolCallId,
           status: "completed",
-          content: [{ type: "content", content: { type: "text", text } }],
-          rawOutput: mcpResult,
+          content: [{ type: "content", content: { type: "text", text: boundCardText(text) } }],
+          rawOutput: elideForPreview(mcpResult),
         },
       });
       return { content: text };
@@ -1112,13 +1160,7 @@ export class ToolExecutor {
     rawInput: unknown;
     title: string;
     locations?: Array<{ path: string }>;
-  }): Promise<
-    | { type: "allow" }
-    | { type: "reject" }
-    | { type: "cancelled" }
-    | { type: "aborted" }
-    | { type: "error"; message: string }
-  > {
+  }): Promise<PermissionDecision> {
     const mode = this.getMode();
 
     if (this.signal?.aborted) {
@@ -1188,16 +1230,42 @@ export class ToolExecutor {
   private permissionOutcome(permissionResponse: {
     outcome: { outcome: string; optionId?: string };
   }): { type: "allow" } | { type: "reject" } | { type: "cancelled" } {
-    if (permissionResponse.outcome.outcome === "cancelled") {
+    if (permissionResponse?.outcome?.outcome === "cancelled") {
       return { type: "cancelled" };
     }
-    if (
-      permissionResponse.outcome.outcome === "selected" &&
-      permissionResponse.outcome.optionId === "reject"
-    ) {
-      return { type: "reject" };
+    return permissionResponse?.outcome?.outcome === "selected" &&
+      permissionResponse.outcome.optionId === "allow"
+      ? { type: "allow" }
+      : { type: "reject" };
+  }
+
+  /**
+   * Settle every non-"allow" permission outcome. Fails closed: `default`
+   * catches any future outcome variant and rejects it rather than letting the
+   * write/execute proceed. Messages match the previous per-branch handling.
+   */
+  private async permissionDenialResult(
+    toolCallId: string,
+    action: "Write" | "Edit" | "Command",
+    permissionResult: Exclude<PermissionDecision, { type: "allow" }>
+  ): Promise<ToolResult> {
+    switch (permissionResult.type) {
+      case "error": {
+        const message = `Error requesting permission: ${permissionResult.message}`;
+        await this.markFailed(toolCallId, message);
+        return { content: message };
+      }
+      case "cancelled":
+        await this.markFailed(toolCallId, "Cancelled by user.");
+        return { content: `${action} cancelled by user.` };
+      case "aborted":
+        await this.markFailed(toolCallId, "Cancelled by turn.");
+        return { content: `${action} cancelled by turn.` };
+      case "reject":
+      default:
+        await this.markFailed(toolCallId, "Rejected by user.");
+        return { content: `${action} rejected by user.` };
     }
-    return { type: "allow" };
   }
 
   /** Mark an in-progress tool call as failed. */
@@ -1208,7 +1276,7 @@ export class ToolExecutor {
         sessionUpdate: "tool_call_update",
         toolCallId,
         status: "failed",
-        rawOutput: { error: message },
+        rawOutput: elideForPreview({ error: message }),
       },
     });
   }
@@ -1228,12 +1296,12 @@ export class ToolExecutor {
       update: {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: toolName,
+        title: elideStringForPreview(toolName),
         kind: "other",
         status: "failed",
         locations: [],
-        rawInput,
-        rawOutput: { error: message },
+        rawInput: elideForPreview(rawInput),
+        rawOutput: elideForPreview({ error: message }),
       },
     });
   }
