@@ -260,9 +260,9 @@ test("close waits for preprocessing cleanup before persisting and removing the s
   };
   let saveSawCleanedImage = false;
   const save = sessionStore.save.bind(sessionStore);
-  sessionStore.save = (session) => {
+  sessionStore.save = async (session) => {
     saveSawCleanedImage = !existsSync(sourcePath);
-    save(session);
+    await save(session);
   };
   const agent = new GlmAcpAgent(conn as never, {
     visionClient: vision,
@@ -703,7 +703,7 @@ test("close is retained while an unloaded resume is setting up replacement resou
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-unloaded-close-"));
   const store = new SessionStore(storeRoot);
   const sessionId = "44444444-4444-4444-4444-444444444444";
-  store.save({
+  await store.save({
     sessionId,
     cwd: "/tmp",
     messages: [{ role: "system", content: "system" }],
@@ -750,7 +750,7 @@ test("close aborts stalled restore MCP setup and disposes a late empty-catalog r
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-abort-restore-setup-"));
   const store = new SessionStore(storeRoot);
   const sessionId = "55555555-5555-5555-5555-555555555555";
-  store.save({
+  await store.save({
     sessionId,
     cwd: "/tmp",
     messages: [{ role: "system", content: "system" }],
@@ -787,7 +787,10 @@ test("close aborts stalled restore MCP setup and disposes a late empty-catalog r
     await Promise.race([
       close,
       new Promise<never>((_resolve, reject) => {
-        setTimeout(() => reject(new Error("close waited for stalled MCP setup")), 50);
+        // Generous bound: the raced close resolves through a real fsync'd
+        // session write, which can exceed 100 ms on slow CI runners. The
+        // property under test is that close never blocks on the held stall.
+        setTimeout(() => reject(new Error("close waited for stalled MCP setup")), 2_000);
       }),
     ]);
     assert.equal(abortObserved, true, "close must abort the restore connector");
@@ -1339,7 +1342,10 @@ test("close cancels stalled fork MCP setup and disposes its late result once", a
     assert.equal(setupSignal?.aborted, true, "close must abort the fork connector");
     await forkRejected;
     const watchdog = new Promise<never>((_resolve, reject) => {
-      setTimeout(() => reject(new Error("close waited for stalled fork MCP setup")), 100).unref();
+      // Generous bound: the raced close resolves through a real fsync'd
+      // session write, which can exceed 100 ms on slow CI runners. The
+      // property under test is that close never blocks on the held stall.
+      setTimeout(() => reject(new Error("close waited for stalled fork MCP setup")), 2_000).unref();
     });
     await Promise.race([closing, watchdog]);
     assert.equal(disposed, 0, "the late setup result is not available yet");
@@ -1396,7 +1402,7 @@ test("fork rejects persisted history with an unmatched assistant tool call", asy
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-invalid-history-"));
   const store = new SessionStore(storeRoot);
   const sessionId = "33333333-3333-4333-8333-333333333333";
-  store.save({
+  await store.save({
     sessionId,
     cwd: tmpdir(),
     messages: [
@@ -1600,7 +1606,7 @@ test("close interrupts a stalled unloaded restore replay", async () => {
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-close-replay-"));
   const store = new SessionStore(storeRoot);
   const sessionId = "66666666-6666-6666-6666-666666666666";
-  store.save({
+  await store.save({
     sessionId,
     cwd: "/tmp",
     messages: [
@@ -1630,7 +1636,10 @@ test("close interrupts a stalled unloaded restore replay", async () => {
     const close = agent.closeSession({ sessionId });
     await Promise.race([
       close,
-      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("close waited for replay")), 50)),
+      // Generous bound: the raced close resolves through a real fsync'd
+      // session write, which can exceed 100 ms on slow CI runners. The
+      // property under test is that close never blocks on the held replay.
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("close waited for replay")), 2_000)),
     ]);
     await assert.rejects(load, /cancelled/i);
   } finally {
@@ -1643,7 +1652,7 @@ test("a failed unloaded restore removes its transition record", async () => {
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-unloaded-failure-record-"));
   const store = new SessionStore(storeRoot);
   const sessionId = "77777777-7777-7777-7777-777777777777";
-  store.save({
+  await store.save({
     sessionId,
     cwd: "/tmp",
     messages: [{ role: "system", content: "system" }],

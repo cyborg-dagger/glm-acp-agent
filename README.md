@@ -203,7 +203,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_MODEL` | No | `glm-5.3` | Default GLM model for new sessions |
 | `ACP_GLM_AVAILABLE_MODELS` | No | built-in list | Comma-separated list of model ids advertised in `session/set_model` |
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
-| `ACP_GLM_MAX_TOKENS` | No | `32768` | Cap on `max_tokens` for each completion |
+| `ACP_GLM_MAX_TOKENS` | No | `32768` | Cap on `max_tokens` for each completion. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_MAX_TURNS` | No | `100` | Max model/tool turns per prompt (also settable via `--max-turns`) |
 | `ACP_GLM_COMMAND_TIMEOUT_MS` | No | `120000` | Deadline for each `run_command`, in milliseconds. Invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES` | No | `65536` | Maximum combined bytes captured from each `run_command` stdout and stderr. Further output is drained and reported as truncated. Invalid values fall back to the default with a stderr warning. |
@@ -213,6 +213,7 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_LIST_FILES_LIMIT_BYTES` | No | `262144` | Maximum bytes assembled for a `list_files` result before its truncation marker. |
 | `ACP_GLM_THINKING` | No | auto-detected | Force thinking mode `true` / `false` |
 | `ACP_GLM_STREAM_THINKING` | No | `true` | Forward reasoning tokens to the client as `agent_thought_chunk`; set `false` to keep reasoning off the wire (the model still thinks — only the client-side stream is silenced) |
+| `ACP_GLM_STREAM_IDLE_TIMEOUT_MS` | No | `300000` | Idle deadline in milliseconds for a stalled model-provider stream read; invalid values fall back to the default with a stderr warning. |
 | `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |
 | `ACP_GLM_DEBUG` | No | — | Set to `true` or `1` to enable verbose debug logging to stderr (shows model selection, API key resolution, tool calls, and usage stats) |
 | `XDG_CONFIG_HOME` | No | `~/.config` | Where the credentials file is read/written |
@@ -251,6 +252,8 @@ Only models the Coding Plan endpoint serves **under their own name** are adverti
 Vision-only chat models (`glm-4v-plus` etc.) are **not** advertised. `glm-5.3-flash` is the built-in native-vision Coding Plan model (`image_url` content parts). Default `glm-5.3`, `glm-5-turbo`, and `glm-4.7` still use the [Vision MCP](#vision-mcp) path. `glm-5v-turbo`, when re-added via the override above, keeps native `image_url` handling as an opt-in exception.
 
 When the model name matches `glm-4.5`, `glm-4.6`, `glm-4.7`, or the `glm-5` family, the agent enables Z.AI's `thinking: { type: "enabled" }` extension and forwards reasoning tokens to the client as `agent_thought_chunk` blocks. This includes `glm-5.3-flash` and `glm-5v-turbo`. `ACP_GLM_THINKING=false` asks for plain completions on models that still accept `thinking.type: "disabled"` (GLM-4.7, GLM-5 Turbo). On GLM-5.3 and GLM-5.3-Flash the flag is a no-op: those models reject `disabled`, so the agent leaves thinking enabled rather than sending it (see [Thought level](#thought-level-reasoning-effort) below).
+
+The provider stream itself is guarded against stalls. The Z.AI SDK's HTTP timeout only covers waiting for response headers — a response whose body stops mid-stream would otherwise hang the turn forever. The agent therefore aborts a provider stream read that produces no data for `ACP_GLM_STREAM_IDLE_TIMEOUT_MS` milliseconds (default `300000`; invalid values for the variable fall back to the default with a stderr warning). On timeout, whatever partial output already reached the user is kept, an `[error]` message is appended as an agent message, the turn ends, and the last valid on-disk session checkpoint is preserved. A slow ACP client back-pressuring chunks it already received does not trip the watchdog — only silence from the provider between reads does.
 
 #### Thought level (reasoning effort)
 

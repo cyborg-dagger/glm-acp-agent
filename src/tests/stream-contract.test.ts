@@ -5,9 +5,10 @@ import { once } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GlmClient, type GlmStreamChunk } from "../llm/glm-client.js";
+import { GlmClient, ModelStreamIdleTimeoutError, type GlmStreamChunk } from "../llm/glm-client.js";
 import { GlmAcpAgent } from "../protocol/agent.js";
 import { SessionStore } from "../protocol/session-store.js";
+import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 
 async function withProvider(
   frames: unknown[], run: (client: GlmClient, requests: unknown[]) => Promise<void>,
@@ -44,6 +45,110 @@ async function withProvider(
 function delta(content: Record<string, unknown>, reason: string | null = null) {
   return { choices: [{ index: 0, delta: content, finish_reason: reason }] };
 }
+async function withStalledProvider(run: (client: GlmClient) => Promise<void>): Promise<void> {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(`data: ${JSON.stringify(delta({ content: "partial output" }))}\n\n`);
+    res.flushHeaders();
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const savedKey = process.env["Z_AI_API_KEY"];
+  const savedUrl = process.env["ACP_GLM_BASE_URL"];
+  process.env["Z_AI_API_KEY"] = "fixture-key";
+  process.env["ACP_GLM_BASE_URL"] = `http://127.0.0.1:${address.port}/v4`;
+  try {
+    await run(new GlmClient());
+  } finally {
+    if (savedKey === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = savedKey;
+    if (savedUrl === undefined) delete process.env["ACP_GLM_BASE_URL"];
+    else process.env["ACP_GLM_BASE_URL"] = savedUrl;
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+}
+
+test("HTTP idle timeout covers provider next only and retains already yielded text", async () => {
+  await withStalledProvider(async client => {
+    const partial: string[] = [];
+    await assert.rejects(async () => {
+      for await (const chunk of client.streamChat([], undefined, { model: "glm-5.3", idleTimeoutMs: 40 })) {
+        if (chunk.text) partial.push(chunk.text);
+      }
+    }, (error: unknown) => error instanceof ModelStreamIdleTimeoutError);
+    assert.deepEqual(partial, ["partial output"]);
+  });
+});
+
+test("HTTP idle timeout preserves external abort as cancellation", async () => {
+  await withStalledProvider(async client => {
+    const controller = new AbortController();
+    const cancel = setTimeout(() => controller.abort(), 20);
+    try {
+      await assert.rejects(async () => {
+        for await (const chunk of client.streamChat([], controller.signal, { model: "glm-5.3", idleTimeoutMs: 200 })) void chunk;
+      }, (error: unknown) => error instanceof Error && error.name === "AbortError");
+    } finally {
+      clearTimeout(cancel);
+    }
+  });
+});
+
+test("HTTP idle timeout aborts the underlying provider connection", async () => {
+  let connectionClosed = false;
+  const server = createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(`data: ${JSON.stringify(delta({ content: "partial output" }))}\n\n`);
+    res.flushHeaders();
+    // The request completes as soon as its body is drained, so its "close"
+    // would fire regardless. The response never ends, so observing res
+    // instead proves the client tore the unfinished SSE stream down.
+    res.on("close", () => { connectionClosed = true; });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const savedKey = process.env["Z_AI_API_KEY"];
+  const savedUrl = process.env["ACP_GLM_BASE_URL"];
+  process.env["Z_AI_API_KEY"] = "fixture-key";
+  process.env["ACP_GLM_BASE_URL"] = `http://127.0.0.1:${address.port}/v4`;
+  try {
+    const client = new GlmClient();
+    await assert.rejects(async () => {
+      for await (const chunk of client.streamChat([], undefined, { model: "glm-5.3", idleTimeoutMs: 40 })) void chunk;
+    }, (error: unknown) => error instanceof ModelStreamIdleTimeoutError);
+    const deadline = Date.now() + 3_000;
+    while (!connectionClosed && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.ok(connectionClosed, "the idle watchdog must abort the stalled provider connection");
+  } finally {
+    if (savedKey === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = savedKey;
+    if (savedUrl === undefined) delete process.env["ACP_GLM_BASE_URL"];
+    else process.env["ACP_GLM_BASE_URL"] = savedUrl;
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
+test("HTTP idle timeout does not include downstream consumer backpressure", async () => {
+  await withProvider([delta({ content: "first" }), delta({}, "stop")], async client => {
+    const text: string[] = [];
+    for await (const chunk of client.streamChat([], undefined, { model: "glm-5.3", idleTimeoutMs: 20 })) {
+      if (chunk.text) {
+        text.push(chunk.text);
+        await new Promise(resolve => setTimeout(resolve, 60));
+      }
+    }
+    assert.deepEqual(text, ["first"]);
+  });
+});
 
 for (const frames of [[], [delta({ content: "partial answer" })]]) {
   test(`HTTP EOF without terminal reason rejects (${frames.length} frames)`, async () => {
@@ -195,6 +300,83 @@ test("incomplete HTTP response preserves partial text for close and restore", as
       assert.ok(store.load(sessionId)?.messages.some(message => message.role === "assistant" && message.content === "received before EOF"));
     });
   } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("agent-level idle timeout retains partial text, preserves the checkpoint, and recovers", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "glm-idle-agent-flow-"));
+  const store = new SessionStore(join(cwd, "sessions"));
+  interface RecordedUpdate {
+    update: { sessionUpdate: string; content?: { type: string; text?: string } };
+  }
+  const updates: RecordedUpdate[] = [];
+  let streamCall = 0;
+  const agent = new GlmAcpAgent({
+    sessionUpdate: async (update: RecordedUpdate) => { updates.push(update); },
+  } as never, {
+    sessionStore: store,
+    visionClient: null,
+    glm: {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        streamCall += 1;
+        if (streamCall === 1) {
+          yield { text: "checkpoint response" };
+          yield { done: true, stopReason: "stop" };
+          return;
+        }
+        if (streamCall === 2) {
+          yield { text: "partial output" };
+          // Mirror the GlmClient watchdog: silence on the wire, then the
+          // idle-timeout rejection mid-turn with text already delivered.
+          await new Promise(resolve => setTimeout(resolve, 25));
+          throw new ModelStreamIdleTimeoutError("No provider stream data for 25ms");
+        }
+        yield { text: "recovered response" };
+        yield { done: true, stopReason: "stop" };
+      },
+    },
+  });
+  let sessionId: string | undefined;
+  try {
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    ({ sessionId } = await agent.newSession({ cwd, mcpServers: [] }));
+
+    // Prompt #1 completes and becomes the durable on-disk checkpoint.
+    const healthy = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
+    assert.equal(healthy.stopReason, "end_turn");
+    const checkpoint = structuredClone(store.load(sessionId));
+    assert.ok(checkpoint);
+
+    // Prompt #2 stalls mid-turn and rejects with the idle-timeout error.
+    await assert.rejects(
+      agent.prompt({ sessionId, prompt: [{ type: "text", text: "second" }] }),
+      (error: unknown) => error instanceof ModelStreamIdleTimeoutError,
+    );
+
+    // The client saw the partial text that was already streamed, plus the
+    // surfaced [error] chunk describing the watchdog abort.
+    const chunkTexts = updates
+      .filter(update => update.update.sessionUpdate === "agent_message_chunk")
+      .map(update => update.update.content?.text ?? "");
+    assert.ok(chunkTexts.some(text => text.includes("partial output")));
+    assert.ok(chunkTexts.some(text => text.includes("[error] No provider stream data for 25ms")));
+
+    // The stalled turn never corrupted or overwrote the last valid checkpoint.
+    assert.deepEqual(store.load(sessionId), checkpoint);
+
+    // Prompt #3 succeeds and its recovered turn lands in the next checkpoint.
+    const recovered = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "third" }] });
+    assert.equal(recovered.stopReason, "end_turn");
+    const persisted = store.load(sessionId);
+    assert.ok(persisted?.messages.some(
+      message => message.role === "assistant" && message.content === "recovered response",
+    ));
+    assert.ok(persisted?.messages.some(
+      message => message.role === "assistant" && message.content === "partial output",
+    ));
+  } finally {
+    if (sessionId) await agent.closeSession({ sessionId });
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("agent validates injected provider completion before executing its calls", async () => {

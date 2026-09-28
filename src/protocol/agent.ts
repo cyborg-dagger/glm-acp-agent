@@ -159,6 +159,15 @@ interface SessionState {
    * to observe its abort before mutating shared session state.
    */
   promptPromise: Promise<void> | null;
+  /**
+   * A deferred timeout checkpoint scheduled after this prompt drains. Set at
+   * most once per session state (by a timed-out fork/restore drain) and
+   * awaited by the drained prompt's cleanup so its ACP response cannot outrun
+   * the checkpoint it triggered. Deliberately never reset: a later await on
+   * the settled promise is a no-op, and a replacement session state installs
+   * its own field.
+   */
+  drainCheckpointPromise?: Promise<void> | null;
   /** True while closeSession is waiting for the active prompt to unwind. */
   closing: boolean;
   /** True after closeSession has disposed and removed this session. */
@@ -577,7 +586,7 @@ export class GlmAcpAgent implements Agent {
     session.updatedAt = new Date().toISOString();
     // Persist immediately so a fork/reload before the next prompt doesn't
     // resurrect the previous model or thought level.
-    this.persistSession(sessionId, session);
+    await this.persistSession(sessionId, session);
     // Notify clients so any UI that displays the active model refreshes
     // immediately, instead of waiting for the next prompt to complete.
     await safeSessionUpdate(this.connection, {
@@ -679,7 +688,7 @@ export class GlmAcpAgent implements Agent {
       }
       session.mode = params.value;
       session.updatedAt = new Date().toISOString();
-      this.persistSession(params.sessionId, session);
+      await this.persistSession(params.sessionId, session);
       // Mirror setSessionMode so clients tracking the ACP mode state (rather
       // than the config option) stay in sync with the dropdown.
       await safeSessionUpdate(this.connection, {
@@ -727,7 +736,7 @@ export class GlmAcpAgent implements Agent {
     // different level set (e.g. "max" from glm-5.3 sent while on glm-4.7).
     session.thoughtLevel = resolveThoughtLevel(session.model, params.value);
     session.updatedAt = new Date().toISOString();
-    this.persistSession(params.sessionId, session);
+    await this.persistSession(params.sessionId, session);
     return {
       configOptions: this.configOptionsState(
         session.model,
@@ -781,7 +790,7 @@ export class GlmAcpAgent implements Agent {
     const newMode = params.modeId;
     session.mode = newMode;
     session.updatedAt = new Date().toISOString();
-    this.persistSession(params.sessionId, session);
+    await this.persistSession(params.sessionId, session);
     await safeSessionUpdate(this.connection, {
       sessionId: params.sessionId,
       update: {
@@ -943,7 +952,7 @@ export class GlmAcpAgent implements Agent {
         },
       });
 
-      this.persistSession(params.sessionId, session);
+      await this.persistSession(params.sessionId, session);
 
       const response: PromptResponse = { stopReason };
       if (usage) response.usage = usage;
@@ -979,6 +988,10 @@ export class GlmAcpAgent implements Agent {
       if (session.abortController === abortController) session.abortController = null;
       if (session.promptPromise === promptPromise) session.promptPromise = null;
       resolvePromptPromise();
+      // A timed-out fork/restore attaches its durable checkpoint to the prompt
+      // drain. Signal the chain first (the checkpoint depends on it), then keep
+      // the owning prompt call pending until that checkpoint is durable.
+      if (session.drainCheckpointPromise) await session.drainCheckpointPromise;
     }
   }
 
@@ -1019,7 +1032,7 @@ export class GlmAcpAgent implements Agent {
           try { await current.promptPromise; } catch { /* resolves in prompt finally */ }
         }
         current.closed = true;
-        this.persistSession(params.sessionId, current);
+        await this.persistSession(params.sessionId, current);
         await this.disposeSessionTools(current);
         if (this.sessions.get(params.sessionId) === current) {
           this.sessions.delete(params.sessionId);
@@ -1065,10 +1078,15 @@ export class GlmAcpAgent implements Agent {
       }
 
       await this.processSupervisor.terminateAll();
-      const deadlineMs = this.shutdownDrainTimeoutMs;
+      // One budget for the whole shutdown, not per stage: the CLI gives
+      // shutdown five seconds before it force-exits, and the default drain
+      // window below stays inside it so a late persistence flush can never be
+      // cut off mid-write by process.exit().
+      const deadlineAt = Date.now() + this.shutdownDrainTimeoutMs;
+      const remainingMs = () => Math.max(0, deadlineAt - Date.now());
       const promptsSettled = await Promise.all(sessions.map(([, session]) =>
         session.promptPromise
-          ? settlesWithin(session.promptPromise, deadlineMs)
+          ? settlesWithin(session.promptPromise, remainingMs())
           : Promise.resolve(true),
       ));
 
@@ -1081,16 +1099,17 @@ export class GlmAcpAgent implements Agent {
       const setups = [...this.pendingSetups].map((setup) => setup.dispose());
       const auxDrained = await settlesWithin(
         Promise.allSettled([...transitions, ...closes, ...setups]),
-        deadlineMs,
+        remainingMs(),
       );
 
       const resourceDisposals: Promise<void>[] = [];
+      const persistenceWrites: Promise<void>[] = [];
       for (let index = 0; index < sessions.length; index += 1) {
         const [sessionId, session] = sessions[index]!;
         session.closed = true;
         // A prompt that missed the drain deadline may still hold an unmatched
         // assistant tool call. Leave the last valid on-disk checkpoint intact.
-        if (promptsSettled[index] === true) this.persistSession(sessionId, session);
+        if (promptsSettled[index] === true) persistenceWrites.push(this.persistSession(sessionId, session));
         resourceDisposals.push(this.disposeSessionTools(session));
         if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
         this.sessionTodos.delete(sessionId);
@@ -1102,21 +1121,40 @@ export class GlmAcpAgent implements Agent {
         Promise.all(resourceDisposals).catch((error) => {
           resourceCleanupError = error;
         }),
-        deadlineMs,
+        remainingMs(),
       );
 
-      if (this.processSupervisor.hasActiveProcesses()) {
-        await this.processSupervisor.forceTerminateAll();
+      let persistenceDrained: boolean;
+      try {
+        if (this.processSupervisor.hasActiveProcesses()) {
+          await this.processSupervisor.forceTerminateAll();
+        }
+        if (this.processSupervisor.hasActiveProcesses()) {
+          throw new Error("Agent shutdown left active command processes");
+        }
+        if (!resourcesDrained) {
+          throw new Error("Agent shutdown timed out waiting for resource cleanup");
+        }
+        if (resourceCleanupError) throw resourceCleanupError;
+        if (!auxDrained || promptsSettled.some((settled) => !settled)) {
+          throw new Error("Agent shutdown timed out waiting for prompt cleanup");
+        }
+      } finally {
+        // Queued checkpoints must reach disk on every exit path, not only the
+        // clean one: an earlier throw skips straight here, the bounded drain
+        // below still waits for the writes, and the original error rethrows.
+        persistenceDrained = await settlesWithin(
+          Promise.all([...persistenceWrites, this.sessionStore?.flush() ?? Promise.resolve()]),
+          remainingMs(),
+        );
+        if (!persistenceDrained) {
+          process.stderr.write(
+            "[glm-acp-agent] warning: shutdown returned before queued session checkpoints were durable\n"
+          );
+        }
       }
-      if (this.processSupervisor.hasActiveProcesses()) {
-        throw new Error("Agent shutdown left active command processes");
-      }
-      if (!resourcesDrained) {
-        throw new Error("Agent shutdown timed out waiting for resource cleanup");
-      }
-      if (resourceCleanupError) throw resourceCleanupError;
-      if (!auxDrained || promptsSettled.some((settled) => !settled)) {
-        throw new Error("Agent shutdown timed out waiting for prompt cleanup");
+      if (!persistenceDrained) {
+        throw new Error("Agent shutdown timed out waiting for session persistence");
       }
     })();
     return this.shutdownPromise;
@@ -1144,7 +1182,7 @@ export class GlmAcpAgent implements Agent {
     >();
 
     if (this.sessionStore) {
-      for (const meta of this.sessionStore.listMetadata()) {
+      for (const meta of await this.sessionStore.listMetadataAsync()) {
         merged.set(meta.sessionId, {
           cwd: meta.cwd,
           title: meta.title,
@@ -1222,13 +1260,13 @@ export class GlmAcpAgent implements Agent {
         }
         const persisted = source
           ? this.snapshot(params.sessionId, source)
-          : this.requirePersisted(params.sessionId);
+          : await this.requirePersisted(params.sessionId);
         assertSettledToolHistory(persisted.messages);
         // A draining prompt deliberately suppresses its normal final save:
         // the fork owns its lifecycle while it settles. Checkpoint the exact
         // settled parent snapshot before any child setup, so a restart cannot
         // recover the older (and possibly unmatched) tool-call history.
-        if (source) this.persistSession(params.sessionId, source, persisted);
+        if (source) await this.persistSession(params.sessionId, source, persisted);
         const setup = this.connectMcpServers(params.mcpServers ?? [], forkAbortController.signal);
         void setup.then(
           (tools) => {
@@ -1246,7 +1284,7 @@ export class GlmAcpAgent implements Agent {
         if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
           throw new Error(`Session fork cancelled: ${params.sessionId}`);
         }
-        const response = this.createFork(params, persisted, provisional);
+        const response = await this.createFork(params, persisted, provisional);
         provisional = null;
         return response;
       } finally {
@@ -1266,11 +1304,11 @@ export class GlmAcpAgent implements Agent {
     }
   }
 
-  private createFork(
+  private async createFork(
     params: ForkSessionRequest,
     persisted: PersistedSession,
     mcpTools: SessionMcpTools,
-  ): ForkSessionResponse {
+  ): Promise<ForkSessionResponse> {
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const newSessionId = randomUUID();
@@ -1316,7 +1354,7 @@ export class GlmAcpAgent implements Agent {
       original: null,
       restoreAbortController: null,
     });
-    this.persistSession(newSessionId, forked);
+    await this.persistSession(newSessionId, forked);
 
     // Notify on the *created* session id — the parent thread's command list is
     // unchanged and a notify there would repaint the wrong menu.
@@ -1378,7 +1416,7 @@ export class GlmAcpAgent implements Agent {
           // disk can be older than a just-finished live turn.
           persisted = this.snapshot(params.sessionId, original);
         } else {
-          persisted = this.requirePersisted(params.sessionId);
+          persisted = await this.requirePersisted(params.sessionId);
         }
 
         this.assertRestoreOwner(lifecycle, lease);
@@ -1466,7 +1504,7 @@ export class GlmAcpAgent implements Agent {
         // Checkpoint the merged state immediately: it can retain a partially
         // received turn from the drained prompt, which otherwise exists only
         // in memory until the next prompt or close.
-        this.persistSession(params.sessionId, restored);
+        await this.persistSession(params.sessionId, restored);
         // Ownership transfers only after the replacement is installed. The
         // old resources are released afterwards, so setup and replay failures
         // still retain a valid original session.
@@ -1483,7 +1521,7 @@ export class GlmAcpAgent implements Agent {
         };
       } catch (err) {
         if (!swapped && original) {
-          this.persistOriginalIfOwned(params.sessionId, original, lifecycle, lease, record);
+          await this.persistOriginalIfOwned(params.sessionId, original, lifecycle, lease, record);
         }
         if (!swapped) {
           if (provisional) await disposeProvisional(provisional);
@@ -1543,24 +1581,29 @@ export class GlmAcpAgent implements Agent {
     // here: the prompt's cleanup can null `session.promptPromise` right after
     // the timeout resolves, and re-reading the field would never attach the
     // release callback, leaving the lease stuck in `restoring` forever.
-    void pending?.then(() => {
-      this.persistOriginalIfOwned(sessionId, session, lifecycle, lease, record);
+    session.drainCheckpointPromise = pending?.then(async () => {
+      try {
+        await this.persistOriginalIfOwned(sessionId, session, lifecycle, lease, record);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[glm-acp-agent] warning: failed to checkpoint drained session ${sessionId}: ${msg}\n`);
+      }
       if (!lifecycle.closeRequested) lease.release();
       if (record.original === session) record.original = null;
-    });
+    }) ?? null;
   }
 
-  private persistOriginalIfOwned(
+  private async persistOriginalIfOwned(
     sessionId: string,
     session: SessionState,
     lifecycle: SessionLifecycle,
     lease: TransitionLease,
     record: SessionTransition,
-  ): void {
+  ): Promise<void> {
     if (!lifecycle.owns(lease)) return;
     if (record.original !== session) return;
     if (this.sessions.get(sessionId) !== session) return;
-    this.persistSession(sessionId, session);
+    await this.persistSession(sessionId, session);
   }
 
   private registerTransition(sessionId: string, lifecycle: SessionLifecycle): SessionTransition {
@@ -1623,6 +1666,9 @@ export class GlmAcpAgent implements Agent {
   }
 
   private assertConfigurable(sessionId: string, session: SessionState): void {
+    // Fail fast like newSession does: a config setter admitted while shutdown
+    // is draining would race the final persistence flush.
+    if (this.shuttingDown) throw new Error(`Agent is shutting down: ${sessionId}`);
     if (session.closing || session.closed || session.lifecycle.closeRequested) {
       throw new Error(`Session is closing: ${sessionId}`);
     }
@@ -1682,15 +1728,15 @@ export class GlmAcpAgent implements Agent {
     };
   }
 
-  private persistSession(
+  private async persistSession(
     sessionId: string,
     session: SessionState,
     persisted = this.snapshot(sessionId, session),
-  ): void {
+  ): Promise<void> {
     if (this.sessions.get(sessionId) !== session) return;
     if (!this.sessionStore) return;
     try {
-      this.sessionStore.save(persisted);
+      await this.sessionStore.save(persisted);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(
@@ -1699,11 +1745,11 @@ export class GlmAcpAgent implements Agent {
     }
   }
 
-  private requirePersisted(sessionId: string): PersistedSession {
+  private async requirePersisted(sessionId: string): Promise<PersistedSession> {
     if (!this.sessionStore) {
       throw new Error("Session persistence is disabled");
     }
-    const persisted = this.sessionStore.load(sessionId);
+    const persisted = await this.sessionStore.loadAsync(sessionId);
     if (!persisted) {
       throw new Error(`Session not found: ${sessionId}`);
     }

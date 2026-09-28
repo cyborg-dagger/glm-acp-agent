@@ -946,6 +946,103 @@ test("shutdown keeps the last valid checkpoint when a prompt exceeds the drain d
   }
 });
 
+test("shutdown waits for a slow store before resolving", async () => {
+  const { store: realStore, cleanup } = makeTempStore();
+  const trackedSaves: Promise<void>[] = [];
+  try {
+    const conn = createConnectionStub();
+    let savesDurable = 0;
+    const store = {
+      save: async (session: Parameters<SessionStore["save"]>[0]) => {
+        const pending = (async () => {
+          await new Promise<void>((resolve) => { setTimeout(resolve, 40); });
+          await realStore.save(session);
+          savesDurable += 1;
+        })();
+        trackedSaves.push(pending);
+        return pending;
+      },
+      flush: () => realStore.flush(),
+    } as unknown as SessionStore;
+    const glm = makeStreamingGlm([[{ text: "final turn" }, { done: true, stopReason: "stop" }]]);
+    const agent = new GlmAcpAgent(conn as never, {
+      glm,
+      sessionStore: store,
+      // Generous on purpose: the drain must outlast slowest-CI fsync latency,
+      // not just the artificial 40 ms delay.
+      shutdownDrainTimeoutMs: 10_000,
+    });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    await agent.shutdown("disconnect");
+
+    // One save at prompt completion plus the shutdown checkpoint: the response
+    // must not resolve while either is still in the store's write queue.
+    assert.equal(savesDurable, 2, "shutdown resolved before the queued checkpoint was durable");
+    assert.ok(realStore.load(sessionId)?.messages.some(
+      (message) => message.role === "assistant" && message.content === "final turn"
+    ));
+  } finally {
+    // A timed-out drain leaves writes pending in the background; let them
+    // settle before the tempdir is removed or they fail with spurious ENOENT.
+    await Promise.allSettled(trackedSaves);
+    cleanup();
+  }
+});
+
+test("shutdown flushes queued checkpoints before rethrowing a resource cleanup error", async () => {
+  const { store: realStore, cleanup } = makeTempStore();
+  const trackedSaves: Promise<void>[] = [];
+  try {
+    const conn = createConnectionStub();
+    // The final checkpoint sits in a deliberately slow write queue while MCP
+    // disposal fails fast. The original error must still rethrow — but only
+    // after the queued checkpoint became durable.
+    let savesDurable = 0;
+    const store = {
+      save: async (session: Parameters<SessionStore["save"]>[0]) => {
+        const pending = (async () => {
+          await new Promise<void>((resolve) => { setTimeout(resolve, 40); });
+          await realStore.save(session);
+          savesDurable += 1;
+        })();
+        trackedSaves.push(pending);
+        return pending;
+      },
+      flush: () => realStore.flush(),
+    } as unknown as SessionStore;
+    const glm = makeStreamingGlm([[{ text: "durable turn" }, { done: true, stopReason: "stop" }]]);
+    const agent = new GlmAcpAgent(conn as never, {
+      glm,
+      sessionStore: store,
+      shutdownDrainTimeoutMs: 10_000,
+      mcpConnector: async () => ({
+        toolDefinitions: [],
+        async dispose() { throw new Error("mcp disposal failed"); },
+      }) as never,
+    });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    await assert.rejects(agent.shutdown("disconnect"), /mcp disposal failed/);
+
+    assert.equal(
+      savesDurable,
+      2,
+      "the shutdown-enqueued checkpoint must be durable by the time shutdown rethrows",
+    );
+    assert.ok(realStore.load(sessionId)?.messages.some(
+      (message) => message.role === "assistant" && message.content === "durable turn"
+    ));
+  } finally {
+    await Promise.allSettled(trackedSaves);
+    cleanup();
+  }
+});
+
 test("shutdown persists partial streamed assistant text without late UI updates", async () => {
   const { store, cleanup } = makeTempStore();
   try {
@@ -1078,7 +1175,7 @@ test("loadSession disposes its replacement MCP client when replay fails", async 
   });
   const sessionId = "22222222-2222-2222-2222-222222222222";
   try {
-    store.save({
+    await store.save({
       sessionId,
       cwd: "/tmp",
       messages: [{ role: "system", content: "you are a coding assistant" }, { role: "user", content: "ping" }],
@@ -1148,7 +1245,7 @@ for (const [name, restore] of [
     });
     const sessionId = "11111111-1111-1111-1111-111111111111";
     try {
-      store.save({
+      await store.save({
         sessionId,
         cwd: "/tmp",
         messages: [{ role: "system", content: "you are a coding assistant" }],
@@ -2747,7 +2844,7 @@ test("prompt persists session state to the SessionStore", async () => {
 test("loadSession restores messages and replays them as session updates", async () => {
   const { store, cleanup } = makeTempStore();
   try {
-    store.save({
+    await store.save({
       sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
       cwd: "/tmp",
       messages: [
@@ -2819,7 +2916,7 @@ test("unstable_forkSession creates a new sessionId with a deep-copied history", 
 test("resumeSession restores in-memory state without replaying messages", async () => {
   const { store, cleanup } = makeTempStore();
   try {
-    store.save({
+    await store.save({
       sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
       cwd: "/tmp",
       messages: [
@@ -2889,7 +2986,7 @@ test("unstable_forkSession works on a session that exists only on disk", async (
   const { store, cleanup } = makeTempStore();
   try {
     const sourceId = "22222222-2222-2222-2222-222222222222";
-    store.save({
+    await store.save({
       sessionId: sourceId,
       cwd: "/tmp/orig",
       messages: [
@@ -2942,7 +3039,7 @@ test("unstable_setSessionModel emits a session_info_update notification", async 
 test("listSessions surfaces persisted-but-not-in-memory sessions", async () => {
   const { store, cleanup } = makeTempStore();
   try {
-    store.save({
+    await store.save({
       sessionId: "11111111-1111-1111-1111-111111111111",
       cwd: "/tmp",
       messages: [{ role: "system", content: "" }],
@@ -3384,7 +3481,7 @@ test("loadSession advertises commands after replaying history", async () => {
   const { store, cleanup: cleanupStore } = makeTempStore();
   const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
   try {
-    store.save({
+    await store.save({
       sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
       cwd,
       messages: [
@@ -3450,7 +3547,7 @@ test("resumeSession advertises commands for the resumed cwd", async () => {
   const { store, cleanup: cleanupStore } = makeTempStore();
   const { cwd, cleanup: cleanupCwd } = makeTempCwd(COMMAND_FIXTURE);
   try {
-    store.save({
+    await store.save({
       sessionId: "abcd1234-abcd-abcd-abcd-abcdabcd1234",
       cwd,
       messages: [{ role: "system", content: "system" }],

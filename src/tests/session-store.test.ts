@@ -49,7 +49,7 @@ function writeRaw(dir: string, sessionId: string, value: unknown): void {
   writeFileSync(join(dir, `${sessionId}.json`), JSON.stringify(value), "utf8");
 }
 
-test("load and listMetadata skip null, primitive, and array JSON roots", () => {
+test("load and listMetadataAsync skip null, primitive, and array JSON roots", async () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
@@ -59,14 +59,14 @@ test("load and listMetadata skip null, primitive, and array JSON roots", () => {
       assert.equal(store.load(id), undefined, `load should reject ${String(value)}`);
     }
 
-    assert.doesNotThrow(() => store.listMetadata());
-    assert.deepEqual(store.listMetadata(), []);
+    await assert.doesNotReject(() => store.listMetadataAsync());
+    assert.deepEqual(await store.listMetadataAsync(), []);
   } finally {
     cleanup(dir);
   }
 });
 
-test("load rejects malformed metadata, mismatched ids, and unsupported versions", () => {
+test("load rejects malformed metadata, mismatched ids, and unsupported versions", async () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
@@ -92,8 +92,8 @@ test("load rejects malformed metadata, mismatched ids, and unsupported versions"
       assert.equal(store.load(id), undefined, `load should reject ${id}`);
     }
 
-    assert.doesNotThrow(() => store.listMetadata());
-    assert.deepEqual(store.listMetadata(), []);
+    await assert.doesNotReject(() => store.listMetadataAsync());
+    assert.deepEqual(await store.listMetadataAsync(), []);
   } finally {
     cleanup(dir);
   }
@@ -221,12 +221,12 @@ test("load migrates valid v1 through v4 records without losing fields", () => {
   }
 });
 
-test("save atomically replaces a broad-mode record and keeps the file private", () => {
+test("save atomically replaces a broad-mode record and keeps the file private", async () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
     const first = validSession({ updatedAt: "2026-09-16T10:00:00.000Z" });
-    store.save(first);
+    await store.save(first);
     const path = join(dir, `${first.sessionId}.json`);
     chmodSync(path, 0o666);
 
@@ -235,7 +235,7 @@ test("save atomically replaces a broad-mode record and keeps the file private", 
       updatedAt: "2026-09-16T11:00:00.000Z",
       messages: [...first.messages, { role: "user", content: "new turn" }],
     });
-    store.save(second);
+    await store.save(second);
 
     // POSIX exposes the mode bits; Windows does not provide this permission
     // contract, while the replacement/load/temporary-file assertions remain
@@ -250,7 +250,55 @@ test("save atomically replaces a broad-mode record and keeps the file private", 
   }
 });
 
-test("save cleans up its temporary file when replacement fails", () => {
+test("save uses invocation-time snapshots and orders concurrent writes per session", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const first = validSession({ sessionId: "ordered", title: "first snapshot" });
+    const expectedMessages = structuredClone(first.messages);
+    const firstSave = store.save(first);
+    first.messages.push({ role: "user", content: "mutated after save invocation" });
+    await firstSave;
+    assert.deepEqual(
+      store.load(first.sessionId)?.messages,
+      expectedMessages,
+      "the persisted snapshot must reflect invocation time, not later mutation",
+    );
+
+    // Artificially delay the first queued write by pre-seeding its FIFO slot,
+    // the way a slow predecessor save would: the second snapshot is enqueued
+    // while the first is still pending and must still land last.
+    const pendingSaves = (store as unknown as { pendingSaves: Map<string, Promise<void>> }).pendingSaves;
+    pendingSaves.set("ordered", new Promise<void>((resolve) => { setTimeout(resolve, 40); }));
+    const older = store.save(validSession({ sessionId: "ordered", title: "older queued snapshot" }));
+    const newer = store.save(validSession({ sessionId: "ordered", title: "newer queued snapshot" }));
+    await Promise.all([older, newer]);
+    assert.equal(store.load(first.sessionId)?.title, "newer queued snapshot");
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("flush drains pending saves including ones queued during the flush", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const pendingSaves = (store as unknown as { pendingSaves: Map<string, Promise<void>> }).pendingSaves;
+    pendingSaves.set("flushed", new Promise<void>((resolve) => { setTimeout(resolve, 40); }));
+    const early = store.save(validSession({ sessionId: "flushed", title: "early snapshot" }));
+    // The flush's first drain only sees `early`; `late` is queued mid-flush
+    // and must extend the drain rather than being left in the queue.
+    const flushing = store.flush();
+    const late = store.save(validSession({ sessionId: "flushed", title: "late snapshot" }));
+    await flushing;
+    assert.equal(store.load("flushed")?.title, "late snapshot");
+    await Promise.all([early, late]);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("save cleans up its temporary file when replacement fails", async () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
@@ -258,7 +306,7 @@ test("save cleans up its temporary file when replacement fails", () => {
     const target = join(dir, `${session.sessionId}.json`);
     mkdirSync(target);
 
-    assert.throws(() => store.save(session));
+    await assert.rejects(store.save(session));
     assert.equal(existsSync(target), true);
     assert.equal(statSync(target).isDirectory(), true);
     assert.deepEqual(
@@ -271,12 +319,12 @@ test("save cleans up its temporary file when replacement fails", () => {
   }
 });
 
-test("save preserves the prior record when serializing the replacement fails", () => {
+test("save preserves the prior record when serializing the replacement fails", async () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
     const first = validSession({ sessionId: "serialization-fails" });
-    store.save(first);
+    await store.save(first);
     const path = join(dir, `${first.sessionId}.json`);
     const before = readFileSync(path, "utf8");
     const cyclicMessage = { role: "user", content: "bad" } as Record<string, unknown>;
@@ -287,6 +335,57 @@ test("save preserves the prior record when serializing the replacement fails", (
     );
     assert.equal(readFileSync(path, "utf8"), before);
     assert.deepEqual(readdirSync(dir).filter((name) => name.includes(".tmp")), []);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("loadAsync waits for the in-flight queued save of the same session (read-your-writes)", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const old = validSession({ sessionId: "racing", title: "old record" });
+    await store.save(old);
+
+    // Start the replacement save WITHOUT awaiting it: the snapshot is queued
+    // in the session's FIFO and its multi-step write (open/write/sync/rename)
+    // is still in flight. loadAsync chains on that in-flight entry, so the
+    // read cannot race ahead of the rename and observe the pre-rename file
+    // holding the OLD record.
+    const updated = validSession({ sessionId: "racing", title: "new record" });
+    const pending = store.save(updated);
+    const loaded = await store.loadAsync(old.sessionId);
+    assert.deepEqual(loaded, { ...updated, schemaVersion: SESSION_SCHEMA_VERSION });
+    await pending;
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("listMetadataAsync lists sessions in parallel, sorted by updatedAt desc, skipping invalid entries", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    // More files than the concurrency bound so the parallel path is exercised.
+    const ids = Array.from({ length: 12 }, (_, index) => `par-${index}`);
+    for (const id of ids) {
+      const seconds = String(Number(id.slice("par-".length))).padStart(2, "0");
+      writeRaw(dir, id, validSession({ sessionId: id, updatedAt: `2026-09-01T00:00:${seconds}.000Z` }));
+    }
+    // Non-JSON file: excluded by the extension filter.
+    writeFileSync(join(dir, "notes.txt"), "not a session", "utf8");
+    // Malformed JSON root: parsed but rejected.
+    writeFileSync(join(dir, "broken-json.json"), "{ not json", "utf8");
+    // Session id mismatch between filename and record: rejected by the parser.
+    writeRaw(dir, "mismatched", validSession({ sessionId: "some-other-session" }));
+
+    const metadata = await store.listMetadataAsync();
+    assert.equal(metadata.length, ids.length, "only the valid session files are listed");
+    assert.deepEqual(
+      metadata.map((entry) => entry.sessionId),
+      [...ids].reverse(),
+      "entries are sorted by updatedAt descending",
+    );
   } finally {
     cleanup(dir);
   }
