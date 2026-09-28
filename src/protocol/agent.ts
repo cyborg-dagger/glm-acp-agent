@@ -1124,7 +1124,7 @@ export class GlmAcpAgent implements Agent {
         remainingMs(),
       );
 
-      let persistenceDrained = true;
+      let persistenceDrained: boolean;
       try {
         if (this.processSupervisor.hasActiveProcesses()) {
           await this.processSupervisor.forceTerminateAll();
@@ -1666,6 +1666,9 @@ export class GlmAcpAgent implements Agent {
   }
 
   private assertConfigurable(sessionId: string, session: SessionState): void {
+    // Fail fast like newSession does: a config setter admitted while shutdown
+    // is draining would race the final persistence flush.
+    if (this.shuttingDown) throw new Error(`Agent is shutting down: ${sessionId}`);
     if (session.closing || session.closed || session.lifecycle.closeRequested) {
       throw new Error(`Session is closing: ${sessionId}`);
     }

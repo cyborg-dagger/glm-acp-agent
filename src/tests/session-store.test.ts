@@ -255,15 +255,44 @@ test("save uses invocation-time snapshots and orders concurrent writes per sessi
   try {
     const store = new SessionStore(dir);
     const first = validSession({ sessionId: "ordered", title: "first snapshot" });
+    const expectedMessages = structuredClone(first.messages);
     const firstSave = store.save(first);
-    first.title = "mutated after save invocation";
+    first.messages.push({ role: "user", content: "mutated after save invocation" });
     await firstSave;
-    assert.equal(store.load(first.sessionId)?.title, "first snapshot");
+    assert.deepEqual(
+      store.load(first.sessionId)?.messages,
+      expectedMessages,
+      "the persisted snapshot must reflect invocation time, not later mutation",
+    );
 
+    // Artificially delay the first queued write by pre-seeding its FIFO slot,
+    // the way a slow predecessor save would: the second snapshot is enqueued
+    // while the first is still pending and must still land last.
+    const pendingSaves = (store as unknown as { pendingSaves: Map<string, Promise<void>> }).pendingSaves;
+    pendingSaves.set("ordered", new Promise<void>((resolve) => { setTimeout(resolve, 40); }));
     const older = store.save(validSession({ sessionId: "ordered", title: "older queued snapshot" }));
     const newer = store.save(validSession({ sessionId: "ordered", title: "newer queued snapshot" }));
     await Promise.all([older, newer]);
     assert.equal(store.load(first.sessionId)?.title, "newer queued snapshot");
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("flush drains pending saves including ones queued during the flush", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const pendingSaves = (store as unknown as { pendingSaves: Map<string, Promise<void>> }).pendingSaves;
+    pendingSaves.set("flushed", new Promise<void>((resolve) => { setTimeout(resolve, 40); }));
+    const early = store.save(validSession({ sessionId: "flushed", title: "early snapshot" }));
+    // The flush's first drain only sees `early`; `late` is queued mid-flush
+    // and must extend the drain rather than being left in the queue.
+    const flushing = store.flush();
+    const late = store.save(validSession({ sessionId: "flushed", title: "late snapshot" }));
+    await flushing;
+    assert.equal(store.load("flushed")?.title, "late snapshot");
+    await Promise.all([early, late]);
   } finally {
     cleanup(dir);
   }

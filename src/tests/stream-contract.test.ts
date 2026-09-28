@@ -97,6 +97,45 @@ test("HTTP idle timeout preserves external abort as cancellation", async () => {
   });
 });
 
+test("HTTP idle timeout aborts the underlying provider connection", async () => {
+  let connectionClosed = false;
+  const server = createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(`data: ${JSON.stringify(delta({ content: "partial output" }))}\n\n`);
+    res.flushHeaders();
+    // The response never ends, so a close can only come from the client side
+    // tearing the connection down — i.e. the watchdog's controller.abort().
+    req.on("close", () => { connectionClosed = true; });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const savedKey = process.env["Z_AI_API_KEY"];
+  const savedUrl = process.env["ACP_GLM_BASE_URL"];
+  process.env["Z_AI_API_KEY"] = "fixture-key";
+  process.env["ACP_GLM_BASE_URL"] = `http://127.0.0.1:${address.port}/v4`;
+  try {
+    const client = new GlmClient();
+    await assert.rejects(async () => {
+      for await (const chunk of client.streamChat([], undefined, { model: "glm-5.3", idleTimeoutMs: 40 })) void chunk;
+    }, (error: unknown) => error instanceof ModelStreamIdleTimeoutError);
+    const deadline = Date.now() + 1_000;
+    while (!connectionClosed && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.ok(connectionClosed, "the idle watchdog must abort the stalled provider connection");
+  } finally {
+    if (savedKey === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = savedKey;
+    if (savedUrl === undefined) delete process.env["ACP_GLM_BASE_URL"];
+    else process.env["ACP_GLM_BASE_URL"] = savedUrl;
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
 test("HTTP idle timeout does not include downstream consumer backpressure", async () => {
   await withProvider([delta({ content: "first" }), delta({}, "stop")], async client => {
     const text: string[] = [];
