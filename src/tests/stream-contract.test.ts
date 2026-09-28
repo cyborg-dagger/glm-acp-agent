@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { GlmClient, ModelStreamIdleTimeoutError, type GlmStreamChunk } from "../llm/glm-client.js";
 import { GlmAcpAgent } from "../protocol/agent.js";
 import { SessionStore } from "../protocol/session-store.js";
+import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 
 async function withProvider(
   frames: unknown[], run: (client: GlmClient, requests: unknown[]) => Promise<void>,
@@ -259,6 +260,83 @@ test("incomplete HTTP response preserves partial text for close and restore", as
       assert.ok(store.load(sessionId)?.messages.some(message => message.role === "assistant" && message.content === "received before EOF"));
     });
   } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("agent-level idle timeout retains partial text, preserves the checkpoint, and recovers", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "glm-idle-agent-flow-"));
+  const store = new SessionStore(join(cwd, "sessions"));
+  interface RecordedUpdate {
+    update: { sessionUpdate: string; content?: { type: string; text?: string } };
+  }
+  const updates: RecordedUpdate[] = [];
+  let streamCall = 0;
+  const agent = new GlmAcpAgent({
+    sessionUpdate: async (update: RecordedUpdate) => { updates.push(update); },
+  } as never, {
+    sessionStore: store,
+    visionClient: null,
+    glm: {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        streamCall += 1;
+        if (streamCall === 1) {
+          yield { text: "checkpoint response" };
+          yield { done: true, stopReason: "stop" };
+          return;
+        }
+        if (streamCall === 2) {
+          yield { text: "partial output" };
+          // Mirror the GlmClient watchdog: silence on the wire, then the
+          // idle-timeout rejection mid-turn with text already delivered.
+          await new Promise(resolve => setTimeout(resolve, 25));
+          throw new ModelStreamIdleTimeoutError("No provider stream data for 25ms");
+        }
+        yield { text: "recovered response" };
+        yield { done: true, stopReason: "stop" };
+      },
+    },
+  });
+  let sessionId: string | undefined;
+  try {
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    ({ sessionId } = await agent.newSession({ cwd, mcpServers: [] }));
+
+    // Prompt #1 completes and becomes the durable on-disk checkpoint.
+    const healthy = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
+    assert.equal(healthy.stopReason, "end_turn");
+    const checkpoint = structuredClone(store.load(sessionId));
+    assert.ok(checkpoint);
+
+    // Prompt #2 stalls mid-turn and rejects with the idle-timeout error.
+    await assert.rejects(
+      agent.prompt({ sessionId, prompt: [{ type: "text", text: "second" }] }),
+      (error: unknown) => error instanceof ModelStreamIdleTimeoutError,
+    );
+
+    // The client saw the partial text that was already streamed, plus the
+    // surfaced [error] chunk describing the watchdog abort.
+    const chunkTexts = updates
+      .filter(update => update.update.sessionUpdate === "agent_message_chunk")
+      .map(update => update.update.content?.text ?? "");
+    assert.ok(chunkTexts.some(text => text.includes("partial output")));
+    assert.ok(chunkTexts.some(text => text.includes("[error] No provider stream data for 25ms")));
+
+    // The stalled turn never corrupted or overwrote the last valid checkpoint.
+    assert.deepEqual(store.load(sessionId), checkpoint);
+
+    // Prompt #3 succeeds and its recovered turn lands in the next checkpoint.
+    const recovered = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "third" }] });
+    assert.equal(recovered.stopReason, "end_turn");
+    const persisted = store.load(sessionId);
+    assert.ok(persisted?.messages.some(
+      message => message.role === "assistant" && message.content === "recovered response",
+    ));
+    assert.ok(persisted?.messages.some(
+      message => message.role === "assistant" && message.content === "partial output",
+    ));
+  } finally {
+    if (sessionId) await agent.closeSession({ sessionId });
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("agent validates injected provider completion before executing its calls", async () => {
