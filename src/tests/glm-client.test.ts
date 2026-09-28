@@ -1,10 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import {
   GlmClient,
+  ModelStreamIdleTimeoutError,
   getAvailableModels,
   getDefaultModel,
   getContextWindow,
@@ -184,6 +187,97 @@ test("constructor throws if Z_AI_API_KEY is missing", () => {
     if (oldXdg === undefined) delete process.env["XDG_CONFIG_HOME"];
     else process.env["XDG_CONFIG_HOME"] = oldXdg;
     rmSync(emptyConfig, { recursive: true, force: true });
+  }
+});
+
+// Minimal stalled SSE provider (same pattern as stream-contract.test.ts):
+// one content frame, then the connection stays open and silent forever.
+// The `construct` callback lets tests set env vars before GlmClient reads
+// them, since the idle timeout is resolved at construction time.
+async function withStalledProvider(
+  run: (construct: () => GlmClient) => Promise<void>
+): Promise<void> {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(`data: ${JSON.stringify({
+      choices: [{ index: 0, delta: { content: "partial output" }, finish_reason: null }],
+    })}\n\n`);
+    res.flushHeaders();
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const savedKey = process.env["Z_AI_API_KEY"];
+  const savedUrl = process.env["ACP_GLM_BASE_URL"];
+  const savedIdle = process.env["ACP_GLM_STREAM_IDLE_TIMEOUT_MS"];
+  process.env["Z_AI_API_KEY"] = "fixture-key";
+  process.env["ACP_GLM_BASE_URL"] = `http://127.0.0.1:${address.port}/v4`;
+  delete process.env["ACP_GLM_STREAM_IDLE_TIMEOUT_MS"];
+  try {
+    await run(() => new GlmClient());
+  } finally {
+    if (savedKey === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = savedKey;
+    if (savedUrl === undefined) delete process.env["ACP_GLM_BASE_URL"];
+    else process.env["ACP_GLM_BASE_URL"] = savedUrl;
+    if (savedIdle === undefined) delete process.env["ACP_GLM_STREAM_IDLE_TIMEOUT_MS"];
+    else process.env["ACP_GLM_STREAM_IDLE_TIMEOUT_MS"] = savedIdle;
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(err => (err ? reject(err) : resolve())));
+  }
+}
+
+test("stream idle timeout is resolved at construction from the environment", async () => {
+  await withStalledProvider(async construct => {
+    // Bake a small idle window into the client at construction.
+    process.env["ACP_GLM_STREAM_IDLE_TIMEOUT_MS"] = "60";
+    const client = construct();
+
+    // The stalled provider trips the constructed timeout...
+    await assert.rejects(async () => {
+      for await (const chunk of client.streamChat([])) void chunk;
+    }, (err: unknown) => err instanceof ModelStreamIdleTimeoutError);
+
+    // ...and changing the env var afterwards must not raise the timeout:
+    // a second stalled call still rejects via the constructed 60ms window.
+    process.env["ACP_GLM_STREAM_IDLE_TIMEOUT_MS"] = "60000";
+    const start = Date.now();
+    await assert.rejects(async () => {
+      for await (const chunk of client.streamChat([])) void chunk;
+    }, (err: unknown) => err instanceof ModelStreamIdleTimeoutError);
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 3000, `env was re-read after construction (took ${elapsed}ms)`);
+  });
+});
+
+test("invalid ACP_GLM_MAX_TOKENS falls back to the default with a stderr warning", () => {
+  const savedKey = process.env["Z_AI_API_KEY"];
+  const savedTokens = process.env["ACP_GLM_MAX_TOKENS"];
+  const savedIdle = process.env["ACP_GLM_STREAM_IDLE_TIMEOUT_MS"];
+  delete process.env["ACP_GLM_STREAM_IDLE_TIMEOUT_MS"];
+  process.env["Z_AI_API_KEY"] = "test-key";
+  process.env["ACP_GLM_MAX_TOKENS"] = "abc";
+  const written: string[] = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: unknown) => {
+    written.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    const c = new GlmClient();
+    assert.equal(c.getMaxOutputTokens(), 32_768);
+    const warning = written.find((line) => line.includes("ACP_GLM_MAX_TOKENS"));
+    assert.ok(warning, `expected a stderr warning, got: ${JSON.stringify(written)}`);
+    assert.match(warning!, /invalid/);
+  } finally {
+    process.stderr.write = originalWrite;
+    if (savedKey === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = savedKey;
+    if (savedTokens === undefined) delete process.env["ACP_GLM_MAX_TOKENS"];
+    else process.env["ACP_GLM_MAX_TOKENS"] = savedTokens;
+    if (savedIdle === undefined) delete process.env["ACP_GLM_STREAM_IDLE_TIMEOUT_MS"];
+    else process.env["ACP_GLM_STREAM_IDLE_TIMEOUT_MS"] = savedIdle;
   }
 });
 
