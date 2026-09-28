@@ -1125,6 +1125,58 @@ test("StdioMcpClient terminates a frame that crosses the limit across many small
   assert.ok(getKillCount() > 0);
   await client.dispose();
 });
+test("StdioMcpClient terminates a multi-byte frame whose bytes exceed the limit under the char fast path", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+  const list = client.listTools();
+  await completeHandshake(written, pushStdout);
+  await list;
+  const pending = client.callTool("search", {});
+  await tick();
+
+  // Every '日' encodes to 3 UTF-8 bytes, so this frame's character count sits
+  // below the fast-path threshold while its byte count crosses the cap. The
+  // byte check must still run and kill the connection.
+  const frame = "日".repeat(Math.floor(MCP_RESPONSE_LIMIT_BYTES / 3) + 1);
+  // The frame must leave the char fast path (length > LIMIT/3, where the byte
+  // scan runs) while its char count alone stays under the cap — exactly the
+  // range the old unsound fast path waved through.
+  assert.ok(frame.length > MCP_RESPONSE_LIMIT_BYTES / 3, "byte scan must run");
+  assert.ok(frame.length <= MCP_RESPONSE_LIMIT_BYTES, "old fast path would have passed it");
+  for (let offset = 0; offset < frame.length; offset += 32_768) {
+    pushStdout(frame.slice(offset, offset + 32_768));
+  }
+  await assert.rejects(pending, /byte limit/);
+  await tick();
+  assert.ok(getKillCount() > 0);
+  await client.dispose();
+});
+
+test("StdioMcpClient keeps a multi-byte frame just under the byte limit alive", async () => {
+  const { child, written, pushStdout, getKillCount } = makeFakeChild();
+  const client = new StdioMcpClient(stdioServer(), { spawn: () => child as never });
+  const list = client.listTools();
+  await completeHandshake(written, pushStdout);
+  await list;
+  const pending = client.callTool("search", {});
+  await tick();
+
+  // 3-byte characters whose total byte count stays within the cap: the frame
+  // is large in characters but must not trip the oversize kill.
+  const frame = "日".repeat(Math.floor((MCP_RESPONSE_LIMIT_BYTES - 8) / 3));
+  for (let offset = 0; offset < frame.length; offset += 32_768) {
+    pushStdout(frame.slice(offset, offset + 32_768));
+  }
+  pushStdout("\n");
+  await tick();
+
+  const callBody = JSON.parse(written.at(-1)?.trim() ?? "{}") as { id: number };
+  pushStdout(JSON.stringify({ jsonrpc: "2.0", id: callBody.id, result: { content: [{ type: "text", text: "ok" }] } }) + "\n");
+  await assert.doesNotReject(pending);
+  assert.equal(getKillCount(), 0);
+  await client.dispose();
+});
+
 test("StdioMcpClient does not resurrect a disposed server", async () => {
   const { child } = makeFakeChild();
   let spawnCount = 0;
