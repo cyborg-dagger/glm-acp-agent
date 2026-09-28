@@ -3,7 +3,7 @@ import type { ChatCompletionAssistantMessageParam, ChatCompletionMessageParam, C
 import type { ModelInfo, Usage } from "@agentclientprotocol/sdk";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { resolveApiKey } from "./credentials.js";
-import { debug, error } from "./logger.js";
+import { debug, error, warn } from "./logger.js";
 import { IncompleteModelStreamError, validateStreamCompletion } from "./stream-state.js";
 
 /**
@@ -284,6 +284,8 @@ export function getDefaultModel(): string {
 export class GlmClient {
   private client: OpenAI;
   private maxTokens: number;
+  /** Resolved once at construction; later env changes cannot affect a running client. */
+  private readonly streamIdleTimeoutMs: number;
 
   constructor() {
     const apiKey = resolveApiKey();
@@ -299,6 +301,10 @@ export class GlmClient {
     // the actual content and trips finish_reason=length ("output limit
     // reached"). Override with ACP_GLM_MAX_TOKENS.
     this.maxTokens = parseIntEnv("ACP_GLM_MAX_TOKENS", 32_768);
+    // Default silence bound for one provider stream item (see
+    // StreamChatOptions.idleTimeoutMs). Resolved once at construction so
+    // env re-reads cannot change behaviour mid-session.
+    this.streamIdleTimeoutMs = parseIntEnv("ACP_GLM_STREAM_IDLE_TIMEOUT_MS", DEFAULT_STREAM_IDLE_TIMEOUT_MS);
 
     this.client = new OpenAI({ apiKey, baseURL });
   }
@@ -365,7 +371,7 @@ export class GlmClient {
     const requestedIdleTimeout = options?.idleTimeoutMs;
     const idleTimeoutMs = requestedIdleTimeout !== undefined && requestedIdleTimeout > 0
       ? requestedIdleTimeout
-      : parseIntEnv("ACP_GLM_STREAM_IDLE_TIMEOUT_MS", DEFAULT_STREAM_IDLE_TIMEOUT_MS);
+      : this.streamIdleTimeoutMs;
     const idleBoundedStream = readWithIdleTimeout(
       stream as AsyncIterable<unknown> & { controller?: AbortController },
       signal,
@@ -483,12 +489,18 @@ export class GlmClient {
   }
 }
 
-/** Parse an integer environment variable, falling back to a default. */
+/**
+ * Parse an integer environment variable, falling back to a default. A set but
+ * invalid value (not a finite positive integer) logs a stderr warning first, so
+ * a typo never silently changes behaviour.
+ */
 function parseIntEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
   const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+  if (Number.isFinite(n) && n > 0) return n;
+  warn(`invalid ${name} value "${raw}"; falling back to ${fallback}`);
+  return fallback;
 }
 /** Bound only provider reads; yielded items leave the timer stopped during ACP backpressure. */
 async function* readWithIdleTimeout<T>(
