@@ -49,7 +49,7 @@ function writeRaw(dir: string, sessionId: string, value: unknown): void {
   writeFileSync(join(dir, `${sessionId}.json`), JSON.stringify(value), "utf8");
 }
 
-test("load and listMetadata skip null, primitive, and array JSON roots", () => {
+test("load and listMetadataAsync skip null, primitive, and array JSON roots", async () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
@@ -59,14 +59,14 @@ test("load and listMetadata skip null, primitive, and array JSON roots", () => {
       assert.equal(store.load(id), undefined, `load should reject ${String(value)}`);
     }
 
-    assert.doesNotThrow(() => store.listMetadata());
-    assert.deepEqual(store.listMetadata(), []);
+    await assert.doesNotReject(() => store.listMetadataAsync());
+    assert.deepEqual(await store.listMetadataAsync(), []);
   } finally {
     cleanup(dir);
   }
 });
 
-test("load rejects malformed metadata, mismatched ids, and unsupported versions", () => {
+test("load rejects malformed metadata, mismatched ids, and unsupported versions", async () => {
   const dir = makeDir();
   try {
     const store = new SessionStore(dir);
@@ -92,8 +92,8 @@ test("load rejects malformed metadata, mismatched ids, and unsupported versions"
       assert.equal(store.load(id), undefined, `load should reject ${id}`);
     }
 
-    assert.doesNotThrow(() => store.listMetadata());
-    assert.deepEqual(store.listMetadata(), []);
+    await assert.doesNotReject(() => store.listMetadataAsync());
+    assert.deepEqual(await store.listMetadataAsync(), []);
   } finally {
     cleanup(dir);
   }
@@ -306,6 +306,57 @@ test("save preserves the prior record when serializing the replacement fails", a
     );
     assert.equal(readFileSync(path, "utf8"), before);
     assert.deepEqual(readdirSync(dir).filter((name) => name.includes(".tmp")), []);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("loadAsync waits for the in-flight queued save of the same session (read-your-writes)", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    const old = validSession({ sessionId: "racing", title: "old record" });
+    await store.save(old);
+
+    // Start the replacement save WITHOUT awaiting it: the snapshot is queued
+    // in the session's FIFO and its multi-step write (open/write/sync/rename)
+    // is still in flight. loadAsync chains on that in-flight entry, so the
+    // read cannot race ahead of the rename and observe the pre-rename file
+    // holding the OLD record.
+    const updated = validSession({ sessionId: "racing", title: "new record" });
+    const pending = store.save(updated);
+    const loaded = await store.loadAsync(old.sessionId);
+    assert.deepEqual(loaded, { ...updated, schemaVersion: SESSION_SCHEMA_VERSION });
+    await pending;
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("listMetadataAsync lists sessions in parallel, sorted by updatedAt desc, skipping invalid entries", async () => {
+  const dir = makeDir();
+  try {
+    const store = new SessionStore(dir);
+    // More files than the concurrency bound so the parallel path is exercised.
+    const ids = Array.from({ length: 12 }, (_, index) => `par-${index}`);
+    for (const id of ids) {
+      const seconds = String(Number(id.slice("par-".length))).padStart(2, "0");
+      writeRaw(dir, id, validSession({ sessionId: id, updatedAt: `2026-09-01T00:00:${seconds}.000Z` }));
+    }
+    // Non-JSON file: excluded by the extension filter.
+    writeFileSync(join(dir, "notes.txt"), "not a session", "utf8");
+    // Malformed JSON root: parsed but rejected.
+    writeFileSync(join(dir, "broken-json.json"), "{ not json", "utf8");
+    // Session id mismatch between filename and record: rejected by the parser.
+    writeRaw(dir, "mismatched", validSession({ sessionId: "some-other-session" }));
+
+    const metadata = await store.listMetadataAsync();
+    assert.equal(metadata.length, ids.length, "only the valid session files are listed");
+    assert.deepEqual(
+      metadata.map((entry) => entry.sessionId),
+      [...ids].reverse(),
+      "entries are sorted by updatedAt descending",
+    );
   } finally {
     cleanup(dir);
   }

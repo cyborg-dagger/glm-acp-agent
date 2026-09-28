@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
@@ -76,6 +76,8 @@ const VALID_THOUGHT_LEVELS = new Set<ThoughtLevel>([
   "max",
 ]);
 const VALID_MESSAGE_ROLES = new Set(["system", "developer", "user", "assistant", "tool", "function"]);
+/** Max session files read concurrently while building the listing. */
+const LIST_METADATA_CONCURRENCY = 8;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -259,6 +261,21 @@ function defaultSessionDir(): string {
   return join(base, "glm-acp-agent", "sessions");
 }
 
+/** Run `mapper` over `items` with at most `limit` in flight, preserving order. */
+async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, mapper: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 /**
  * File-backed session store. Each session lives in its own JSON file so we can
  * grow/shrink linearly with the number of conversations and avoid locking a
@@ -292,12 +309,12 @@ export class SessionStore {
       schemaVersion: SESSION_SCHEMA_VERSION,
     };
     if (!parsePersistedSession(body, session.sessionId)) {
-      throw new Error("Invalid persisted session: " + session.sessionId);
+      throw new Error(`Invalid persisted session: ${session.sessionId}`);
     }
     // Serialize before returning or yielding to the event loop: callers may
     // continue mutating their live session while this snapshot waits in queue.
     const bytes = Buffer.from(JSON.stringify(body, null, 2) + "\n", "utf8");
-    const tempPath = join(this.dir, "." + basename(path) + "." + randomUUID() + ".tmp");
+    const tempPath = join(this.dir, `.${basename(path)}.${randomUUID()}.tmp`);
 
     const previous = this.pendingSaves.get(session.sessionId) ?? Promise.resolve();
     const savePromise = previous.catch(() => undefined).then(async () => {
@@ -345,7 +362,10 @@ export class SessionStore {
     }
   }
 
-  /** Load a session by id, returning undefined if no such file exists. */
+  /**
+   * Test-only synchronous load; protocol paths use loadAsync so disk reads
+   * never block the event loop.
+   */
   load(sessionId: string): PersistedSession | undefined {
     let path: string;
     try {
@@ -370,6 +390,9 @@ export class SessionStore {
     } catch {
       return undefined;
     }
+    // Read-your-writes: a load/fork racing a just-finished prompt must see the queued snapshot.
+    const pending = this.pendingSaves.get(sessionId);
+    if (pending) await pending.catch(() => undefined);
     let raw: string;
     try {
       raw = await readFile(path, "utf8");
@@ -391,26 +414,6 @@ export class SessionStore {
     return parsePersistedSession(parsed, sessionId);
   }
 
-  /**
-   * List metadata synchronously for compatibility with existing store users.
-   * Protocol requests use listMetadataAsync to avoid blocking on file I/O.
-   */
-  listMetadata(): PersistedSessionMetadata[] {
-    let entries: string[];
-    try {
-      entries = readdirSync(this.dir);
-    } catch {
-      return [];
-    }
-    const out: PersistedSessionMetadata[] = [];
-    for (const name of entries) {
-      if (!name.endsWith(".json")) continue;
-      const sess = this.load(name.slice(0, -".json".length));
-      if (sess) out.push(this.toMetadata(sess));
-    }
-    return this.sortMetadata(out);
-  }
-
   async listMetadataAsync(): Promise<PersistedSessionMetadata[]> {
     let entries: string[];
     try {
@@ -418,13 +421,11 @@ export class SessionStore {
     } catch {
       return [];
     }
-    const out: PersistedSessionMetadata[] = [];
-    for (const name of entries) {
-      if (!name.endsWith(".json")) continue;
-      const sess = await this.loadAsync(name.slice(0, -".json".length));
-      if (sess) out.push(this.toMetadata(sess));
-    }
-    return this.sortMetadata(out);
+    const names = entries.filter((name) => name.endsWith(".json"));
+    const sessions = await mapWithConcurrency(names, LIST_METADATA_CONCURRENCY, async (name) =>
+      this.loadAsync(name.slice(0, -".json".length)),
+    );
+    return this.sortMetadata(sessions.flatMap((sess) => (sess ? [this.toMetadata(sess)] : [])));
   }
 
   private toMetadata(sess: PersistedSession): PersistedSessionMetadata {
