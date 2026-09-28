@@ -104,9 +104,10 @@ test("HTTP idle timeout aborts the underlying provider connection", async () => 
     res.writeHead(200, { "Content-Type": "text/event-stream" });
     res.write(`data: ${JSON.stringify(delta({ content: "partial output" }))}\n\n`);
     res.flushHeaders();
-    // The response never ends, so a close can only come from the client side
-    // tearing the connection down — i.e. the watchdog's controller.abort().
-    req.on("close", () => { connectionClosed = true; });
+    // The request completes as soon as its body is drained, so its "close"
+    // would fire regardless. The response never ends, so observing res
+    // instead proves the client tore the unfinished SSE stream down.
+    res.on("close", () => { connectionClosed = true; });
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");

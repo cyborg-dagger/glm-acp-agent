@@ -422,10 +422,14 @@ export class SessionStore {
       return [];
     }
     const names = entries.filter((name) => name.endsWith(".json"));
-    const sessions = await mapWithConcurrency(names, LIST_METADATA_CONCURRENCY, async (name) =>
-      this.loadAsync(name.slice(0, -".json".length)),
-    );
-    return this.sortMetadata(sessions.flatMap((sess) => (sess ? [this.toMetadata(sess)] : [])));
+    // Project to metadata inside the mapper: each loaded history is released
+    // as soon as its metadata is extracted, so peak memory stays bounded no
+    // matter how many sessions the directory holds.
+    const metadata = await mapWithConcurrency(names, LIST_METADATA_CONCURRENCY, async (name) => {
+      const sess = await this.loadAsync(name.slice(0, -".json".length));
+      return sess ? this.toMetadata(sess) : undefined;
+    });
+    return this.sortMetadata(metadata.flatMap((entry) => (entry ? [entry] : [])));
   }
 
   private toMetadata(sess: PersistedSession): PersistedSessionMetadata {
