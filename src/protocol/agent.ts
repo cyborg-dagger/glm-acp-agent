@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
+import { PACKAGE_VERSION } from "../package-version.js";
 import type { ChatCompletionContentPart } from "openai/resources/index.js";
 import type {
   Agent,
@@ -76,7 +77,7 @@ import {
   assertValidHistory,
   compactToBudget,
   estimateMessagesTokens,
-  estimateSerializedTokens,
+  ToolSchemaTokenCache,
   type ContextBudget,
 } from "./context-budget.js";
 
@@ -305,6 +306,7 @@ export class GlmAcpAgent implements Agent {
   private readonly mcpConnector: NonNullable<GlmAcpAgentOptions["mcpConnector"]>;
   private readonly pendingSetups = new Set<PendingMcpSetup>();
   private readonly processSupervisor = new ProcessSupervisor();
+  private readonly toolSchemaTokenCache = new ToolSchemaTokenCache();
   private shuttingDown = false;
   private shutdownPromise: Promise<void> | null = null;
   private readonly shutdownDrainTimeoutMs: number;
@@ -366,7 +368,7 @@ export class GlmAcpAgent implements Agent {
       protocolVersion: negotiatedVersion,
       agentInfo: {
         name: "glm-acp-agent",
-        version: "1.0.0",
+        version: PACKAGE_VERSION,
       },
       // Advertise auth methods so the ACP registry verifier and capable
       // clients can discover how to configure us. The `agent`-default method
@@ -2108,7 +2110,8 @@ export class GlmAcpAgent implements Agent {
   private contextBudget(session: SessionState): ContextBudget {
     const contextWindow = getContextWindow(session.model);
     const maxOutputTokens = this.glm.getMaxOutputTokens?.() ?? 32_768;
-    const toolSchemaTokens = estimateSerializedTokens(session.toolDefinitions);
+    // Session catalogs are immutable after assembly; a replacement catalog has a new identity.
+    const toolSchemaTokens = this.toolSchemaTokenCache.get(session.toolDefinitions);
     return {
       contextWindow,
       maxOutputTokens,
