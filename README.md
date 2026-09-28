@@ -69,9 +69,11 @@ ACP Client (IDE plugin, CLI, …)
 
 The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations use paths resolved against the ACP session working directory. When the client advertises `fs.writeTextFile`, writes and edits are routed through the ACP client so they render as native diffs. When it advertises both `fs.readTextFile` and `fs.writeTextFile`, `read_file` and edit-file reads also use the editor buffer; otherwise those reads fall back to the agent process filesystem. Writes and arbitrary shell commands still go through ACP `session/request_permission`, and the permission payload is always the **full** tool arguments — the user approves exactly what will run.
 
-Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` (and in the `read_file` content preview) are elided to a short head plus a character count. Model-facing tool results are also capped at a UTF-8 byte boundary; write payloads and permission requests remain complete. Progress narration lives in the `todowrite` task list rather than prose, and reasoning tokens are only forwarded as `agent_thought_chunk` when `ACP_GLM_STREAM_THINKING` is not `false` (the default preserves streaming).
+Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` (and in the `read_file` content preview) are elided to a short head plus a character count, and every completed or failed card's visible text is bounded to an aggregate 16 KiB UTF-8 budget — oversized previews end with `[… N bytes elided in preview; full result sent to model]` and card titles are elided to 240 characters. The model still receives the full tool result, capped at 256 KiB by `ACP_GLM_TOOL_RESULT_LIMIT_BYTES`; write payloads and permission requests remain complete. Progress narration lives in the `todowrite` task list rather than prose, and reasoning tokens are only forwarded as `agent_thought_chunk` when `ACP_GLM_STREAM_THINKING` is not `false` (the default preserves streaming).
 
 ## Client MCP, context, and trust boundary
+
+All MCP transports share an 8 MiB response cap (`MCP_RESPONSE_LIMIT_BYTES`): HTTP response bodies are read incrementally and a larger body cancels the read and fails the tool call, while an oversized or newline-less stdio JSON-RPC frame fails the connection, rejecting pending requests and terminating the child process. The cap applies to client-provided servers and to the built-in Web MCP and Vision MCP clients.
 
 ### Client-provided MCP servers
 
@@ -114,6 +116,8 @@ Clients can use `session/set_mode` to drive the permission policy:
 | `bypass_permissions` | Bypass all permissions | Silent | Silent |
 
 Reads, listings, and MCP tool calls are always silent across all modes.
+
+Permission prompts always carry the full, unelided tool arguments, so the user approves exactly what will run. The prompt offers exactly `allow` and `reject`, and a tool runs only when the response selects `allow` with outcome `selected`; anything else — a missing or unrecognised option id, an unknown outcome string, or a null/absent response — is treated as reject. An explicit `cancelled` outcome remains distinct from rejection.
 
 ---
 
