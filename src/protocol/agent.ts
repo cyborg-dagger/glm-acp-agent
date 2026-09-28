@@ -159,7 +159,14 @@ interface SessionState {
    * to observe its abort before mutating shared session state.
    */
   promptPromise: Promise<void> | null;
-  /** A deferred timeout checkpoint scheduled after this prompt drains. */
+  /**
+   * A deferred timeout checkpoint scheduled after this prompt drains. Set at
+   * most once per session state (by a timed-out fork/restore drain) and
+   * awaited by the drained prompt's cleanup so its ACP response cannot outrun
+   * the checkpoint it triggered. Deliberately never reset: a later await on
+   * the settled promise is a no-op, and a replacement session state installs
+   * its own field.
+   */
   drainCheckpointPromise?: Promise<void> | null;
   /** True while closeSession is waiting for the active prompt to unwind. */
   closing: boolean;
@@ -1071,10 +1078,15 @@ export class GlmAcpAgent implements Agent {
       }
 
       await this.processSupervisor.terminateAll();
-      const deadlineMs = this.shutdownDrainTimeoutMs;
+      // One budget for the whole shutdown, not per stage: the CLI gives
+      // shutdown five seconds before it force-exits, and the default drain
+      // window below stays inside it so a late persistence flush can never be
+      // cut off mid-write by process.exit().
+      const deadlineAt = Date.now() + this.shutdownDrainTimeoutMs;
+      const remainingMs = () => Math.max(0, deadlineAt - Date.now());
       const promptsSettled = await Promise.all(sessions.map(([, session]) =>
         session.promptPromise
-          ? settlesWithin(session.promptPromise, deadlineMs)
+          ? settlesWithin(session.promptPromise, remainingMs())
           : Promise.resolve(true),
       ));
 
@@ -1087,7 +1099,7 @@ export class GlmAcpAgent implements Agent {
       const setups = [...this.pendingSetups].map((setup) => setup.dispose());
       const auxDrained = await settlesWithin(
         Promise.allSettled([...transitions, ...closes, ...setups]),
-        deadlineMs,
+        remainingMs(),
       );
 
       const resourceDisposals: Promise<void>[] = [];
@@ -1109,26 +1121,38 @@ export class GlmAcpAgent implements Agent {
         Promise.all(resourceDisposals).catch((error) => {
           resourceCleanupError = error;
         }),
-        deadlineMs,
+        remainingMs(),
       );
 
-      if (this.processSupervisor.hasActiveProcesses()) {
-        await this.processSupervisor.forceTerminateAll();
+      let persistenceDrained = true;
+      try {
+        if (this.processSupervisor.hasActiveProcesses()) {
+          await this.processSupervisor.forceTerminateAll();
+        }
+        if (this.processSupervisor.hasActiveProcesses()) {
+          throw new Error("Agent shutdown left active command processes");
+        }
+        if (!resourcesDrained) {
+          throw new Error("Agent shutdown timed out waiting for resource cleanup");
+        }
+        if (resourceCleanupError) throw resourceCleanupError;
+        if (!auxDrained || promptsSettled.some((settled) => !settled)) {
+          throw new Error("Agent shutdown timed out waiting for prompt cleanup");
+        }
+      } finally {
+        // Queued checkpoints must reach disk on every exit path, not only the
+        // clean one: an earlier throw skips straight here, the bounded drain
+        // below still waits for the writes, and the original error rethrows.
+        persistenceDrained = await settlesWithin(
+          Promise.all([...persistenceWrites, this.sessionStore?.flush() ?? Promise.resolve()]),
+          remainingMs(),
+        );
+        if (!persistenceDrained) {
+          process.stderr.write(
+            "[glm-acp-agent] warning: shutdown returned before queued session checkpoints were durable\n"
+          );
+        }
       }
-      if (this.processSupervisor.hasActiveProcesses()) {
-        throw new Error("Agent shutdown left active command processes");
-      }
-      if (!resourcesDrained) {
-        throw new Error("Agent shutdown timed out waiting for resource cleanup");
-      }
-      if (resourceCleanupError) throw resourceCleanupError;
-      if (!auxDrained || promptsSettled.some((settled) => !settled)) {
-        throw new Error("Agent shutdown timed out waiting for prompt cleanup");
-      }
-      const persistenceDrained = await settlesWithin(
-        Promise.all([...persistenceWrites, this.sessionStore?.flush() ?? Promise.resolve()]),
-        deadlineMs,
-      );
       if (!persistenceDrained) {
         throw new Error("Agent shutdown timed out waiting for session persistence");
       }
