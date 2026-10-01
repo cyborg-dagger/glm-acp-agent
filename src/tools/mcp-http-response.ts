@@ -137,7 +137,17 @@ function parseEnvelope(text: string, expectedId: number): McpHttpJsonRpcResponse
   const hasError = Object.hasOwn(record, "error");
   const hasId = Object.hasOwn(record, "id");
   if (record.jsonrpc !== "2.0") throw new Error("Invalid MCP JSON-RPC envelope");
-  if (!hasId && typeof record.method === "string" && !hasResult && !hasError) return undefined;
+  if (Object.hasOwn(record, "method")) {
+    if (typeof record.method !== "string" || hasResult || hasError
+      || (Object.hasOwn(record, "params") && (typeof record.params !== "object" || record.params === null || Array.isArray(record.params)))
+      || (hasId && (typeof record.id !== "string" && typeof record.id !== "number"))
+      || (typeof record.id === "number" && !Number.isFinite(record.id))) {
+      throw new Error("Invalid MCP JSON-RPC envelope");
+    }
+    // Server request dispatch is unsupported; preserve the ability to read the
+    // outgoing request's later response, even when both directions use the same id.
+    return undefined;
+  }
   if (!hasId || hasResult === hasError || (record.id !== null && typeof record.id !== "string" && typeof record.id !== "number")
     || (typeof record.id === "number" && !Number.isFinite(record.id))) {
     throw new Error("Invalid MCP JSON-RPC envelope");

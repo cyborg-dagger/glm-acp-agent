@@ -73,6 +73,97 @@ function fixtureFetch(reply: (request: Request, init: RequestInit) => Response |
 }
 
 for (const adapter of ["session", "zai"] as const) {
+  // Treating method-bearing messages as responses would reject the first chunk
+  // or mistake a same-number server request for the outgoing tool call's reply.
+  for (const prefix of ["string id", "same-number id", "object params"] as const) {
+    test(`${adapter} HTTP skips a valid server request with ${prefix} before the matching SSE result`, async () => {
+      let chunksRead = 0;
+      let cancellations = 0;
+      let response: Response | undefined;
+      const fetchImpl = fixtureFetch(request => {
+        if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
+        if (request.method !== "tools/call") return jsonResponse(request);
+        const serverRequest = prefix === "object params"
+          ? { jsonrpc: "2.0", id: "server-roots", method: "roots/list", params: { _meta: { progressToken: "roots-progress" } } }
+          : { jsonrpc: "2.0", id: prefix === "same-number id" ? request.id : "server-ping", method: "ping" };
+        const chunks = [
+          encoder.encode(`data: ${JSON.stringify(serverRequest)}\n\n`),
+          encoder.encode(`data: ${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: resultFor("tools/call") })}\n\n`),
+        ];
+        response = new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (chunksRead === chunks.length) { controller.close(); return; }
+            controller.enqueue(chunks[chunksRead++]);
+          },
+          cancel() { cancellations += 1; return new Promise<void>(() => {}); },
+        }, { highWaterMark: 0 }), { headers: { "Content-Type": "text/event-stream" } });
+        return response;
+      });
+      await withClient(adapter, fetchImpl, async call => {
+        assert.deepEqual(await within(call()), { content: [{ type: "text", text: "A🌟B" }] });
+        assert.equal(chunksRead, 2, "the matching result must be read after the server request");
+        assert.equal(cancellations, 1, "the open response body must be released once");
+        assert.equal(response?.body?.locked, false);
+      });
+    });
+  }
+
+  // Blindly skipping objects with a method or id would let malformed request
+  // envelopes disappear and incorrectly return the otherwise valid next chunk.
+  for (const [name, fields] of [
+    ["non-string method", { id: "server-ping", method: 7 }],
+    ["null method", { id: "server-ping", method: null }],
+    ["null id", { id: null, method: "ping" }],
+    ["boolean id", { id: true, method: "ping" }],
+    ["object id", { id: {}, method: "ping" }],
+    ["array id", { id: [], method: "ping" }],
+    ["null params", { id: "server-ping", method: "ping", params: null }],
+    ["array params", { id: "server-ping", method: "ping", params: [] }],
+    ["string params", { id: "server-ping", method: "ping", params: "invalid" }],
+    ["number params", { id: "server-ping", method: "ping", params: 7 }],
+    ["boolean params", { id: "server-ping", method: "ping", params: true }],
+    ["request with result", { id: "server-ping", method: "ping", result: {} }],
+    ["request with error", { id: "server-ping", method: "ping", error: { code: -32000, message: "invalid" } }],
+  ] as const) {
+    test(`${adapter} HTTP rejects a malformed server request with ${name} before the matching SSE result`, async () => {
+      let chunksRead = 0;
+      let cancellations = 0;
+      let response: Response | undefined;
+      const fetchImpl = fixtureFetch(request => {
+        if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
+        if (request.method !== "tools/call") return jsonResponse(request);
+        const chunks = [
+          encoder.encode(`data: ${JSON.stringify({ jsonrpc: "2.0", ...fields })}\n\n`),
+          encoder.encode(`data: ${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: resultFor("tools/call") })}\n\n`),
+        ];
+        response = new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (chunksRead === chunks.length) { controller.close(); return; }
+            controller.enqueue(chunks[chunksRead++]);
+          },
+          cancel() { cancellations += 1; return new Promise<void>(() => {}); },
+        }, { highWaterMark: 0 }), { headers: { "Content-Type": "text/event-stream" } });
+        return response;
+      });
+      await withClient(adapter, fetchImpl, async call => {
+        await assert.rejects(within(call()), /invalid.*JSON-RPC/i);
+        assert.equal(chunksRead, 1, "malformed requests must fail before reading the matching result");
+        assert.equal(cancellations, 1);
+        assert.equal(response?.body?.locked, false);
+      });
+    });
+  }
+
+  test(`${adapter} HTTP rejects a nonfinite server request id before the matching SSE result`, async () => {
+    await withClient(adapter, fixtureFetch(request => {
+      if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
+      if (request.method !== "tools/call") return jsonResponse(request);
+      return new Response('data: {"jsonrpc":"2.0","id":1e400,"method":"ping"}\n\n'
+        + `data: ${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: resultFor("tools/call") })}\n\n`,
+      { headers: { "Content-Type": "text/event-stream" } });
+    }), async call => { await assert.rejects(call(), /invalid.*JSON-RPC/i); });
+  });
+
   test(`${adapter} HTTP reconstructs multiline SSE and selects the matching id across split UTF8 chunks`, async () => {
     const fetchImpl = fixtureFetch(request => {
       if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
