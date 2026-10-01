@@ -935,6 +935,58 @@ test("edit_file replaces a unique blank-line snippet through the permission flow
   }
 });
 
+for (const scenario of [
+  { name: "overlapping snippets", content: "ababa", oldText: "aba", expected: "changedba" },
+  { name: "overlapping astral text", content: "🙂🙂🙂", oldText: "🙂🙂", expected: "changed🙂" },
+  { name: "a literal UTF-16 surrogate", content: "🙂", oldText: "\ud83d", expected: "changed\ude42" },
+]) {
+  test(`edit_file counts non-overlapping literal matches for ${scenario.name}`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-overlap-"));
+    const path = join(dir, "code.txt");
+    writeFileSync(path, scenario.content, "utf8");
+    const conn = createConnectionStub();
+    const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    try {
+      const result = await executor.execute(
+        "tc1",
+        "edit_file",
+        JSON.stringify({ path, old_text: scenario.oldText, new_text: "changed" })
+      );
+      assert.match(result.content, /edited successfully/);
+      assert.deepEqual(conn.writeTextFileCalls.map(call => call.content), [scenario.expected]);
+      assert.equal(conn.permissionRequests.length, 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const afterPermission of [false, true]) {
+  test(`edit_file reports the full non-overlapping ambiguity count ${afterPermission ? "after" : "before"} permission`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-overlap-ambiguous-"));
+    const path = join(dir, "code.txt");
+    const ambiguous = "🙂🙂🙂🙂🙂🙂🙂";
+    writeFileSync(path, afterPermission ? "🙂🙂" : ambiguous, "utf8");
+    const conn = createConnectionStub({
+      onPermission: () => writeFileSync(path, ambiguous, "utf8"),
+    });
+    const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    try {
+      const result = await executor.execute(
+        "tc1",
+        "edit_file",
+        JSON.stringify({ path, old_text: "🙂🙂", new_text: "changed" })
+      );
+      assert.match(result.content, afterPermission ? /now occurs 3 times/ : /occurs 3 times/);
+      assert.equal(readFileSync(path, "utf8"), ambiguous);
+      assert.equal(conn.writeTextFileCalls.length, 0);
+      assert.equal(conn.permissionRequests.length, afterPermission ? 1 : 0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test("edit_file inserts replacement text literally when it contains replace tokens", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-literal-"));
   const path = join(dir, "code.txt");

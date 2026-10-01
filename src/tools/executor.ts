@@ -69,6 +69,19 @@ const PREVIEW_WALK_BUDGET_BYTES = 262_144;
 /** Marker charged into objects/arrays when the walk budget is exhausted mid-container. */
 const PREVIEW_ELIDED_KEY = "[elided]";
 
+/** Count non-overlapping literal matches; snippet must be non-empty. */
+function countNonOverlappingMatches(text: string, snippet: string): number {
+  let count = 0;
+  for (
+    let index = text.indexOf(snippet);
+    index !== -1;
+    index = text.indexOf(snippet, index + snippet.length)
+  ) {
+    count += 1;
+  }
+  return count;
+}
+
 /** Format a bounded listing while measuring each candidate line only once. */
 export function formatDirectoryListing(
   header: string,
@@ -640,7 +653,7 @@ export class ToolExecutor {
       return { content: `Error editing file: cannot read ${path}: ${message}` };
     }
 
-    const occurrences = current.split(oldText).length - 1;
+    const occurrences = countNonOverlappingMatches(current, oldText);
     if (occurrences === 0) {
       await this.markFailed(toolCallId, "old_text not found in file");
       return {
@@ -699,7 +712,7 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, message);
       return { content: `Error editing file: cannot re-read ${path}: ${message}` };
     }
-    const latestOccurrences = latest.split(oldText).length - 1;
+    const latestOccurrences = countNonOverlappingMatches(latest, oldText);
     if (latestOccurrences !== 1) {
       const reason =
         latestOccurrences === 0
