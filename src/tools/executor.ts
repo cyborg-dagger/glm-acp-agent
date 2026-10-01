@@ -298,6 +298,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) return { content: "Tool call cancelled before execution." };
     try {
       const page = await this.readTextPage(absolutePath, offset, limit);
       if (page.eof) {
@@ -454,6 +455,8 @@ export class ToolExecutor {
         rawInput: elideForPreview(args),
       },
     });
+
+    if (this.signal?.aborted) return { content: "Tool call cancelled before execution." };
 
     // Step 2: request user permission based on the current session mode. The
     // prompt must show the full payload: an approval decides on exactly what
@@ -631,6 +634,8 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) return { content: "Tool call cancelled before execution." };
+
     let current: string;
     try {
       current = await this.performRead(absolutePath);
@@ -760,6 +765,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) return { content: "Tool call cancelled before execution." };
     try {
       const directory = await opendir(absolutePath);
       const entries: Dirent[] = [];
@@ -951,6 +957,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) return { content: "Tool call cancelled before execution." };
     try {
       const apiKey = requireResolvedApiKey();
       const toolArgs: Record<string, unknown> = { query };
@@ -1013,6 +1020,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) return { content: "Tool call cancelled before execution." };
     try {
       const apiKey = requireResolvedApiKey();
 
@@ -1081,6 +1089,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) return { content: "Tool call cancelled before execution." };
     try {
       const visionArgs: Record<string, unknown> = { image_source: imageSource };
       if (prompt) visionArgs["prompt"] = prompt;
@@ -1123,6 +1132,7 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) return { content: "Tool call cancelled before execution." };
     try {
       const mcpResult = await this.sessionMcpTools!.callTool(toolName, args, this.signal);
       const text = unwrapToolText(mcpResult);
