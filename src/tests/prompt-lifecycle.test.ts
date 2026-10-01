@@ -266,11 +266,22 @@ test("cancellation after a thought notification settles blocks its same-chunk te
   }
 });
 
-for (const toolName of ["read_file", "list_files", "custom_mcp_tool"] as const) {
-  test(`cancellation after a ${toolName} announcement settles blocks its operation`, async () => {
+for (const { toolName, transfer } of [
+  { toolName: "read_file", transfer: "cancel" },
+  { toolName: "list_files", transfer: "cancel" },
+  { toolName: "custom_mcp_tool", transfer: "cancel" },
+  { toolName: "read_file", transfer: "fork" },
+  { toolName: "read_file", transfer: "load" },
+  { toolName: "custom_mcp_tool", transfer: "fork" },
+  { toolName: "custom_mcp_tool", transfer: "load" },
+] as const) {
+  test(`cancellation after a ${toolName} announcement settles blocks its operation (${transfer})`, async () => {
     const cwd = await mkdtemp(join(tmpdir(), "glm-acp-settled-tool-announcement-"));
     const store = new SessionStore(join(cwd, "sessions"));
     let startedOperations = 0;
+    let transferPromise: Promise<unknown> | undefined;
+    let forkedSessionId: string | undefined;
+    let announced = false;
     const conn = {
       ...connection(),
       async readTextFile() {
@@ -282,9 +293,18 @@ for (const toolName of ["read_file", "list_files", "custom_mcp_tool"] as const) 
     conn.sessionUpdate = params => {
       conn.updates.push(params);
       const delivered = Promise.resolve();
-      if ((params.update as { status?: string }).status === "in_progress") {
+      if (!announced && (params.update as { status?: string }).status === "in_progress") {
+        announced = true;
         void delivered.then(() => queueMicrotask(() => queueMicrotask(() => {
-          void agent.cancel({ sessionId: String(params.sessionId) });
+          const sessionId = String(params.sessionId);
+          if (transfer === "cancel") {
+            void agent.cancel({ sessionId });
+          } else {
+            transferPromise = transfer === "fork"
+              ? agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] })
+              : agent.loadSession({ sessionId, cwd, mcpServers: [] });
+            void transferPromise.catch(() => undefined);
+          }
         })));
       }
       return delivered;
@@ -309,63 +329,79 @@ for (const toolName of ["read_file", "list_files", "custom_mcp_tool"] as const) 
     const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
     try {
       assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] })).stopReason, "cancelled");
+      if (transferPromise) {
+        const transferred = await transferPromise as { sessionId?: string };
+        if (transfer === "fork") forkedSessionId = transferred.sessionId;
+      }
       assert.equal(startedOperations, 0, "cancel must not dispatch editor/MCP operations after announcement");
       const result = store.load(sessionId)?.messages.find(message => message.role === "tool" && message.tool_call_id === "announced");
       assert.equal(result?.content, "Tool call cancelled before execution.");
     } finally {
       await agent.closeSession({ sessionId });
+      if (forkedSessionId) await agent.closeSession({ sessionId: forkedSessionId });
       await rm(cwd, { recursive: true, force: true });
     }
   });
 }
 
-test("cancelling an unresolved editor write waits for its actual result before checkpointing success", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "glm-acp-held-editor-write-"));
-  const store = new SessionStore(join(cwd, "sessions"));
-  const held = deferred<void>();
-  const started = deferred<void>();
-  const conn = {
-    ...connection(),
-    async writeTextFile() {
-      started.resolve();
-      await held.promise;
-    },
-  };
-  const glm = {
-    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
-      yield { toolCall: { id: "editor-write", name: "write_file", arguments: JSON.stringify({ path: "buffer.txt", content: "written" }) } };
-      yield { done: true, stopReason: "tool_calls" };
-    },
-  };
-  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
-  await agent.initialize({ protocolVersion: 1, clientCapabilities: { fs: { writeTextFile: true } } } as never);
-  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
-  const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "write" }] });
-  let close: Promise<unknown> | undefined;
-  try {
-    await started.promise;
-    await agent.cancel({ sessionId });
-    close = agent.closeSession({ sessionId });
-    let promptSettled = false;
-    let closeSettled = false;
-    void prompt.then(() => { promptSettled = true; });
-    void close.then(() => { closeSettled = true; });
-    await new Promise<void>(resolve => setImmediate(resolve));
-    assert.equal(promptSettled, false);
-    assert.equal(closeSettled, false);
-    assert.ok(!store.load(sessionId)?.messages.some(message => message.role === "tool" && message.tool_call_id === "editor-write"));
-    held.resolve();
-    assert.equal((await prompt).stopReason, "cancelled");
-    await close;
-    assert.ok(store.load(sessionId)?.messages.some(message => message.role === "tool" &&
-      message.tool_call_id === "editor-write" && message.content === "File written successfully: buffer.txt"));
-  } finally {
-    held.resolve();
-    await Promise.allSettled([prompt, close]);
-    await agent.closeSession({ sessionId });
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
+for (const transfer of ["close", "fork", "load"] as const) {
+  test(`${transfer} of an unresolved editor write waits for its actual result before checkpointing success`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "glm-acp-held-editor-write-"));
+    const store = new SessionStore(join(cwd, "sessions"));
+    const held = deferred<void>();
+    const started = deferred<void>();
+    const conn = {
+      ...connection(),
+      async writeTextFile() {
+        started.resolve();
+        await held.promise;
+      },
+    };
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        yield { toolCall: { id: "editor-write", name: "write_file", arguments: JSON.stringify({ path: "buffer.txt", content: "written" }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: { fs: { writeTextFile: true } } } as never);
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "write" }] });
+    let close: Promise<unknown> | undefined;
+    let forkedSessionId: string | undefined;
+    try {
+      await started.promise;
+      if (transfer === "close") {
+        await agent.cancel({ sessionId });
+        close = agent.closeSession({ sessionId });
+      } else {
+        close = transfer === "fork"
+          ? agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] })
+          : agent.loadSession({ sessionId, cwd, mcpServers: [] });
+      }
+      let promptSettled = false;
+      let closeSettled = false;
+      void prompt.then(() => { promptSettled = true; });
+      void close.then(() => { closeSettled = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(promptSettled, false);
+      assert.equal(closeSettled, false);
+      assert.ok(!store.load(sessionId)?.messages.some(message => message.role === "tool" && message.tool_call_id === "editor-write"));
+      held.resolve();
+      assert.equal((await prompt).stopReason, "cancelled");
+      const transferred = await close as { sessionId?: string };
+      if (transfer === "fork") forkedSessionId = transferred.sessionId;
+      assert.ok(store.load(sessionId)?.messages.some(message => message.role === "tool" &&
+        message.tool_call_id === "editor-write" && message.content === "File written successfully: buffer.txt"));
+    } finally {
+      held.resolve();
+      await Promise.allSettled([prompt, close]);
+      await agent.closeSession({ sessionId });
+      if (forkedSessionId) await agent.closeSession({ sessionId: forkedSessionId });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
 
 test("cancelled delayed vision preprocessing settles without starting the model", async () => {
   const conn = connection();

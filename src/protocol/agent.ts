@@ -1238,6 +1238,9 @@ export class GlmAcpAgent implements Agent {
     const lifecycle = record.lifecycle;
     const lease = lifecycle.begin("snapshotting");
     record.original = source ?? null;
+    // Ownership changes synchronously. Abort before a queued prompt
+    // continuation can start work under the snapshotting generation.
+    source?.abortController?.abort();
     const forkAbortController = new AbortController();
     record.restoreAbortController = forkAbortController;
     let deferLeaseRelease = false;
@@ -1250,7 +1253,6 @@ export class GlmAcpAgent implements Agent {
       };
       try {
         if (source) {
-          source.abortController?.abort();
           const { drained, pending } = await this.drainPrompt(source);
           if (!drained) {
             deferLeaseRelease = true;
@@ -1392,6 +1394,9 @@ export class GlmAcpAgent implements Agent {
     const lifecycle = record.lifecycle;
     const lease = lifecycle.begin("restoring");
     record.original = original ?? null;
+    // Keep prompt cancellation atomic with the restore lease; canonical
+    // outcomes from already-active operations still drain below.
+    original?.abortController?.abort();
     const restoreAbortController = new AbortController();
     record.restoreAbortController = restoreAbortController;
     let deferLeaseRelease = false;
@@ -1407,7 +1412,6 @@ export class GlmAcpAgent implements Agent {
       try {
         let persisted: PersistedSession;
         if (original) {
-          original.abortController?.abort();
           const { drained, pending } = await this.drainPrompt(original);
           if (!drained) {
             deferLeaseRelease = true;
