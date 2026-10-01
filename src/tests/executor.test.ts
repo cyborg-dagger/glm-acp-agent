@@ -1211,6 +1211,49 @@ test("edit_file re-validates after the permission prompt and refuses a file chan
   }
 });
 
+for (const scenario of [
+  { name: "preserves unrelated changes", concurrent: "user changed this\nold snippet\n", expected: "user changed this\nnew snippet\n", writes: 1 },
+  { name: "refuses a changed target", concurrent: "keep\nuser rewrote this\n", expected: "keep\nuser rewrote this\n", writes: 0 },
+  { name: "refuses a newly ambiguous target", concurrent: "old snippet\nold snippet\n", expected: "old snippet\nold snippet\n", writes: 0 },
+  { name: "cancels before dispatch", concurrent: "keep\nold snippet\n", expected: "keep\nold snippet\n", writes: 0, abort: true },
+]) {
+  test(`edit_file ${scenario.name} while the in_progress notification is pending`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-notification-"));
+    const path = join(dir, "code.txt");
+    writeFileSync(path, "keep\nold snippet\n", "utf8");
+    const conn = createConnectionStub();
+    let entered!: () => void;
+    const notificationEntered = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const notificationReleased = new Promise<void>(resolve => { release = resolve; });
+    const sessionUpdate = conn.sessionUpdate.bind(conn);
+    conn.sessionUpdate = async payload => {
+      await sessionUpdate(payload);
+      const update = payload["update"] as { status?: string };
+      if (update.status === "in_progress") {
+        entered();
+        await notificationReleased;
+      }
+    };
+    const controller = new AbortController();
+    const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, controller.signal);
+    try {
+      const editing = executor.execute("tc1", "edit_file", JSON.stringify({ path, old_text: "old snippet", new_text: "new snippet" }));
+      await notificationEntered;
+      writeFileSync(path, scenario.concurrent, "utf8");
+      if (scenario.abort) controller.abort();
+      release();
+      const result = await editing;
+      assert.equal(readFileSync(path, "utf8"), scenario.expected);
+      assert.equal(conn.writeTextFileCalls.length, scenario.writes);
+      assert.match(result.content, scenario.abort ? /cancelled by turn/i : scenario.writes ? /File edited successfully/ : /changed while waiting/);
+    } finally {
+      release();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test("write_file surfaces client writeTextFile failures as a failed tool result", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-write-client-fail-"));
   const path = join(dir, "y.txt");

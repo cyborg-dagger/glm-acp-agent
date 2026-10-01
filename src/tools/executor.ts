@@ -674,9 +674,23 @@ export class ToolExecutor {
       return { content: "Edit cancelled by turn." };
     }
 
-    // The permission prompt can sit in front of the user for a while; re-read
-    // and re-validate so a buffer edited while deciding is not silently
-    // overwritten by this stale snapshot.
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "in_progress",
+      },
+    });
+    if (this.signal?.aborted) {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Edit cancelled by turn." };
+    }
+
+    // Both permission and progress delivery can wait on the client. Re-read
+    // after those waits so the edit includes changes already in the buffer.
+    // ACP writes replace the whole buffer without a version precondition;
+    // this remains an optimistic read/write, not an atomic compare-and-swap.
     let latest: string;
     try {
       latest = await this.performRead(absolutePath);
@@ -696,15 +710,6 @@ export class ToolExecutor {
         content: `Error editing file: ${path} changed while waiting for permission (${reason}). Re-read the file and retry.`,
       };
     }
-
-    await this.connection.sessionUpdate({
-      sessionId: this.sessionId,
-      update: {
-        sessionUpdate: "tool_call_update",
-        toolCallId,
-        status: "in_progress",
-      },
-    });
 
     try {
       if (this.signal?.aborted) {
