@@ -1524,10 +1524,14 @@ test(
   async () => {
     const dir = mkdtempSync(join(tmpdir(), "glm-executor-cmd-background-survival-"));
     const marker = join(dir, "background-finished");
+    const staging = join(dir, "background-finished.tmp");
     const conn = createConnectionStub();
     const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
     try {
-      const command = `${shellNodeCommand()} -e 'setTimeout(() => require("node:fs").writeFileSync(${shellFixturePath(marker, "background-finished")}, "done"), 250)' >/dev/null 2>&1 & echo started`;
+      // Existence must mean a closed, complete write, rather than the empty
+      // file becoming visible between writeFileSync's open and write steps.
+      const fixture = `setTimeout(() => { const fs = require("node:fs"); const staging = ${shellFixturePath(staging, "background-finished.tmp")}; fs.writeFileSync(staging, "done"); fs.renameSync(staging, ${shellFixturePath(marker, "background-finished")}); }, 250)`;
+      const command = `${shellNodeCommand()} -e '${fixture}' >/dev/null 2>&1 & echo started`;
       const result = await exec.execute("tc1", "run_command", JSON.stringify({ command }));
       assert.match(result.content, /Exit code: 0/);
       const deadline = Date.now() + 2_500;
