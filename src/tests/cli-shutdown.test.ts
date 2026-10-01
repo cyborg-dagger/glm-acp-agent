@@ -21,6 +21,7 @@ function shellQuote(value: string): string {
 }
 
 async function startMockLlm(command: string) {
+  let commandSent = false;
   const server = createServer((req, res) => {
     req.resume();
     req.on("end", () => {
@@ -29,16 +30,17 @@ async function startMockLlm(command: string) {
         id: "mock",
         object: "chat.completion.chunk",
         choices: [{
-          delta: {
+          delta: commandSent ? { content: "done" } : {
             tool_calls: [{
               index: 0,
               id: "tool-1",
               function: { name: "run_command", arguments: JSON.stringify({ command }) },
             }],
           },
-          finish_reason: "tool_calls",
+          finish_reason: commandSent ? "stop" : "tool_calls",
         }],
       };
+      commandSent = true;
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       res.end("data: [DONE]\n\n");
     });
@@ -254,6 +256,7 @@ test("CLI shutdown preserves intentionally backgrounded commands after normal sh
   const marker = join(cwd, "marker");
   const pending = join(cwd, "pending");
   // Reveal the marker only after its write closes; otherwise teardown can race the background writer.
+  // The mock issues one command, so this rename accounts for its only detached writer.
   const code = [
     'const fs=require("node:fs");',
     `setTimeout(()=>{fs.writeFileSync(${JSON.stringify(pending)}, "done");`,
