@@ -1264,6 +1264,11 @@ export class GlmAcpAgent implements Agent {
     const lifecycle = record.lifecycle;
     const lease = lifecycle.begin("snapshotting");
     record.original = source ?? null;
+    // Install the prompt's checkpoint owner before any abort can complete its
+    // cleanup, including an abort performed synchronously by a caller.
+    const promptDrain = source
+      ? this.drainPrompt(params.sessionId, source, lifecycle, lease, record)
+      : Promise.resolve(true);
     const forkAbortController = new AbortController();
     record.restoreAbortController = forkAbortController;
     let deferLeaseRelease = false;
@@ -1277,10 +1282,9 @@ export class GlmAcpAgent implements Agent {
       try {
         if (source) {
           source.abortController?.abort();
-          const { drained, pending } = await this.drainPrompt(source);
+          const drained = await promptDrain;
           if (!drained) {
             deferLeaseRelease = true;
-            this.releaseAfterPromptDrain(params.sessionId, pending, source, lifecycle, lease, record);
             throw new Error(`Session fork timed out waiting for prompt cleanup: ${lease.generation}`);
           }
         }
@@ -1387,7 +1391,15 @@ export class GlmAcpAgent implements Agent {
     // still owns and disposes its MCP resources if saving fails or close wins.
     await this.saveSnapshot(this.snapshot(newSessionId, forked), true);
     if (this.shuttingDown || signal.aborted) {
-      throw new Error(`Session fork cancelled: ${params.sessionId}`);
+      const cancellation = new Error(`Session fork cancelled: ${params.sessionId}`);
+      try {
+        await this.sessionStore?.remove(newSessionId);
+      } catch (rollbackError) {
+        throw new AggregateError([cancellation, rollbackError],
+          `Session fork cancelled; provisional child rollback failed: ${newSessionId}`,
+          { cause: rollbackError });
+      }
+      throw cancellation;
     }
     this.sessions.set(newSessionId, forked);
     this.transitions.set(newSessionId, {
@@ -1431,6 +1443,9 @@ export class GlmAcpAgent implements Agent {
     const lifecycle = record.lifecycle;
     const lease = lifecycle.begin("restoring");
     record.original = original ?? null;
+    const promptDrain = original
+      ? this.drainPrompt(params.sessionId, original, lifecycle, lease, record)
+      : Promise.resolve(true);
     const restoreAbortController = new AbortController();
     record.restoreAbortController = restoreAbortController;
     let deferLeaseRelease = false;
@@ -1447,10 +1462,9 @@ export class GlmAcpAgent implements Agent {
         let persisted: PersistedSession;
         if (original) {
           original.abortController?.abort();
-          const { drained, pending } = await this.drainPrompt(original);
+          const drained = await promptDrain;
           if (!drained) {
             deferLeaseRelease = true;
-            this.releaseAfterPromptDrain(params.sessionId, pending, original, lifecycle, lease, record);
             throw new Error(`Session restore timed out waiting for prompt cleanup: ${lease.generation}`);
           }
           this.assertRestoreOwner(lifecycle, lease);
@@ -1611,10 +1625,34 @@ export class GlmAcpAgent implements Agent {
   }
 
   private async drainPrompt(
-    session: SessionState
-  ): Promise<{ drained: boolean; pending: Promise<void> | null }> {
+    sessionId: string,
+    session: SessionState,
+    lifecycle: SessionLifecycle,
+    lease: TransitionLease,
+    record: SessionTransition
+  ): Promise<boolean> {
     const pending = session.promptPromise;
-    if (!pending) return { drained: true, pending: null };
+    if (!pending) return true;
+    let decide!: (timedOut: boolean) => void;
+    const decision = new Promise<boolean>(resolve => { decide = resolve; });
+    // The internal latch resolves before prompt finally awaits this promise.
+    // Decide who owns persistence only after the drain race, while installing
+    // the promise synchronously so prompt cleanup cannot miss its error owner.
+    const checkpoint = pending.then(async () => {
+      try {
+        if (await decision) {
+          try {
+            await this.persistOriginalIfOwned(sessionId, session, lifecycle, lease, record);
+          } finally {
+            if (!lifecycle.closeRequested) lease.release();
+            if (record.original === session) record.original = null;
+          }
+        }
+      } finally {
+        if (session.drainCheckpointPromise === checkpoint) session.drainCheckpointPromise = null;
+      }
+    });
+    session.drainCheckpointPromise = checkpoint;
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<"timeout">((resolve) => {
       if (this.sessionDrainTimeoutMs <= 0) queueMicrotask(() => resolve("timeout"));
@@ -1625,31 +1663,8 @@ export class GlmAcpAgent implements Agent {
       timeout,
     ]);
     if (timer) clearTimeout(timer);
-    return { drained: outcome === "drained", pending };
-  }
-
-  private releaseAfterPromptDrain(
-    sessionId: string,
-    pending: Promise<void> | null,
-    session: SessionState,
-    lifecycle: SessionLifecycle,
-    lease: TransitionLease,
-    record: SessionTransition
-  ): void {
-    // The promise captured when the drain started must be the one observed
-    // here: the prompt's cleanup can null `session.promptPromise` right after
-    // the timeout resolves, and re-reading the field would never attach the
-    // release callback, leaving the lease stuck in `restoring` forever.
-    const checkpoint: Promise<void> | null = pending?.then(async () => {
-      try {
-        await this.persistOriginalIfOwned(sessionId, session, lifecycle, lease, record);
-      } finally {
-        if (!lifecycle.closeRequested) lease.release();
-        if (record.original === session) record.original = null;
-        if (session.drainCheckpointPromise === checkpoint) session.drainCheckpointPromise = null;
-      }
-    }) ?? null;
-    session.drainCheckpointPromise = checkpoint;
+    decide(outcome === "timeout");
+    return outcome === "drained";
   }
 
   private async persistOriginalIfOwned(

@@ -284,7 +284,7 @@ async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, mapp
 export class SessionStore {
   private dir: string;
   private pendingSaves = new Map<string, Promise<void>>();
-  /** Retain rejected accepted writes until flush reports them. */
+  /** Retain rejected accepted writes/removals until flush reports them. */
   private failedSaves = new Map<string, unknown>();
   private flushPromise: Promise<void> | null = null;
 
@@ -319,8 +319,7 @@ export class SessionStore {
     const bytes = Buffer.from(JSON.stringify(body, null, 2) + "\n", "utf8");
     const tempPath = join(this.dir, `.${basename(path)}.${randomUUID()}.tmp`);
 
-    const previous = this.pendingSaves.get(session.sessionId) ?? Promise.resolve();
-    const savePromise = previous.catch(() => undefined).then(async () => {
+    return this.queueOperation(session.sessionId, async () => {
       await mkdir(this.dir, { recursive: true, mode: 0o700 });
       let file: Awaited<ReturnType<typeof open>> | undefined;
       try {
@@ -345,21 +344,37 @@ export class SessionStore {
         }
       }
     });
-
-    this.pendingSaves.set(session.sessionId, savePromise);
-    const clearIfCurrent = () => {
-      if (this.pendingSaves.get(session.sessionId) === savePromise) {
-        this.pendingSaves.delete(session.sessionId);
-      }
-    };
-    void savePromise.then(clearIfCurrent, (error) => {
-      if (!this.failedSaves.has(session.sessionId)) this.failedSaves.set(session.sessionId, error);
-      clearIfCurrent();
-    });
-    return savePromise;
   }
 
-  /** Wait for every accepted write, including writes queued while flushing. */
+  /** Remove a provisional checkpoint after all previously accepted writes. */
+  remove(sessionId: string): Promise<void> {
+    const path = this.pathFor(sessionId);
+    return this.queueOperation(sessionId, async () => {
+      try {
+        await unlink(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    });
+  }
+
+  private queueOperation(sessionId: string, operation: () => Promise<void>): Promise<void> {
+    const previous = this.pendingSaves.get(sessionId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    this.pendingSaves.set(sessionId, current);
+    const clearIfCurrent = () => {
+      if (this.pendingSaves.get(sessionId) === current) {
+        this.pendingSaves.delete(sessionId);
+      }
+    };
+    void current.then(clearIfCurrent, (error) => {
+      if (!this.failedSaves.has(sessionId)) this.failedSaves.set(sessionId, error);
+      clearIfCurrent();
+    });
+    return current;
+  }
+
+  /** Wait for every accepted write/removal, including operations queued while flushing. */
   flush(): Promise<void> {
     if (this.flushPromise) return this.flushPromise;
     const flushing = Promise.resolve().then(async () => {
