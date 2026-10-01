@@ -1036,8 +1036,8 @@ export class GlmAcpAgent implements Agent {
         if (current.promptPromise) {
           try { await current.promptPromise; } catch { /* resolves in prompt finally */ }
         }
+        await this.persistSession(params.sessionId, current, undefined, true);
         current.closed = true;
-        await this.persistSession(params.sessionId, current);
         await this.disposeSessionTools(current);
         if (this.sessions.get(params.sessionId) === current) {
           this.sessions.delete(params.sessionId);
@@ -1049,6 +1049,12 @@ export class GlmAcpAgent implements Agent {
       }
     })();
     record.closePromise = closePromise;
+    // A failed checkpoint retains the closing state and its resources. Clear
+    // the completed attempt so another close can retry the durable write.
+    const clearClose = () => {
+      if (record.closePromise === closePromise) record.closePromise = null;
+    };
+    void closePromise.then(clearClose, clearClose);
     return closePromise;
   }
 
@@ -1109,27 +1115,37 @@ export class GlmAcpAgent implements Agent {
 
       const resourceDisposals: Promise<void>[] = [];
       const persistenceWrites: Promise<void>[] = [];
+      const persistenceErrors: unknown[] = [];
       for (let index = 0; index < sessions.length; index += 1) {
         const [sessionId, session] = sessions[index]!;
         session.closed = true;
         // A prompt that missed the drain deadline may still hold an unmatched
         // assistant tool call. Leave the last valid on-disk checkpoint intact.
-        if (promptsSettled[index] === true) persistenceWrites.push(this.persistSession(sessionId, session));
+        if (promptsSettled[index] === true) {
+          // Observe failure immediately while the independent resource cleanup
+          // proceeds; a durable-write rejection must not abandon cleanup.
+          persistenceWrites.push(this.persistSession(sessionId, session, undefined, true).catch((error) => {
+            persistenceErrors.push(error);
+          }));
+        }
         resourceDisposals.push(this.disposeSessionTools(session));
         if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
         this.sessionTodos.delete(sessionId);
       }
       this.transitions.clear();
       if (this._visionClient) resourceDisposals.push(this._visionClient.dispose());
-      let resourceCleanupError: unknown;
+      const resourceCleanupErrors: unknown[] = [];
       const resourcesDrained = await settlesWithin(
-        Promise.all(resourceDisposals).catch((error) => {
-          resourceCleanupError = error;
+        Promise.allSettled(resourceDisposals).then((results) => {
+          for (const result of results) {
+            if (result.status === "rejected") resourceCleanupErrors.push(result.reason);
+          }
         }),
         remainingMs(),
       );
 
       let persistenceDrained: boolean;
+      let shutdownError: unknown;
       try {
         if (this.processSupervisor.hasActiveProcesses()) {
           await this.processSupervisor.forceTerminateAll();
@@ -1140,16 +1156,21 @@ export class GlmAcpAgent implements Agent {
         if (!resourcesDrained) {
           throw new Error("Agent shutdown timed out waiting for resource cleanup");
         }
-        if (resourceCleanupError) throw resourceCleanupError;
+        if (resourceCleanupErrors.length === 1) throw resourceCleanupErrors[0];
+        if (resourceCleanupErrors.length > 1) throw new AggregateError(resourceCleanupErrors, "Agent shutdown resource cleanup failed");
         if (!auxDrained || promptsSettled.some((settled) => !settled)) {
           throw new Error("Agent shutdown timed out waiting for prompt cleanup");
         }
+      } catch (error) {
+        shutdownError = error;
       } finally {
         // Queued checkpoints must reach disk on every exit path, not only the
         // clean one: an earlier throw skips straight here, the bounded drain
         // below still waits for the writes, and the original error rethrows.
         persistenceDrained = await settlesWithin(
-          Promise.all([...persistenceWrites, this.sessionStore?.flush() ?? Promise.resolve()]),
+          Promise.all([...persistenceWrites, (this.sessionStore?.flush() ?? Promise.resolve()).catch((error) => {
+            persistenceErrors.push(error);
+          })]),
           remainingMs(),
         );
         if (!persistenceDrained) {
@@ -1159,8 +1180,11 @@ export class GlmAcpAgent implements Agent {
         }
       }
       if (!persistenceDrained) {
-        throw new Error("Agent shutdown timed out waiting for session persistence");
+        persistenceErrors.push(new Error("Agent shutdown timed out waiting for session persistence"));
       }
+      const failures = [...new Set([...(shutdownError ? [shutdownError] : []), ...persistenceErrors])];
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) throw new AggregateError(failures, "Agent shutdown cleanup and session persistence failed");
     })();
     return this.shutdownPromise;
   }
@@ -1271,7 +1295,7 @@ export class GlmAcpAgent implements Agent {
         // the fork owns its lifecycle while it settles. Checkpoint the exact
         // settled parent snapshot before any child setup, so a restart cannot
         // recover the older (and possibly unmatched) tool-call history.
-        if (source) await this.persistSession(params.sessionId, source, persisted);
+        if (source) await this.persistSession(params.sessionId, source, persisted, true);
         const setup = this.connectMcpServers(params.mcpServers ?? [], forkAbortController.signal);
         void setup.then(
           (tools) => {
@@ -1294,7 +1318,7 @@ export class GlmAcpAgent implements Agent {
         if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
           throw new Error(`Session fork cancelled: ${params.sessionId}`);
         }
-        const response = await this.createFork(params, persisted, provisional, agentsMd);
+        const response = await this.createFork(params, persisted, provisional, agentsMd, forkAbortController.signal);
         provisional = null;
         return response;
       } finally {
@@ -1319,6 +1343,7 @@ export class GlmAcpAgent implements Agent {
     persisted: PersistedSession,
     mcpTools: SessionMcpTools,
     agentsMd: string | undefined,
+    signal: AbortSignal,
   ): Promise<ForkSessionResponse> {
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
@@ -1358,6 +1383,12 @@ export class GlmAcpAgent implements Agent {
       ),
       lifecycle: forkLifecycle,
     };
+    // Keep the child provisional until its checkpoint succeeds; the caller
+    // still owns and disposes its MCP resources if saving fails or close wins.
+    await this.saveSnapshot(this.snapshot(newSessionId, forked), true);
+    if (this.shuttingDown || signal.aborted) {
+      throw new Error(`Session fork cancelled: ${params.sessionId}`);
+    }
     this.sessions.set(newSessionId, forked);
     this.transitions.set(newSessionId, {
       lifecycle: forkLifecycle,
@@ -1366,7 +1397,6 @@ export class GlmAcpAgent implements Agent {
       original: null,
       restoreAbortController: null,
     });
-    await this.persistSession(newSessionId, forked);
 
     // Notify on the *created* session id — the parent thread's command list is
     // unchanged and a notify there would repaint the wrong menu.
@@ -1503,7 +1533,8 @@ export class GlmAcpAgent implements Agent {
         if (lifecycle.closeRequested) {
           throw new Error(`Session restore cancelled: ${params.sessionId}`);
         }
-        if (original && this.sessions.get(params.sessionId) === original) {
+        const mergeConfiguration = () => {
+          if (!original || this.sessions.get(params.sessionId) !== original) return;
           // Configuration setters stay responsive while a load replays, and
           // they mutate the still-installed original. Carry those latest
           // values into the replacement instead of installing the values
@@ -1512,14 +1543,22 @@ export class GlmAcpAgent implements Agent {
           restored.mode = original.mode;
           restored.thoughtLevel = original.thoughtLevel;
           restored.updatedAt = original.updatedAt;
-        }
+        };
+        // Save before transferring resource ownership. A configuration update
+        // during the write may queue a newer original snapshot, so checkpoint
+        // that merged configuration again before installing the replacement.
+        do {
+          mergeConfiguration();
+          await this.saveSnapshot(this.snapshot(params.sessionId, restored), true);
+          if (this.shuttingDown) throw new Error("Agent is shutting down");
+          this.assertRestoreOwner(lifecycle, lease);
+        } while (original && (
+          restored.model !== original.model || restored.mode !== original.mode ||
+          restored.thoughtLevel !== original.thoughtLevel || restored.updatedAt !== original.updatedAt
+        ));
         this.sessions.set(params.sessionId, restored);
         this.sessionTodos.delete(params.sessionId);
         swapped = true;
-        // Checkpoint the merged state immediately: it can retain a partially
-        // received turn from the drained prompt, which otherwise exists only
-        // in memory until the next prompt or close.
-        await this.persistSession(params.sessionId, restored);
         // Ownership transfers only after the replacement is installed. The
         // old resources are released afterwards, so setup and replay failures
         // still retain a valid original session.
@@ -1535,13 +1574,18 @@ export class GlmAcpAgent implements Agent {
           configOptions: this.configOptionsState(restored.model, restored.thoughtLevel, restored.mode),
         };
       } catch (err) {
-        if (!swapped && original) {
-          await this.persistOriginalIfOwned(params.sessionId, original, lifecycle, lease, record);
+        try {
+          if (!swapped && original && !deferLeaseRelease) {
+            try {
+              await this.persistOriginalIfOwned(params.sessionId, original, lifecycle, lease, record);
+            } catch (checkpointError) {
+              throw new AggregateError([err, checkpointError], "Session restore failed and original checkpoint failed", { cause: checkpointError });
+            }
+          }
+          throw err;
+        } finally {
+          if (!swapped && provisional) await disposeProvisional(provisional);
         }
-        if (!swapped) {
-          if (provisional) await disposeProvisional(provisional);
-        }
-        throw err;
       } finally {
         if (!deferLeaseRelease) lease.release();
       }
@@ -1596,16 +1640,16 @@ export class GlmAcpAgent implements Agent {
     // here: the prompt's cleanup can null `session.promptPromise` right after
     // the timeout resolves, and re-reading the field would never attach the
     // release callback, leaving the lease stuck in `restoring` forever.
-    session.drainCheckpointPromise = pending?.then(async () => {
+    const checkpoint: Promise<void> | null = pending?.then(async () => {
       try {
         await this.persistOriginalIfOwned(sessionId, session, lifecycle, lease, record);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[glm-acp-agent] warning: failed to checkpoint drained session ${sessionId}: ${msg}\n`);
+      } finally {
+        if (!lifecycle.closeRequested) lease.release();
+        if (record.original === session) record.original = null;
+        if (session.drainCheckpointPromise === checkpoint) session.drainCheckpointPromise = null;
       }
-      if (!lifecycle.closeRequested) lease.release();
-      if (record.original === session) record.original = null;
     }) ?? null;
+    session.drainCheckpointPromise = checkpoint;
   }
 
   private async persistOriginalIfOwned(
@@ -1618,7 +1662,7 @@ export class GlmAcpAgent implements Agent {
     if (!lifecycle.owns(lease)) return;
     if (record.original !== session) return;
     if (this.sessions.get(sessionId) !== session) return;
-    await this.persistSession(sessionId, session);
+    await this.persistSession(sessionId, session, undefined, true);
   }
 
   private registerTransition(sessionId: string, lifecycle: SessionLifecycle): SessionTransition {
@@ -1747,15 +1791,22 @@ export class GlmAcpAgent implements Agent {
     sessionId: string,
     session: SessionState,
     persisted = this.snapshot(sessionId, session),
+    required = false,
   ): Promise<void> {
     if (this.sessions.get(sessionId) !== session) return;
+    await this.saveSnapshot(persisted, required);
+  }
+
+  /** Optional UI/config saves warn; transition and side-effect checkpoints reject. */
+  private async saveSnapshot(persisted: PersistedSession, required: boolean): Promise<void> {
     if (!this.sessionStore) return;
     try {
       await this.sessionStore.save(persisted);
     } catch (err) {
+      if (required) throw err;
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(
-        `[glm-acp-agent] warning: failed to persist session ${sessionId}: ${msg}\n`
+        `[glm-acp-agent] warning: failed to persist session ${persisted.sessionId}: ${msg}\n`
       );
     }
   }
@@ -2104,6 +2155,9 @@ export class GlmAcpAgent implements Agent {
 
       if (ownsPrompt() || preservesDrainingHistory()) {
         session.messages.push(assistantToolMessage!, ...toolResults);
+        // Complete and uncertain effects must survive a failure of the next
+        // provider request. Incomplete text streams keep their prior checkpoint.
+        await this.persistSession(sessionId, session, undefined, true);
         if (toolFailure) throw toolFailure;
       }
 

@@ -284,6 +284,9 @@ async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, mapp
 export class SessionStore {
   private dir: string;
   private pendingSaves = new Map<string, Promise<void>>();
+  /** Retain rejected accepted writes until flush reports them. */
+  private failedSaves = new Map<string, unknown>();
+  private flushPromise: Promise<void> | null = null;
 
   constructor(dir: string = defaultSessionDir()) {
     this.dir = dir;
@@ -349,17 +352,32 @@ export class SessionStore {
         this.pendingSaves.delete(session.sessionId);
       }
     };
-    void savePromise.then(clearIfCurrent, clearIfCurrent);
+    void savePromise.then(clearIfCurrent, (error) => {
+      if (!this.failedSaves.has(session.sessionId)) this.failedSaves.set(session.sessionId, error);
+      clearIfCurrent();
+    });
     return savePromise;
   }
 
   /** Wait for every accepted write, including writes queued while flushing. */
-  async flush(): Promise<void> {
-    while (this.pendingSaves.size > 0) {
-      await Promise.all(
-        [...this.pendingSaves.values()].map((save) => save.catch(() => undefined)),
-      );
-    }
+  flush(): Promise<void> {
+    if (this.flushPromise) return this.flushPromise;
+    const flushing = Promise.resolve().then(async () => {
+      try {
+        while (this.pendingSaves.size > 0) {
+          await Promise.allSettled([...this.pendingSaves.values()]);
+        }
+        if (this.failedSaves.size > 0) {
+          const failures = [...this.failedSaves.values()];
+          this.failedSaves.clear();
+          throw new AggregateError(failures, "Failed to persist session checkpoints");
+        }
+      } finally {
+        this.flushPromise = null;
+      }
+    });
+    this.flushPromise = flushing;
+    return flushing;
   }
 
   /**
