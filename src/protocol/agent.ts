@@ -2139,17 +2139,24 @@ export class GlmAcpAgent implements Agent {
 
     // Reached MAX_TURNS without resolution. Tell the user why we stopped —
     // without this, hitting the cap is indistinguishable from a normal end.
-    if (!ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
-    await promptConnection.sessionUpdate({
-      sessionId,
-      update: {
-        sessionUpdate: "agent_message_chunk",
-        content: {
-          type: "text",
-          text: `\n[stopped: reached the ${this.maxTurns}-turn limit — send a message to continue]`,
+    if (signal.aborted || !ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
+    try {
+      await promptConnection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: `\n[stopped: reached the ${this.maxTurns}-turn limit — send a message to continue]`,
+          },
         },
-      },
-    });
+      });
+    } catch (err) {
+      // A cancelled notice follows a settled tool turn. Keep its usage and
+      // return through prompt finalization so the completed history is saved.
+      if (signal.aborted || !ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
+      throw err;
+    }
     return { stopReason: "max_turn_requests", usage: totalUsage };
   }
 

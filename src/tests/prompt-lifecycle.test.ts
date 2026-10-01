@@ -66,6 +66,101 @@ async function withoutNotificationRelease<T>(promise: Promise<T>): Promise<T> {
   }
 }
 
+for (const cancelAtNotice of [false, true]) {
+  test(`${cancelAtNotice ? "cancelling" : "completing"} the turn-limit notice preserves completed writes and usage before close`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "glm-acp-turn-limit-checkpoint-"));
+    const storeRoot = join(cwd, "sessions");
+    const store = new SessionStore(storeRoot);
+    const conn = connection();
+    const held = deferred<void>();
+    const started = deferred<void>();
+    const sendUpdate = conn.sessionUpdate;
+    conn.sessionUpdate = async params => {
+      await sendUpdate(params);
+      const update = params.update as { sessionUpdate?: string; content?: { text?: string } };
+      if (update.sessionUpdate === "agent_message_chunk" && update.content?.text?.includes("[stopped: reached")) {
+        started.resolve();
+        await held.promise;
+      }
+    };
+    let modelCalls = 0;
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        modelCalls += 1;
+        yield { usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 } };
+        yield { toolCall: { id: "completed-write", name: "write_file", arguments: JSON.stringify({
+          path: "written.txt", content: "completed side effect",
+        }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store, maxTurns: 1 });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await store.flush();
+    const prompt = agent.prompt({ sessionId, messageId: "write-once", prompt: [{ type: "text", text: "write once" }] });
+    try {
+      await withoutNotificationRelease(started.promise);
+      assert.equal(await readFile(join(cwd, "written.txt"), "utf8"), "completed side effect");
+      if (cancelAtNotice) await agent.cancel({ sessionId });
+      else held.resolve();
+      const response = await withoutNotificationRelease(prompt);
+
+      // A fresh store must see the prompt's checkpoint before close, restore,
+      // or shutdown can supply an unrelated save and hide a missing write.
+      const history = new SessionStore(storeRoot).load(sessionId)?.messages;
+      const toolResult = history?.find(message => message.role === "tool" && message.tool_call_id === "completed-write");
+      const toolBatch = history?.find(message => message.role === "assistant" && message.tool_calls?.some(call => call.id === "completed-write"));
+      assert.deepEqual({ response, toolResult, toolCallIds: toolBatch?.role === "assistant" ? toolBatch.tool_calls?.map(call => call.id) : undefined }, {
+        response: {
+          stopReason: cancelAtNotice ? "cancelled" : "max_turn_requests",
+          usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 },
+          userMessageId: "write-once",
+        },
+        toolResult: { role: "tool", tool_call_id: "completed-write", content: "File written successfully: written.txt" },
+        toolCallIds: ["completed-write"],
+      });
+      const updateCount = conn.updates.length;
+      const permissionCount = conn.permissionRequests.length;
+      held.reject(new Error("late turn-limit notification rejection"));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(conn.updates.length, updateCount, "late settlement must not resume notifications");
+      assert.equal(conn.permissionRequests.length, permissionCount);
+      assert.equal(modelCalls, 1, "the terminal notice must not start another model request");
+    } finally {
+      held.resolve();
+      await Promise.allSettled([prompt]);
+      await agent.closeSession({ sessionId });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a turn-limit notification failure without cancellation still rejects the prompt", async () => {
+  const conn = connection();
+  const failure = new Error("turn-limit transport failed");
+  const sendUpdate = conn.sessionUpdate;
+  conn.sessionUpdate = async params => {
+    await sendUpdate(params);
+    const update = params.update as { content?: { text?: string } };
+    if (update.content?.text?.includes("[stopped: reached")) throw failure;
+  };
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      yield { toolCall: { id: "completed-todo", name: "todowrite", arguments: JSON.stringify({
+        todos: [{ content: "Completed task", status: "completed" }],
+      }) } };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null, maxTurns: 1 });
+  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  try {
+    await assert.rejects(agent.prompt({ sessionId, prompt: [{ type: "text", text: "finish the task" }] }), failure);
+  } finally {
+    await agent.closeSession({ sessionId });
+  }
+});
+
 for (const kind of ["text", "thought", "metadata", "error", "max-turn", "todo"] as const) {
   test(`cancel and close unwind a held ${kind} notification and consume its late rejection`, async () => {
     const conn = connection();
