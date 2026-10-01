@@ -475,6 +475,74 @@ test("read_file treats editor line pagination as pagination, not byte truncation
   }
 });
 
+for (const legacy of [false, true]) {
+  test(`read_file rejects an oversized ${legacy ? "legacy full buffer" : "conforming editor long line"} before returning it`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-editor-byte-limit-"));
+    const path = join(dir, "buffer.txt");
+    writeFileSync(path, "on disk");
+    const updates: Array<{ update: { status?: string } }> = [];
+    const conn = {
+      async sessionUpdate(payload: { update: { status?: string } }) { updates.push(payload); },
+      async readTextFile(params: { line?: number; limit?: number }) {
+        const content = legacy ? "a\nb\nc\nd\ne\nf\ng\nh\ni" : "🙂".repeat(512);
+        return { content: legacy || params.line === 1 ? content : "" };
+      },
+    };
+    const limits: ResourceLimits = {
+      toolResultBytes: 262_144, fileReadBytes: 16, listEntries: 2000, listBytes: 262_144,
+      fsConcurrency: 16,
+    };
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir, () => "default", () => undefined, limits);
+    try {
+      const result = await exec.execute("tc1", "read_file", JSON.stringify({ path, limit: 1 }));
+      assert.match(result.content, /editor buffer exceeds the 16-byte read\/edit limit/);
+      assert.doesNotMatch(result.content, /🙂|pass offset=/);
+      assert.equal(updates.at(-1)?.update.status, "failed");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+test("read_file checks the byte budget on the legacy EOF probe too", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-editor-probe-byte-limit-"));
+  const path = join(dir, "buffer.txt");
+  writeFileSync(path, "on disk");
+  const conn = {
+    async sessionUpdate() {},
+    async readTextFile(params: { line?: number; limit?: number }) {
+      return { content: params.line === 2 ? "short" : "x".repeat(2048) };
+    },
+  };
+  const limits: ResourceLimits = {
+    toolResultBytes: 262_144, fileReadBytes: 16, listEntries: 2000, listBytes: 262_144,
+    fsConcurrency: 16,
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir, () => "default", () => undefined, limits);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path, offset: 2, limit: 1 }));
+    assert.match(result.content, /editor buffer exceeds the 16-byte read\/edit limit/);
+    assert.doesNotMatch(result.content, /showing lines|pass offset=/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("read_file accepts editor pages exactly at their UTF-8 byte budget", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-editor-exact-byte-limit-"));
+  const path = join(dir, "buffer.txt");
+  writeFileSync(path, "on disk");
+  const conn = {
+    async sessionUpdate() {},
+    async readTextFile() { return { content: "🙂🙂🙂🙂" }; },
+  };
+  const limits: ResourceLimits = {
+    toolResultBytes: 262_144, fileReadBytes: 16, listEntries: 2000, listBytes: 262_144,
+    fsConcurrency: 16,
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir, () => "default", () => undefined, limits);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path, limit: 1 }));
+    assert.equal(result.content, "🙂🙂🙂🙂");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("read_file renders EOF for a conforming editor at a short or empty offset", async () => {
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-eof-"));
   const path = join(dir, "paged.txt");
