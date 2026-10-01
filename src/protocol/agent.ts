@@ -301,6 +301,7 @@ function envMaxTurns(): number | undefined {
 
 export class GlmAcpAgent implements Agent {
   private sessions: Map<string, SessionState> = new Map();
+  private readonly sessionSaveRevisions = new WeakMap<SessionState, number>();
   private sessionTodos: Map<string, TodoItem[]> = new Map();
   private _glm: NonNullable<GlmAcpAgentOptions["glm"]> | null;
   private maxTurns: number;
@@ -1570,12 +1571,16 @@ export class GlmAcpAgent implements Agent {
         // Save before transferring resource ownership. A configuration update
         // during the write may queue a newer original snapshot, so checkpoint
         // that merged configuration again before installing the replacement.
+        // Equal values/timestamps do not imply that no snapshot was queued.
+        let originalSaveRevision: number;
         do {
           mergeConfiguration();
+          originalSaveRevision = original ? this.sessionSaveRevisions.get(original) ?? 0 : 0;
           await this.saveSnapshot(this.snapshot(params.sessionId, restored), true);
           if (this.shuttingDown) throw new Error("Agent is shutting down");
           this.assertRestoreOwner(lifecycle, lease);
         } while (original && (
+          (this.sessionSaveRevisions.get(original) ?? 0) !== originalSaveRevision ||
           restored.model !== original.model || restored.mode !== original.mode ||
           restored.thoughtLevel !== original.thoughtLevel || restored.updatedAt !== original.updatedAt
         ));
@@ -1597,18 +1602,23 @@ export class GlmAcpAgent implements Agent {
           configOptions: this.configOptionsState(restored.model, restored.thoughtLevel, restored.mode),
         };
       } catch (err) {
-        try {
-          if (!swapped && original && !deferLeaseRelease) {
-            try {
-              await this.persistOriginalIfOwned(params.sessionId, original, lifecycle, lease, record);
-            } catch (checkpointError) {
-              throw new AggregateError([err, checkpointError], "Session restore failed and original checkpoint failed", { cause: checkpointError });
-            }
+        let primaryError = err;
+        if (!swapped && original && !deferLeaseRelease) {
+          try {
+            await this.persistOriginalIfOwned(params.sessionId, original, lifecycle, lease, record);
+          } catch (checkpointError) {
+            primaryError = new AggregateError([err, checkpointError], "Session restore failed and original checkpoint failed", { cause: checkpointError });
           }
-          throw err;
-        } finally {
-          if (!swapped && provisional) await disposeProvisional(provisional);
         }
+        try {
+          if (!swapped && provisional) await disposeProvisional(provisional);
+        } catch (disposalError) {
+          const message = primaryError instanceof Error ? primaryError.message : String(primaryError);
+          throw new AggregateError([primaryError, disposalError],
+            `Session restore failed and provisional MCP disposal failed: ${message}`,
+            { cause: disposalError });
+        }
+        throw primaryError;
       } finally {
         if (!deferLeaseRelease) lease.release();
       }
@@ -1818,6 +1828,7 @@ export class GlmAcpAgent implements Agent {
     required = false,
   ): Promise<void> {
     if (this.sessions.get(sessionId) !== session) return;
+    this.sessionSaveRevisions.set(session, (this.sessionSaveRevisions.get(session) ?? 0) + 1);
     await this.saveSnapshot(persisted, required);
   }
 

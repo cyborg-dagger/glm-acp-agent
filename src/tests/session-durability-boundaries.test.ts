@@ -309,6 +309,120 @@ test("failed provisional MCP disposal releases the fork lease after a child chec
   }
 });
 
+test("a duplicate configuration save in the same clock tick cannot overwrite restored directory context", { timeout: 10_000 }, async t => {
+  const cwd = await fs.mkdtemp(join(tmpdir(), "glm-restore-duplicate-config-"));
+  const replacementCwd = join(cwd, "replacement");
+  const dir = join(cwd, "sessions");
+  await fs.mkdir(replacementCwd);
+  await fs.writeFile(join(cwd, "AGENTS.md"), "ORIGINAL_DIRECTORY_CONTEXT");
+  await fs.writeFile(join(replacementCwd, "AGENTS.md"), "RESTORED_DIRECTORY_CONTEXT");
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-01T10:00:00.000Z") });
+  const store = new SessionStore(dir);
+  const agent = new GlmAcpAgent(connection() as never, { sessionStore: store, glm: textGlm() });
+  const written = deferred();
+  const release = deferred();
+  let restoring: Promise<unknown> | undefined;
+  let setting: Promise<unknown> | undefined;
+  let held = false;
+  try {
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.setSessionMode({ sessionId, modeId: "default" });
+    await withCheckpointWrites(dir, async snapshot => {
+      if (snapshot.cwd !== replacementCwd || held) return;
+      held = true;
+      written.resolve();
+      await release.promise;
+    }, async () => {
+      restoring = agent.resumeSession({ sessionId, cwd: replacementCwd, mcpServers: [] });
+      await written.promise;
+      // This queues a complete original snapshot behind the held replacement
+      // write, despite changing neither configuration nor updatedAt.
+      setting = agent.setSessionMode({ sessionId, modeId: "default" });
+      release.resolve();
+      await Promise.all([restoring, setting]);
+      await store.flush();
+      const persisted = await new SessionStore(dir).loadAsync(sessionId);
+      assert.equal(persisted?.cwd, replacementCwd);
+      const system = persisted?.messages.find(message => message.role === "system");
+      assert.match(String(system?.content), /RESTORED_DIRECTORY_CONTEXT/);
+      assert.doesNotMatch(String(system?.content), /ORIGINAL_DIRECTORY_CONTEXT/);
+      const listed = await agent.listSessions({});
+      assert.equal(listed.sessions.find(session => session.sessionId === sessionId)?.cwd, replacementCwd);
+    });
+  } finally {
+    release.resolve();
+    await Promise.allSettled([restoring, setting]);
+    t.mock.timers.reset();
+    await agent.shutdown("disconnect");
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("restore retains both required checkpoint failures when provisional disposal also fails", { timeout: 10_000 }, async () => {
+  const cwd = await fs.mkdtemp(join(tmpdir(), "glm-restore-all-errors-"));
+  const dir = join(cwd, "sessions");
+  const backup = join(cwd, "saved-sessions");
+  const store = new SessionStore(dir);
+  const provisional = new SessionMcpTools([]);
+  const disposalFailure = new Error("fixture provisional restore disposal failed");
+  const dispose = provisional.dispose.bind(provisional);
+  let disposals = 0;
+  provisional.dispose = async () => {
+    disposals++;
+    await dispose();
+    throw disposalFailure;
+  };
+  let connections = 0;
+  let faultInstalled = false;
+  const agent = new GlmAcpAgent(connection() as never, {
+    sessionStore: store, glm: textGlm(),
+    connectSessionMcpServers: async () => {
+      if (++connections !== 2) return new SessionMcpTools([]);
+      // Both the replacement and recovery checkpoint hit a real mkdir failure.
+      await fs.rename(dir, backup);
+      await fs.writeFile(dir, "a file occupies the session directory");
+      faultInstalled = true;
+      return provisional;
+    },
+  });
+  try {
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "seed history" }] });
+    const restoreError = await agent.resumeSession({ sessionId, cwd, mcpServers: [] }).then(
+      () => { throw new Error("fixture checkpoint must reject"); },
+      error => error as Error,
+    );
+    await fs.rm(dir);
+    await fs.rename(backup, dir);
+    faultInstalled = false;
+    // Public follow-up proves cleanup still releases the lease and retains
+    // the original; restoring storage must make it usable without reconnecting.
+    assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue" }] })).stopReason, "end_turn");
+    assert.equal(connections, 2);
+    assert.equal(disposals, 1);
+    assert.ok(restoreError instanceof AggregateError);
+    const checkpointErrors = restoreError.errors[0];
+    assert.ok(checkpointErrors instanceof AggregateError);
+    assert.equal(checkpointErrors.errors.length, 2);
+    for (const failure of checkpointErrors.errors) {
+      assert.equal((failure as NodeJS.ErrnoException).code, "EEXIST");
+    }
+    assert.notEqual(checkpointErrors.errors[0], checkpointErrors.errors[1]);
+    assert.equal(restoreError.errors[1], disposalFailure);
+    assert.equal(restoreError.cause, disposalFailure);
+    await assert.rejects(store.flush(), error => error instanceof AggregateError &&
+      error.errors.includes(checkpointErrors.errors[0]));
+  } finally {
+    if (faultInstalled) {
+      await fs.rm(dir);
+      await fs.rename(backup, dir);
+    }
+    await store.flush().catch(() => undefined);
+    await agent.shutdown("disconnect");
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
 for (const mode of ["restore", "fork"]) {
   test(`a zero-timeout ${mode} assigns its required deferred checkpoint failure to the prompt`, { timeout: 10_000 }, async () => {
     const fixture = fileURLToPath(new URL("./fixtures/deferred-checkpoint.js", import.meta.url));
