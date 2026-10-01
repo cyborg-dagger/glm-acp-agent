@@ -58,7 +58,7 @@ export async function readLocalTextPage(
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
       if (signal?.aborted) throw new Error("The operation was aborted");
       if (bytesRead === 0) { eof = true; break; }
-      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+      chunks.push(bytesRead === buffer.length ? buffer : Buffer.from(buffer.subarray(0, bytesRead)));
       consumed += bytesRead;
     }
     const bytes = Buffer.concat(chunks, consumed);
@@ -128,7 +128,7 @@ export async function readLocalTextFileBounded(path: string, maxReadBytes: numbe
       if (consumed > maxReadBytes) {
         throw new Error(`file exceeds the ${maxReadBytes}-byte read/edit limit`);
       }
-      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+      chunks.push(bytesRead === buffer.length ? buffer : Buffer.from(buffer.subarray(0, bytesRead)));
     }
   } finally {
     await handle.close();
@@ -147,7 +147,7 @@ export async function readLocalTextPrefix(path: string, maxReadBytes: number, si
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
       if (signal?.aborted) throw new Error("The operation was aborted");
       if (bytesRead === 0) break;
-      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+      chunks.push(bytesRead === buffer.length ? buffer : Buffer.from(buffer.subarray(0, bytesRead)));
       consumed += bytesRead;
     }
     return decodeUtf8Safely(Buffer.concat(chunks, consumed));
