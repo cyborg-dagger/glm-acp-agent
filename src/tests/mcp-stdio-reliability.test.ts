@@ -82,8 +82,11 @@ for (const adapter of adapters) {
     `);
   });
 
-  // A synchronous write double misses the actual Socket error event (EPIPE).
-  test(`${adapter} stdio contains real EPIPE and can reconnect`, () => {
+  // Closing fd0 provokes parent-side EPIPE on POSIX; Windows pipe handles do
+  // not have this guarantee. The Writable regression below runs everywhere.
+  test(`${adapter} stdio contains real EPIPE and can reconnect`, {
+    skip: process.platform === "win32" ? "fd0-close EPIPE fixture requires POSIX pipe semantics" : false,
+  }, () => {
     const closedStdinServer = `
       const { readSync, closeSync } = require("node:fs");
       setTimeout(() => process.exit(0), 1800);
@@ -129,7 +132,7 @@ for (const adapter of adapters) {
   });
 }
 
-function makeChild(stalledMethod: string) {
+function makeChild(stalledMethod: string, stdinError?: Error) {
   let accepted = 0;
   let resolveAccepted!: () => void;
   const requestsAccepted = new Promise<void>((resolve) => { resolveAccepted = resolve; });
@@ -139,13 +142,21 @@ function makeChild(stalledMethod: string) {
     stdin: new Writable({
       write(chunk, _encoding, callback) {
         const request = JSON.parse(String(chunk));
-        callback();
-        if (request.id === undefined) return;
+        if (request.id === undefined) {
+          callback();
+          return;
+        }
         if (request.method === stalledMethod) {
           accepted += 1;
           if (accepted === (stalledMethod === "initialize" ? 1 : 2)) resolveAccepted();
+          // Finish an accepted write asynchronously with an error. Node's real
+          // Writable owns the resulting error event; no synchronous throw or
+          // manual ChildProcess/error emission can substitute for that path.
+          if (stdinError && accepted === 2) setImmediate(() => callback(stdinError));
+          else callback();
           return;
         }
+        callback();
         const result = request.method === "tools/list" ? { tools: [{ name: "image_analysis" }] } : {};
         queueMicrotask(() => stdout.push(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\n"));
       },
@@ -153,7 +164,7 @@ function makeChild(stalledMethod: string) {
     stdout,
     stderr,
     pid: 4242,
-    exitCode: null,
+    exitCode: null as number | null,
     kill: () => true, // Intentionally cannot prove exit, as in the existing disposal fixtures.
   });
   return { child, requestsAccepted };
@@ -179,6 +190,50 @@ async function within<T>(promise: Promise<T>, ms: number): Promise<T> {
 }
 
 for (const adapter of adapters) {
+  test(`${adapter} stdio owns asynchronous Writable errors and can reconnect`, async () => {
+    const failure = makeChild("tools/call", Object.assign(new Error("fixture write EPIPE"), { code: "EPIPE" }));
+    const replacement = makeChild("none");
+    for (const { child } of [failure, replacement]) {
+      child.kill = () => {
+        child.exitCode = 137;
+        queueMicrotask(() => child.emit("exit", 137, "SIGTERM"));
+        return true;
+      };
+    }
+    let firstExited!: () => void;
+    const failedChildExited = new Promise<void>(resolve => { firstExited = resolve; });
+    failure.child.once("exit", firstExited);
+    let launches = 0;
+    const options = {
+      // These are stream-backed fixtures with fake PIDs, on every host OS.
+      platform: "linux" as const,
+      spawn: () => (launches++ === 0 ? failure.child : replacement.child) as never,
+      requestTimeoutMs: 3_000,
+      initializationTimeoutMs: 3_000,
+    };
+    const client = adapter === "session"
+      ? new StdioMcpClient({ name: "fixture", command: "node", args: [], env: [] }, options)
+      : new StdioVisionMcpClient({ ...options, apiKey: "fixture-key" });
+    const controllers = [new AbortController(), new AbortController()];
+    const results = Promise.allSettled(controllers.map(controller => client.callTool("image_analysis", {}, controller.signal)));
+    try {
+      await within(failure.requestsAccepted, 1_000);
+      for (const result of await within(results, 500)) {
+        assert.equal(result.status, "rejected");
+        if (result.status === "rejected") assert.match(result.reason.message, /stdin error: fixture write EPIPE/);
+      }
+      await within(failedChildExited, 500);
+      assert.equal(failure.child.stdin.destroyed, true);
+      assert.equal(failure.child.stdout.destroyed, true);
+      assert.equal(failure.child.stderr.destroyed, true);
+      assert.deepEqual(await within(client.callTool("image_analysis", {}), 500), {});
+    } finally {
+      controllers.forEach(controller => controller.abort());
+      await results;
+      await client.dispose();
+    }
+  });
+
   for (const stalledMethod of ["initialize", "tools/call"]) {
     // Moving settlement after termination leaves accepted calls pending on failure.
     test(`${adapter} stdio disposal settles pending ${stalledMethod} before failed termination`, async () => {
