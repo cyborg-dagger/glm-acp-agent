@@ -1325,8 +1325,17 @@ export class GlmAcpAgent implements Agent {
         const response = await this.createFork(params, persisted, provisional, agentsMd, forkAbortController.signal);
         provisional = null;
         return response;
+      } catch (primaryError) {
+        try {
+          if (provisional) await disposeProvisional(provisional);
+        } catch (disposalError) {
+          const message = primaryError instanceof Error ? primaryError.message : String(primaryError);
+          throw new AggregateError([primaryError, disposalError],
+            `Session fork failed and provisional MCP disposal failed: ${message}`,
+            { cause: disposalError });
+        }
+        throw primaryError;
       } finally {
-        if (provisional) await disposeProvisional(provisional);
         if (!deferLeaseRelease) lease.release();
       }
     });

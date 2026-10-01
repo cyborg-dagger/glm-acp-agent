@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { GlmAcpAgent } from "../protocol/agent.js";
@@ -41,7 +41,7 @@ async function withCheckpointWrites(
   const originalOpen = fs.open;
   fs.open = (async (path, ...args) => {
     const handle = await originalOpen(path, ...args);
-    if (String(path).startsWith(`${dir}/.`)) {
+    if (dirname(String(path)) === dir && basename(String(path)).startsWith(".")) {
       const write = handle.writeFile.bind(handle);
       handle.writeFile = async (data, ...writeArgs) => {
         await write(data, ...writeArgs);
@@ -181,54 +181,128 @@ test("cancelled fork rollback waits for every accepted child write", { timeout: 
   }
 });
 
-test("cancelled fork reports a failed durable-child rollback to its caller", { timeout: 10_000 }, async () => {
-  const cwd = await fs.mkdtemp(join(tmpdir(), "glm-fork-rollback-error-"));
+for (const disposalFails of [false, true]) {
+  test(disposalFails
+    ? "cancelled fork retains rollback failure when provisional MCP disposal also fails"
+    : "cancelled fork reports a failed durable-child rollback to its caller", { timeout: 10_000 }, async () => {
+    const cwd = await fs.mkdtemp(join(tmpdir(), "glm-fork-rollback-error-"));
+    const dir = join(cwd, "sessions");
+    const store = new SessionStore(dir);
+    const written = deferred();
+    const release = deferred();
+    let parentId = "";
+    let childId = "";
+    const failure = Object.assign(new Error("fixture unlink denied"), { code: "EACCES" });
+    const disposalFailure = new Error("fixture provisional disposal failed");
+    let childDisposals = 0;
+    let connections = 0;
+    const childTools = new SessionMcpTools([]);
+    const dispose = childTools.dispose.bind(childTools);
+    childTools.dispose = async () => {
+      childDisposals++;
+      await dispose();
+      if (disposalFails) throw disposalFailure;
+    };
+    const originalUnlink = fs.unlink;
+    const agent = new GlmAcpAgent(connection() as never, {
+      sessionStore: store, glm: textGlm(),
+      connectSessionMcpServers: async () => ++connections === 1 ? new SessionMcpTools([]) : childTools,
+    });
+    let fork: Promise<unknown> | undefined;
+    let stopping: Promise<void> | undefined;
+    try {
+      parentId = (await agent.newSession({ cwd, mcpServers: [] })).sessionId;
+      fs.unlink = async path => {
+        if (String(path) === join(dir, `${childId}.json`)) throw failure;
+        await originalUnlink(path);
+      };
+      syncBuiltinESMExports();
+      await withCheckpointWrites(dir, async snapshot => {
+        if (snapshot.sessionId === parentId) return;
+        childId = snapshot.sessionId;
+        written.resolve();
+        await release.promise;
+      }, async () => {
+        fork = agent.unstable_forkSession({ sessionId: parentId, cwd, mcpServers: [] });
+        const rejected = assert.rejects(fork, error => {
+          assert.ok(error instanceof AggregateError);
+          assert.match(error.message, /rollback failed/i);
+          assert.match(error.message, new RegExp(childId));
+          const rollback = disposalFails ? error.errors[0] : error;
+          assert.ok(rollback instanceof AggregateError);
+          assert.match(String(rollback.errors[0]), /Session fork cancelled/);
+          assert.equal(rollback.errors[1], failure);
+          assert.equal(rollback.cause, failure);
+          if (disposalFails) {
+            assert.equal(error.errors[1], disposalFailure);
+            assert.equal(error.cause, disposalFailure);
+          }
+          return true;
+        });
+        await written.promise;
+        stopping = agent.closeSession({ sessionId: parentId });
+        release.resolve();
+        await rejected;
+        await stopping;
+        assert.equal(childDisposals, 1);
+        await assert.rejects(agent.prompt({ sessionId: parentId, prompt: [{ type: "text", text: "after close" }] }), /session not found/i);
+        assert.ok(await new SessionStore(dir).loadAsync(childId), "failed removal remains recoverable and its error is visible");
+      });
+      await assert.rejects(store.flush(), error => error instanceof AggregateError && error.errors.includes(failure));
+    } finally {
+      release.resolve();
+      await Promise.allSettled([fork, stopping]);
+      fs.unlink = originalUnlink;
+      syncBuiltinESMExports();
+      await store.flush().catch(() => undefined);
+      await agent.shutdown("disconnect");
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("failed provisional MCP disposal releases the fork lease after a child checkpoint failure", { timeout: 10_000 }, async () => {
+  const cwd = await fs.mkdtemp(join(tmpdir(), "glm-fork-disposal-lease-"));
   const dir = join(cwd, "sessions");
   const store = new SessionStore(dir);
-  const written = deferred();
-  const release = deferred();
-  let parentId = "";
-  let childId = "";
-  const failure = Object.assign(new Error("fixture unlink denied"), { code: "EACCES" });
-  const originalUnlink = fs.unlink;
-  const agent = new GlmAcpAgent(connection() as never, { sessionStore: store, glm: textGlm() });
-  let fork: Promise<unknown> | undefined;
-  let stopping: Promise<void> | undefined;
+  const disposalFailure = new Error("fixture provisional disposal failed");
+  const childTools = new SessionMcpTools([]);
+  const dispose = childTools.dispose.bind(childTools);
+  let childDisposals = 0;
+  childTools.dispose = async () => {
+    childDisposals++;
+    await dispose();
+    throw disposalFailure;
+  };
+  let connections = 0;
+  const agent = new GlmAcpAgent(connection() as never, {
+    sessionStore: store, glm: textGlm(),
+    connectSessionMcpServers: async () => ++connections === 2 ? childTools : new SessionMcpTools([]),
+  });
   try {
-    parentId = (await agent.newSession({ cwd, mcpServers: [] })).sessionId;
-    fs.unlink = async path => {
-      if (String(path) === join(dir, `${childId}.json`)) throw failure;
-      await originalUnlink(path);
-    };
-    syncBuiltinESMExports();
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    let checkpointFailure: unknown;
     await withCheckpointWrites(dir, async snapshot => {
-      if (snapshot.sessionId === parentId) return;
-      childId = snapshot.sessionId;
-      written.resolve();
-      await release.promise;
+      if (snapshot.sessionId !== sessionId) {
+        // The actual atomic rename rejects because its destination is a directory.
+        await fs.mkdir(join(dir, `${snapshot.sessionId}.json`));
+      }
     }, async () => {
-      fork = agent.unstable_forkSession({ sessionId: parentId, cwd, mcpServers: [] });
-      const rejected = assert.rejects(fork, error => {
-        assert.ok(error instanceof AggregateError);
-        assert.match(error.message, /rollback failed/i);
-        assert.match(error.message, new RegExp(childId));
-        assert.match(String(error.errors[0]), /Session fork cancelled/);
-        assert.equal(error.errors[1], failure);
-        return true;
-      });
-      await written.promise;
-      stopping = agent.closeSession({ sessionId: parentId });
-      release.resolve();
-      await rejected;
-      await stopping;
-      assert.ok(await new SessionStore(dir).loadAsync(childId), "failed removal remains recoverable and its error is visible");
+      const forkError = await agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] }).then(
+        () => { throw new Error("fixture checkpoint must reject"); },
+        error => error as Error,
+      );
+      // Prove the release through public behavior before checking error shape.
+      assert.equal((await agent.prompt({ sessionId, prompt: [{ type: "text", text: "continue after failed cleanup" }] })).stopReason, "end_turn");
+      assert.ok(forkError instanceof AggregateError);
+      checkpointFailure = forkError.errors[0];
+      assert.match((checkpointFailure as NodeJS.ErrnoException).syscall ?? "", /rename/);
+      assert.equal(forkError.errors[1], disposalFailure);
+      assert.equal(forkError.cause, disposalFailure);
+      assert.equal(childDisposals, 1);
     });
-    await assert.rejects(store.flush(), error => error instanceof AggregateError && error.errors.includes(failure));
+    await assert.rejects(store.flush(), error => error instanceof AggregateError && error.errors.includes(checkpointFailure));
   } finally {
-    release.resolve();
-    await Promise.allSettled([fork, stopping]);
-    fs.unlink = originalUnlink;
-    syncBuiltinESMExports();
     await store.flush().catch(() => undefined);
     await agent.shutdown("disconnect");
     await fs.rm(cwd, { recursive: true, force: true });
