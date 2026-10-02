@@ -21,6 +21,7 @@
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "test": "npm run build && node scripts/run-tests.mjs",
+    "test:only": "node scripts/run-tests.mjs",
     "lint": "eslint src",
     "version": "npm run build --silent && node dist/registry/sync-manifest.js"
   },
