@@ -718,9 +718,9 @@ export class ToolExecutor {
         latestOccurrences === 0
           ? "`old_text` is no longer present"
           : `\`old_text\` now occurs ${latestOccurrences} times`;
-      await this.markFailed(toolCallId, `file changed while waiting for permission (${reason})`);
+      await this.markFailed(toolCallId, `file changed while waiting for permission or progress delivery (${reason})`);
       return {
-        content: `Error editing file: ${path} changed while waiting for permission (${reason}). Re-read the file and retry.`,
+        content: `Error editing file: ${path} changed while waiting for permission or progress delivery (${reason}). Re-read the file and retry.`,
       };
     }
 

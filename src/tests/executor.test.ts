@@ -1252,7 +1252,7 @@ test("edit_file re-validates after the permission prompt and refuses a file chan
       "edit_file",
       JSON.stringify({ path, old_text: "old snippet", new_text: "new snippet" })
     );
-    assert.match(result.content, /changed while waiting for permission/);
+    assert.match(result.content, /changed while waiting for permission or progress delivery/);
     // The user's concurrent edit is intact and nothing was written back.
     assert.equal(readFileSync(path, "utf8"), "keep\nuser rewrote this\n");
     assert.equal(conn.writeTextFileCalls.length, 0);
@@ -1294,10 +1294,19 @@ for (const scenario of [
       await notificationEntered;
       writeFileSync(path, scenario.concurrent, "utf8");
       if (scenario.abort) controller.abort();
+      // Reads dispatched before the held notification is released (the initial
+      // buffer read). Once the turn is aborted, the cancellation check must
+      // skip the post-notification re-read entirely, so this count may only
+      // grow while the turn is still alive.
+      const readsBeforeDispatch = conn.readTextFileCalls.length;
       release();
       const result = await editing;
       assert.equal(readFileSync(path, "utf8"), scenario.expected);
       assert.equal(conn.writeTextFileCalls.length, scenario.writes);
+      assert.equal(
+        conn.readTextFileCalls.length,
+        readsBeforeDispatch + (scenario.abort ? 0 : 1)
+      );
       assert.match(result.content, scenario.abort ? /cancelled by turn/i : scenario.writes ? /File edited successfully/ : /changed while waiting/);
     } finally {
       release();
