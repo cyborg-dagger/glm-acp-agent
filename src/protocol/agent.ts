@@ -1670,11 +1670,14 @@ export class GlmAcpAgent implements Agent {
             const terminal = update.sessionUpdate === "session_info_update" ||
               ((update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
                 (update.status === "completed" || update.status === "failed"));
-            if (!ownsPrompt() || signal.aborted) {
+            if (!ownsPrompt() || (signal.aborted && !terminal)) {
               if (!terminal) throw new Error("Prompt notification cancelled");
               return;
             }
             try {
+              // A cancelled prompt that still owns the session can settle its
+              // cards. The aborted wait detaches delivery without changing
+              // an already-known result or delaying prompt cancellation.
               await waitForAbort(connection.sessionUpdate(params), signal, "Prompt notification cancelled");
               // Delivery can win the race just before cancellation, with the
               // await continuation still queued. Check the owner again before

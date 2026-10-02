@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
@@ -292,6 +292,215 @@ for (const status of ["pending", "in_progress", "completed", "failed"] as const)
     } finally {
       held.resolve();
       await Promise.allSettled([prompt, close]);
+      await agent.closeSession({ sessionId });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("cancelled pending permission publishes a failed card without waiting for its delivery", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "glm-acp-cancelled-permission-card-"));
+  const storeRoot = join(cwd, "sessions");
+  const permission = deferred<{ outcome: { outcome: "selected"; optionId: string } }>();
+  const permissionStarted = deferred<void>();
+  const terminalDelivery = deferred<void>();
+  let writes = 0;
+  let modelCalls = 0;
+  const conn = {
+    ...connection(),
+    async requestPermission(params: unknown) {
+      conn.permissionRequests.push(params);
+      permissionStarted.resolve();
+      return permission.promise;
+    },
+    async writeTextFile() { writes += 1; },
+  };
+  conn.sessionUpdate = async params => {
+    conn.updates.push(params);
+    if ((params.update as { status?: string }).status === "failed") await terminalDelivery.promise;
+  };
+  const glm = {
+    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+      modelCalls += 1;
+      yield { toolCall: { id: "permission-held", name: "write_file", arguments: JSON.stringify({ path: "written.txt", content: "do not write" }) } };
+      yield { done: true, stopReason: "tool_calls" };
+    },
+  };
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: new SessionStore(storeRoot) });
+  await agent.initialize({ protocolVersion: 1, clientCapabilities: { fs: { writeTextFile: true } } } as never);
+  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+  const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "write" }] });
+  try {
+    await withoutNotificationRelease(permissionStarted.promise);
+    await agent.cancel({ sessionId });
+    assert.equal((await withoutNotificationRelease(prompt)).stopReason, "cancelled");
+    const cards = conn.updates.map(params => params.update as { toolCallId?: string; status?: string; rawOutput?: unknown })
+      .filter(update => update.toolCallId === "permission-held");
+    assert.deepEqual(cards.map(card => card.status), ["pending", "failed"]);
+    assert.deepEqual(cards[1].rawOutput, { error: "Cancelled by turn." });
+    const result = new SessionStore(storeRoot).load(sessionId)?.messages.find(message => message.role === "tool" && message.tool_call_id === "permission-held");
+    assert.equal(result?.content, "Write cancelled by turn.", "the cancelled result must be durable before close");
+    assert.equal(writes, 0);
+    assert.equal(modelCalls, 1);
+    const updateCount = conn.updates.length;
+    terminalDelivery.reject(new Error("late failed-card delivery rejection"));
+    permission.resolve({ outcome: { outcome: "selected", optionId: "allow" } });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(conn.updates.length, updateCount, "late settlement must not resume notification work");
+    assert.equal(writes, 0, "late permission must not start an editor write");
+    assert.equal(conn.permissionRequests.length, 1);
+  } finally {
+    terminalDelivery.resolve();
+    permission.resolve({ outcome: { outcome: "selected", optionId: "allow" } });
+    await Promise.allSettled([prompt]);
+    await agent.closeSession({ sessionId });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+for (const outcome of ["completed", "failed"] as const) {
+  test(`an editor write ${outcome} after cancel publishes its actual terminal card without waiting for delivery`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "glm-acp-cancelled-write-card-"));
+    const storeRoot = join(cwd, "sessions");
+    const writeStarted = deferred<void>();
+    const writeRelease = deferred<void>();
+    const terminalDelivery = deferred<void>();
+    let writes = 0;
+    let modelCalls = 0;
+    const conn = {
+      ...connection(),
+      async writeTextFile(params: { path: string; content: string }) {
+        writes += 1;
+        writeStarted.resolve();
+        await writeRelease.promise;
+        if (outcome === "failed") throw new Error("editor refused the admitted write");
+        await writeFile(params.path, params.content);
+      },
+    };
+    conn.sessionUpdate = async params => {
+      conn.updates.push(params);
+      if ((params.update as { status?: string }).status === outcome) await terminalDelivery.promise;
+    };
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        modelCalls += 1;
+        yield { toolCall: { id: "write-admitted", name: "write_file", arguments: JSON.stringify({ path: "written.txt", content: "admitted write" }) } };
+        yield { toolCall: { id: "write-stale", name: "write_file", arguments: JSON.stringify({ path: "stale.txt", content: "do not write" }) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: new SessionStore(storeRoot) });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: { fs: { writeTextFile: true } } } as never);
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "write" }] });
+    try {
+      await withoutNotificationRelease(writeStarted.promise);
+      await agent.cancel({ sessionId });
+      writeRelease.resolve();
+      assert.equal((await withoutNotificationRelease(prompt)).stopReason, "cancelled");
+      const cards = conn.updates.map(params => params.update as { toolCallId?: string; status?: string; rawOutput?: unknown })
+        .filter(update => update.toolCallId === "write-admitted");
+      assert.deepEqual(cards.map(card => card.status), ["pending", "in_progress", outcome]);
+      assert.deepEqual(cards[2].rawOutput, outcome === "completed"
+        ? { success: true } : { error: "editor refused the admitted write" });
+      const messages = new SessionStore(storeRoot).load(sessionId)?.messages;
+      const result = messages?.find(message => message.role === "tool" && message.tool_call_id === "write-admitted");
+      assert.equal(result?.content, outcome === "completed"
+        ? "File written successfully: written.txt" : "Error writing file: editor refused the admitted write",
+      "the known editor outcome must be durable before close");
+      const skipped = messages?.find(message => message.role === "tool" && message.tool_call_id === "write-stale");
+      assert.equal(skipped?.content, "Tool call cancelled before execution.");
+      assert.equal(writes, 1);
+      assert.equal(modelCalls, 1);
+      assert.equal(conn.permissionRequests.length, 1);
+      assert.equal(existsSync(join(cwd, "stale.txt")), false);
+      if (outcome === "completed") assert.equal(await readFile(join(cwd, "written.txt"), "utf8"), "admitted write");
+      else assert.equal(existsSync(join(cwd, "written.txt")), false);
+      const updateCount = conn.updates.length;
+      terminalDelivery.reject(new Error("late terminal write-card delivery rejection"));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(conn.updates.length, updateCount);
+      assert.equal(writes, 1);
+    } finally {
+      writeRelease.resolve();
+      terminalDelivery.resolve();
+      await Promise.allSettled([prompt]);
+      await agent.closeSession({ sessionId });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const { toolName, status, args, statuses, permissionCount } of [
+  { toolName: "write_file", status: "pending", args: { path: "written.txt", content: "do not write" }, statuses: ["pending", "failed"], permissionCount: 0 },
+  { toolName: "write_file", status: "in_progress", args: { path: "written.txt", content: "do not write" }, statuses: ["pending", "in_progress", "failed"], permissionCount: 1 },
+  { toolName: "run_command", status: "in_progress", args: { command: "printf do-not-run > written.txt" }, statuses: ["pending", "in_progress", "failed"], permissionCount: 1 },
+  { toolName: "read_file", status: "in_progress", args: { path: "written.txt" }, statuses: ["in_progress", "failed"], permissionCount: 0 },
+  { toolName: "custom_mcp_tool", status: "in_progress", args: {}, statuses: ["in_progress", "failed"], permissionCount: 0 },
+] as const) {
+  test(`cancelled held ${status} ${toolName} announcement publishes a failed card and a cancelled-before-execution result`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "glm-acp-cancelled-announcement-card-"));
+    const storeRoot = join(cwd, "sessions");
+    const announcement = deferred<void>();
+    const announcementStarted = deferred<void>();
+    const terminalDelivery = deferred<void>();
+    let startedOperations = 0;
+    let modelCalls = 0;
+    const conn = {
+      ...connection(),
+      async readTextFile() { startedOperations += 1; return { content: "do not read" }; },
+      async writeTextFile() { startedOperations += 1; },
+    };
+    conn.sessionUpdate = async params => {
+      conn.updates.push(params);
+      const update = params.update as { status?: string };
+      if (update.status === status) {
+        announcementStarted.resolve();
+        await announcement.promise;
+      }
+      if (update.status === "failed") await terminalDelivery.promise;
+    };
+    const tools = {
+      toolDefinitions: [{ type: "function", function: { name: "custom_mcp_tool", description: "fixture", parameters: { type: "object" } } }],
+      hasTool: (name: string) => name === "custom_mcp_tool",
+      async callTool() { startedOperations += 1; return { content: [{ type: "text", text: "do not call" }] }; },
+      async dispose() {},
+    } as unknown as SessionMcpTools;
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        modelCalls += 1;
+        yield { toolCall: { id: "announcement-held", name: toolName, arguments: JSON.stringify(args) } };
+        yield { done: true, stopReason: "tool_calls" };
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: new SessionStore(storeRoot), mcpConnector: async () => tools });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } } } as never);
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "start" }] });
+    try {
+      await withoutNotificationRelease(announcementStarted.promise);
+      await agent.cancel({ sessionId });
+      assert.equal((await withoutNotificationRelease(prompt)).stopReason, "cancelled");
+      const cards = conn.updates.map(params => params.update as { toolCallId?: string; status?: string })
+        .filter(update => update.toolCallId === "announcement-held");
+      assert.deepEqual(cards.map(card => card.status), statuses);
+      const result = new SessionStore(storeRoot).load(sessionId)?.messages.find(message => message.role === "tool" && message.tool_call_id === "announcement-held");
+      assert.equal(result?.content, "Tool call cancelled before execution.", "an interrupted announcement must not imply an unknown side effect");
+      assert.equal(startedOperations, 0);
+      assert.equal(existsSync(join(cwd, "written.txt")), false, "cancelled command/write must not mutate the filesystem");
+      assert.equal(conn.permissionRequests.length, permissionCount);
+      assert.equal(modelCalls, 1);
+      const updateCount = conn.updates.length;
+      terminalDelivery.reject(new Error("late announcement failed-card delivery rejection"));
+      announcement.reject(new Error("late announcement delivery rejection"));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(conn.updates.length, updateCount);
+      assert.equal(conn.permissionRequests.length, permissionCount);
+      assert.equal(startedOperations, 0);
+    } finally {
+      announcement.resolve();
+      terminalDelivery.resolve();
+      await Promise.allSettled([prompt]);
       await agent.closeSession({ sessionId });
       await rm(cwd, { recursive: true, force: true });
     }
