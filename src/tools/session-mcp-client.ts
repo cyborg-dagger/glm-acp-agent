@@ -539,8 +539,8 @@ export class StdioMcpClient implements ConnectedMcpClient {
     this.initializingChild = null;
     this.exited = true;
     this.exitReason = "client disposed";
-    if (child) await this.terminateChildAndWait(child);
     this.rejectAllPending(new Error("cancelled (client disposed)"));
+    if (child) await this.terminateChildAndWait(child);
   }
 
   /**
@@ -596,6 +596,10 @@ export class StdioMcpClient implements ConnectedMcpClient {
     this.child = child;
     this.initializingChild = child;
 
+    // Pipe errors are emitted asynchronously and are not ChildProcess errors.
+    child.stdin.on("error", (err) => {
+      this.failConnection(new Error(`stdin error: ${err.message}`, { cause: err }), child, true);
+    });
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       if (this.child === child) this.handleStdout(chunk);
@@ -857,13 +861,26 @@ export class StdioMcpClient implements ConnectedMcpClient {
       this.buffer = this.buffer.slice(idx + 1);
       const line = raw.trim();
       if (!line) continue;
-      let parsed: JsonRpcResponse;
+      let decoded: unknown;
       try {
-        parsed = JSON.parse(line) as JsonRpcResponse;
+        decoded = JSON.parse(line);
       } catch {
         continue;
       }
-      if (typeof parsed.id !== "number") continue;
+      if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) continue;
+      const parsed = decoded as JsonRpcResponse;
+      if (typeof parsed.id !== "number" || !Number.isFinite(parsed.id)) continue;
+      if (parsed.jsonrpc !== undefined && parsed.jsonrpc !== "2.0") continue;
+      if (Object.hasOwn(parsed, "result") === Object.hasOwn(parsed, "error")) continue;
+      const error = parsed.error;
+      if (Object.hasOwn(parsed, "error")) {
+        if (error === null || typeof error !== "object" || Array.isArray(error)) continue;
+        // An error object without a usable message or code would reject the
+        // call with a garbage message; skip it so the valid reply settles.
+        const hasUsableMessage = typeof error.message === "string";
+        const hasUsableCode = typeof error.code === "string" || typeof error.code === "number";
+        if (!hasUsableMessage && !hasUsableCode) continue;
+      }
       const pending = this.pending.get(parsed.id);
       if (!pending) continue;
       this.pending.delete(parsed.id);
