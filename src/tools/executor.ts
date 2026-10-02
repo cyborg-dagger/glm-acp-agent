@@ -940,9 +940,40 @@ export class ToolExecutor {
         toolCallId,
         title: `Read URL: ${url}`,
         kind: "fetch",
-        status: "in_progress",
+        status: "pending",
         locations: [{ path: url }],
         rawInput: elideForPreview(args),
+      },
+    });
+
+    const permissionResult = await this.maybeRequestPermission({
+      toolCallId,
+      kind: "fetch",
+      rawInput: args,
+      title: `Read URL: ${url}`,
+      locations: [{ path: url }],
+    });
+
+    if (permissionResult.type === "error") {
+      const message = `Error requesting permission: ${permissionResult.message}`;
+      await this.markFailed(toolCallId, message);
+      return { content: message };
+    }
+    if (permissionResult.type === "cancelled") {
+      await this.markFailed(toolCallId, "Cancelled by user.");
+      return { content: "URL read cancelled by user." };
+    }
+    if (permissionResult.type === "reject") {
+      await this.markFailed(toolCallId, "Rejected by user.");
+      return { content: "URL read rejected by user." };
+    }
+
+    await this.connection.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "in_progress",
       },
     });
 
@@ -1089,7 +1120,7 @@ export class ToolExecutor {
    */
   private async maybeRequestPermission(args: {
     toolCallId: string;
-    kind: "write" | "execute";
+    kind: "write" | "execute" | "fetch";
     rawInput: unknown;
     title: string;
     locations?: Array<{ path: string }>;
@@ -1123,7 +1154,7 @@ export class ToolExecutor {
         toolCall: {
           toolCallId: args.toolCallId,
           title: args.title,
-          kind: args.kind === "write" ? "edit" : "execute",
+          kind: args.kind === "write" ? "edit" : args.kind,
           status: "pending",
           locations: args.locations ?? [],
           // Passed through verbatim: callers hand us the full payload so the
