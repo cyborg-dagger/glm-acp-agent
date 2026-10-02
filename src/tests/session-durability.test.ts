@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
@@ -359,6 +359,55 @@ test("shutdown reports checkpoint failure while releasing all owned resources", 
     await assert.rejects(agent.shutdown("disconnect"), /checkpoint failed/);
     assert.equal(disposals, 1);
     assert.equal((agent as unknown as { sessions: Map<string, unknown> }).sessions.size, 0);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a single failed shutdown checkpoint rejects with the original storage error", { timeout: 10_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "glm-shutdown-single-failure-"));
+  const dir = join(cwd, "sessions");
+  const agent = new GlmAcpAgent(connection() as never, { sessionStore: new SessionStore(dir) });
+  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+  // The checkpoint's rename destination becomes a directory, so the queued
+  // atomic write rejects with the real errno error the store retains for flush.
+  await mkdir(join(dir, `${sessionId}.json`), { recursive: true });
+  try {
+    await assert.rejects(agent.shutdown("disconnect"), (error: unknown) => {
+      assert.ok(!(error instanceof AggregateError), "one storage failure must not be re-wrapped by flush reporting");
+      assert.doesNotMatch(String(error), /cleanup and session persistence failed/);
+      const errno = error as NodeJS.ErrnoException;
+      assert.equal(errno.code, "EISDIR");
+      assert.match(errno.syscall ?? "", /rename/);
+      return true;
+    });
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("two distinct failed shutdown checkpoints still aggregate their raw errors once", { timeout: 10_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "glm-shutdown-two-failures-"));
+  const dir = join(cwd, "sessions");
+  const agent = new GlmAcpAgent(connection() as never, { sessionStore: new SessionStore(dir) });
+  const first = await agent.newSession({ cwd, mcpServers: [] });
+  const second = await agent.newSession({ cwd, mcpServers: [] });
+  await mkdir(join(dir, `${first.sessionId}.json`), { recursive: true });
+  await mkdir(join(dir, `${second.sessionId}.json`), { recursive: true });
+  try {
+    await assert.rejects(agent.shutdown("disconnect"), (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(error.message, /cleanup and session persistence failed/);
+      assert.equal(error.errors.length, 2);
+      for (const raw of error.errors as NodeJS.ErrnoException[]) {
+        assert.ok(!(raw instanceof AggregateError), "each raw failure must surface unwrapped");
+        assert.equal(raw.code, "EISDIR");
+      }
+      const reported = (error.errors as NodeJS.ErrnoException[]).map(raw => String(raw));
+      assert.ok(reported.some(text => text.includes(first.sessionId)), "the first session's raw error is retained");
+      assert.ok(reported.some(text => text.includes(second.sessionId)), "the second session's raw error is retained");
+      return true;
+    });
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

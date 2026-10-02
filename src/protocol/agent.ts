@@ -1170,7 +1170,13 @@ export class GlmAcpAgent implements Agent {
         // below still waits for the writes, and the original error rethrows.
         persistenceDrained = await settlesWithin(
           Promise.all([...persistenceWrites, (this.sessionStore?.flush() ?? Promise.resolve()).catch((error) => {
-            persistenceErrors.push(error);
+            // flush() reports each retained save failure inside its AggregateError,
+            // and the direct save catch above already recorded that same error
+            // object; only add elements shutdown has not seen yet.
+            const reported = error instanceof AggregateError ? error.errors : [error];
+            for (const item of reported) {
+              if (!persistenceErrors.includes(item)) persistenceErrors.push(item);
+            }
           })]),
           remainingMs(),
         );
