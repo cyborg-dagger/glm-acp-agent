@@ -377,7 +377,9 @@ test("a single failed shutdown checkpoint rejects with the original storage erro
       assert.ok(!(error instanceof AggregateError), "one storage failure must not be re-wrapped by flush reporting");
       assert.doesNotMatch(String(error), /cleanup and session persistence failed/);
       const errno = error as NodeJS.ErrnoException;
-      assert.equal(errno.code, "EISDIR");
+      // POSIX renames onto a directory as EISDIR; Windows as EPERM. What
+      // matters is that the raw fs errno survives to the caller unwrapped.
+      assert.ok(errno.code === "EISDIR" || errno.code === "EPERM", `unexpected errno ${errno.code}`);
       assert.match(errno.syscall ?? "", /rename/);
       return true;
     });
@@ -401,7 +403,7 @@ test("two distinct failed shutdown checkpoints still aggregate their raw errors 
       assert.equal(error.errors.length, 2);
       for (const raw of error.errors as NodeJS.ErrnoException[]) {
         assert.ok(!(raw instanceof AggregateError), "each raw failure must surface unwrapped");
-        assert.equal(raw.code, "EISDIR");
+        assert.ok(raw.code === "EISDIR" || raw.code === "EPERM", `unexpected errno ${raw.code}`);
       }
       const reported = (error.errors as NodeJS.ErrnoException[]).map(raw => String(raw));
       assert.ok(reported.some(text => text.includes(first.sessionId)), "the first session's raw error is retained");
