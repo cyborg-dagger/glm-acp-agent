@@ -1692,6 +1692,7 @@ test("tool call result is fed back into the next streamChat call", async () => {
   const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-agent-tool-read-"));
   writeFileSync(pathJoin(dir, "x.ts"), "export const x = 1;", "utf8");
   const conn = createConnectionStub();
+  conn.fileResponses.set(pathJoin(dir, "x.ts"), "export const x = 1;");
 
   let callIndex = 0;
   const glm = {
@@ -1729,7 +1730,7 @@ test("tool call result is fed back into the next streamChat call", async () => {
     });
     assert.equal(result.stopReason, "end_turn");
     assert.equal(callIndex, 2);
-    assert.deepEqual(conn.reads, []);
+    assert.deepEqual(conn.reads, [pathJoin(dir, "x.ts")]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

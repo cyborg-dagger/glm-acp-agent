@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -196,12 +196,58 @@ test("read_file reads from the agent process without fs.readTextFile capability"
   const path = join(dir, "note.txt");
   writeFileSync(path, "from disk", "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", { fs: {} });
+  const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir);
   try {
-    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "note.txt" }));
     assert.equal(result.content, "from disk");
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file rejects absolute paths and parent-directory escapes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-confined-"));
+  const outside = `${dir}-secret.txt`;
+  writeFileSync(outside, "secret", "utf8");
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir);
+  try {
+    const absolute = await exec.execute(
+      "tc-absolute",
+      "read_file",
+      JSON.stringify({ path: outside })
+    );
+    assert.match(absolute.content, /absolute paths are not allowed/);
+
+    const parent = await exec.execute(
+      "tc-parent",
+      "read_file",
+      JSON.stringify({ path: `../${outside.slice(outside.lastIndexOf("/") + 1)}` })
+    );
+    assert.match(parent.content, /path must remain inside the session workspace/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { force: true });
+  }
+});
+
+test("read_file rejects symlinks whose targets escape the session workspace", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-symlink-"));
+  const outside = `${dir}-secret.txt`;
+  writeFileSync(outside, "secret", "utf8");
+  symlinkSync(outside, join(dir, "secret-link"));
+  const conn = createConnectionStub();
+  const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir);
+  try {
+    const result = await exec.execute(
+      "tc-symlink",
+      "read_file",
+      JSON.stringify({ path: "secret-link" })
+    );
+    assert.match(result.content, /path must remain inside the session workspace/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { force: true });
   }
 });
 
@@ -228,7 +274,7 @@ test("write_file routes through fs.writeTextFile when the client advertises it",
   const dir = mkdtempSync(join(tmpdir(), "glm-executor-write-client-"));
   const path = join(dir, "out.txt");
   const conn = createConnectionStub({ permission: "allow" });
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
     const result = await exec.execute(
       "tc1",
@@ -271,12 +317,12 @@ test("read_file truncates large files with a range marker", async () => {
   const path = join(dir, "big.txt");
   writeFileSync(path, Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n"), "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
     const first = await exec.execute(
       "tc1",
       "read_file",
-      JSON.stringify({ path, limit: 4 })
+      JSON.stringify({ path: "big.txt", limit: 4 })
     );
     assert.match(first.content, /line-1/);
     assert.match(first.content, /showing lines 1-4 of (10|11)/);
@@ -285,7 +331,7 @@ test("read_file truncates large files with a range marker", async () => {
     const second = await exec.execute(
       "tc2",
       "read_file",
-      JSON.stringify({ path, offset: 5, limit: 4 })
+      JSON.stringify({ path: "big.txt", offset: 5, limit: 4 })
     );
     assert.match(second.content, /line-5/);
     assert.doesNotMatch(second.content, /line-4\b/);
@@ -299,12 +345,12 @@ test("read_file final page reports end of file without a next-offset hint", asyn
   const path = join(dir, "paged.txt");
   writeFileSync(path, Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n"), "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
     const last = await exec.execute(
       "tc1",
       "read_file",
-      JSON.stringify({ path, offset: 7, limit: 4 })
+      JSON.stringify({ path: "paged.txt", offset: 7, limit: 4 })
     );
     assert.match(last.content, /line-10/);
     assert.match(last.content, /showing lines 7-10 of 10/);
@@ -322,12 +368,12 @@ test("read_file offset beyond EOF returns an EOF result without clamping or a hi
   const path = join(dir, "paged.txt");
   writeFileSync(path, Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n"), "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
     const result = await exec.execute(
       "tc1",
       "read_file",
-      JSON.stringify({ path, offset: 11, limit: 4 })
+      JSON.stringify({ path: "paged.txt", offset: 11, limit: 4 })
     );
     assert.match(result.content, /end of file/);
     assert.match(result.content, /offset 11 is beyond the last line/);
@@ -346,9 +392,9 @@ test("read_file elides the client content channel while the tool result stays fu
   const path = join(dir, "long.txt");
   writeFileSync(path, `${"a".repeat(400)}\nsecond line`, "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
-    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "long.txt" }));
     // The model receives the full page through the tool result...
     assert.ok(result.content.startsWith("a".repeat(400)));
     assert.match(result.content, /second line/);
@@ -371,9 +417,9 @@ test("read_file success path emits in_progress and completed updates", async () 
   const path = join(dir, "x.txt");
   writeFileSync(path, "hello", "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
-    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "x.txt" }));
     assert.equal(result.content, "hello");
 
     const sequence = conn.updates.map(

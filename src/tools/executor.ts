@@ -3,8 +3,8 @@ import type {
   ClientCapabilities,
 } from "@agentclientprotocol/sdk";
 import { spawn } from "node:child_process";
-import { lstat, readdir, readFile, writeFile } from "node:fs/promises";
-import { join as pathJoin, resolve as pathResolve } from "node:path";
+import { lstat, readdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { isAbsolute, join as pathJoin, relative, resolve as pathResolve, sep as pathSeparator } from "node:path";
 import { resolveApiKey } from "../llm/credentials.js";
 import {
   callZaiMcpTool,
@@ -155,8 +155,6 @@ export class ToolExecutor {
       HARD_READ_LIMIT,
       Math.max(1, Math.floor(limitArg) || DEFAULT_READ_LIMIT)
     );
-    const absolutePath = this.resolvePath(path);
-
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
       update: {
@@ -171,7 +169,11 @@ export class ToolExecutor {
     });
 
     try {
-      const full = await readFile(absolutePath, "utf8");
+      const absolutePath = await this.resolveConfinedReadPath(path);
+      const full = this.clientCapabilities?.fs?.readTextFile
+        ? (await this.connection.readTextFile({ sessionId: this.sessionId, path: absolutePath }))
+            .content
+        : await readFile(absolutePath, "utf8");
       const lines = full.split("\n");
       // split() turns a trailing newline into a phantom empty last line; drop
       // it so the reported line count matches what an editor shows.
@@ -699,6 +701,21 @@ export class ToolExecutor {
 
   private resolvePath(path: string): string {
     return pathResolve(this.sessionCwd, path);
+  }
+
+  /** Resolve an existing file without allowing reads outside the session workspace. */
+  private async resolveConfinedReadPath(path: string): Promise<string> {
+    if (isAbsolute(path)) {
+      throw new Error("absolute paths are not allowed");
+    }
+
+    const workspace = await realpath(this.sessionCwd);
+    const target = await realpath(pathResolve(workspace, path));
+    const relativeTarget = relative(workspace, target);
+    if (relativeTarget === ".." || relativeTarget.startsWith(`..${pathSeparator}`)) {
+      throw new Error("path must remain inside the session workspace");
+    }
+    return target;
   }
 
   private async webSearch(

@@ -126,6 +126,7 @@ test("end-to-end tool call: agent reads a local file from the session cwd", asyn
   const stub = new StubClient();
   const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-integration-read-"));
   writeFileSync(pathJoin(dir, "x.ts"), "export const x = 1;", "utf8");
+  stub.fileContents.set(pathJoin(dir, "x.ts"), "export const x = 1;");
 
   let callIndex = 0;
   const glm = {
@@ -166,7 +167,7 @@ test("end-to-end tool call: agent reads a local file from the session cwd", asyn
     });
 
     assert.equal(result.stopReason, "end_turn");
-    assert.deepEqual(stub.reads, []);
+    assert.deepEqual(stub.reads, [{ path: pathJoin(dir, "x.ts") }]);
 
     // The client should have seen `tool_call` and `tool_call_update` notifications.
     const updateKinds = stub.updates.map(
