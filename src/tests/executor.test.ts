@@ -26,6 +26,12 @@ function createConnectionStub(opts: {
   terminalOutput?: string;
   /** When set, client readTextFile returns this instead of the on-disk content (simulates a dirty buffer). */
   clientFileContent?: string;
+  /**
+   * Live editor buffer: when set, every client readTextFile serves this
+   * object's current `content` (NOT disk), so tests can mutate the unsaved
+   * buffer independently of the file on disk.
+   */
+  clientBuffer?: { content: string };
   /** Called when a permission request arrives — use it to mutate files mid-prompt. */
   onPermission?: () => void;
 } = {}) {
@@ -47,6 +53,7 @@ function createConnectionStub(opts: {
     async readTextFile(params: { sessionId: string; path: string }) {
       if (opts.readError) throw new Error("file not found");
       readTextFileCalls.push(params);
+      if (opts.clientBuffer) return { content: opts.clientBuffer.content };
       if (opts.clientFileContent !== undefined) return { content: opts.clientFileContent };
       // Mirror a real client: readTextFile serves the file's current on-disk contents.
       return { content: readFileSync(params.path, "utf8") };
@@ -1308,6 +1315,73 @@ for (const scenario of [
         readsBeforeDispatch + (scenario.abort ? 0 : 1)
       );
       assert.match(result.content, scenario.abort ? /cancelled by turn/i : scenario.writes ? /File edited successfully/ : /changed while waiting/);
+    } finally {
+      release();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+// The family above mutates the file on disk while the stub reads disk, so it
+// cannot catch a regression that re-reads disk instead of the client's editor
+// buffer during the post-notification revalidation. Here the client serves an
+// independently mutable in-memory buffer while disk stays stale: the edit must
+// be computed against the buffer the user actually sees.
+for (const scenario of [
+  {
+    name: "preserves an unrelated unsaved buffer change",
+    concurrent: "keep\nuser tweaked this\nold snippet\n",
+    expected: "keep\nuser tweaked this\nnew snippet\n",
+    diskAfter: "keep\nuser tweaked this\nnew snippet\n",
+    writes: 1,
+  },
+  {
+    name: "refuses an unsaved buffer rewrite of the target",
+    concurrent: "keep\nuser rewrote this\n",
+    expected: "keep\nuser rewrote this\n",
+    diskAfter: "keep\nold snippet\n",
+    writes: 0,
+  },
+]) {
+  test(`edit_file ${scenario.name} while the in_progress notification is pending`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "glm-executor-edit-buffer-"));
+    const path = join(dir, "code.txt");
+    // Disk keeps the original contents for the whole test; only the client's
+    // unsaved buffer changes while the notification is held.
+    writeFileSync(path, "keep\nold snippet\n", "utf8");
+    const buffer = { content: "keep\nold snippet\n" };
+    const conn = createConnectionStub({ clientBuffer: buffer });
+    let entered!: () => void;
+    const notificationEntered = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const notificationReleased = new Promise<void>(resolve => { release = resolve; });
+    const sessionUpdate = conn.sessionUpdate.bind(conn);
+    conn.sessionUpdate = async payload => {
+      await sessionUpdate(payload);
+      const update = payload["update"] as { status?: string };
+      if (update.status === "in_progress") {
+        entered();
+        await notificationReleased;
+      }
+    };
+    const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    try {
+      const editing = executor.execute("tc1", "edit_file", JSON.stringify({ path, old_text: "old snippet", new_text: "new snippet" }));
+      await notificationEntered;
+      // Mutate ONLY the unsaved editor buffer; disk stays at "keep\nold snippet\n".
+      buffer.content = scenario.concurrent;
+      const readsBeforeDispatch = conn.readTextFileCalls.length;
+      release();
+      const result = await editing;
+      // The post-notification re-read must serve the client buffer, so the
+      // delivered edit carries the user's unsaved change instead of stale disk.
+      assert.equal(conn.writeTextFileCalls.length, scenario.writes);
+      if (scenario.writes > 0) {
+        assert.equal(conn.writeTextFileCalls[0]?.content, scenario.expected);
+      }
+      assert.equal(readFileSync(path, "utf8"), scenario.diskAfter);
+      assert.equal(conn.readTextFileCalls.length, readsBeforeDispatch + 1);
+      assert.match(result.content, scenario.writes ? /File edited successfully/ : /changed while waiting/);
     } finally {
       release();
       rmSync(dir, { recursive: true, force: true });
