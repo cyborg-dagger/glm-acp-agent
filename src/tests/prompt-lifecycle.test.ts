@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
@@ -911,6 +911,8 @@ test("restore suppresses late tool updates while retaining an active tool result
     },
   };
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-restore-tool-"));
+  const cwd = await mkdtemp(join(storeRoot, "workspace-"));
+  await writeFile(join(cwd, "a.txt"), "");
   const store = new SessionStore(storeRoot);
   let calls = 0;
   let restoredHistory: Array<{ role?: string; tool_call_id?: string }> = [];
@@ -932,11 +934,11 @@ test("restore suppresses late tool updates while retaining an active tool result
     protocolVersion: 1,
     clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
   } as never);
-  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
   try {
     const first = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read" }] });
     await readReady;
-    const resume = agent.resumeSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    const resume = agent.resumeSession({ sessionId, cwd, mcpServers: [] });
     releaseRead();
     assert.equal((await first).stopReason, "cancelled");
     await resume;
@@ -1010,6 +1012,8 @@ test("close persists an in-flight tool result without late tool updates", async 
     },
   };
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-close-tool-history-"));
+  const cwd = await mkdtemp(join(storeRoot, "workspace-"));
+  await writeFile(join(cwd, "a.txt"), "");
   const store = new SessionStore(storeRoot);
   const glm = {
     async *streamChat(): AsyncGenerator<GlmStreamChunk> {
@@ -1022,7 +1026,7 @@ test("close persists an in-flight tool result without late tool updates", async 
     protocolVersion: 1,
     clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
   } as never);
-  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
   try {
     const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read" }] });
     await readReady;
@@ -1065,6 +1069,8 @@ test("fork waits for an active tool and clones a complete assistant/tool batch",
     },
   };
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-tool-history-"));
+  const cwd = await mkdtemp(join(storeRoot, "workspace-"));
+  await writeFile(join(cwd, "a.txt"), "");
   const store = new SessionStore(storeRoot);
   let connections = 0;
   const glm = {
@@ -1085,11 +1091,11 @@ test("fork waits for an active tool and clones a complete assistant/tool batch",
     protocolVersion: 1,
     clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
   } as never);
-  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
   try {
     const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read" }] });
     await readReady;
-    const fork = agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    const fork = agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(connections, 1, "child resources must not be created before the parent drains");
     releaseRead();
@@ -1134,6 +1140,8 @@ test("fork checkpoints a drained second tool turn so its parent survives restart
     },
   };
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-parent-restart-"));
+  const cwd = await mkdtemp(join(storeRoot, "workspace-"));
+  await writeFile(join(cwd, "second.txt"), "");
   const store = new SessionStore(storeRoot);
   let calls = 0;
   const agent = new GlmAcpAgent(conn as never, {
@@ -1155,12 +1163,12 @@ test("fork checkpoints a drained second tool turn so its parent survives restart
     protocolVersion: 1,
     clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
   } as never);
-  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
   try {
     await agent.prompt({ sessionId, prompt: [{ type: "text", text: "first" }] });
     const second = agent.prompt({ sessionId, prompt: [{ type: "text", text: "second" }] });
     await readReady;
-    const fork = agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    const fork = agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] });
     releaseRead();
     assert.equal((await second).stopReason, "cancelled");
     await fork;
@@ -1175,8 +1183,8 @@ test("fork checkpoints a drained second tool turn so its parent survives restart
       sessionStore: store,
       connectSessionMcpServers: async () => new SessionMcpTools([]),
     });
-    await restarted.loadSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
-    await restarted.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await restarted.loadSession({ sessionId, cwd, mcpServers: [] });
+    await restarted.unstable_forkSession({ sessionId, cwd, mcpServers: [] });
   } finally {
     releaseRead();
     await rm(storeRoot, { recursive: true, force: true });
@@ -1202,6 +1210,8 @@ test("fork checkpoints a settled parent after configuration persists during drai
     },
   };
   const storeRoot = await mkdtemp(join(tmpdir(), "glm-acp-fork-config-race-"));
+  const cwd = await mkdtemp(join(storeRoot, "workspace-"));
+  await writeFile(join(cwd, "race.txt"), "");
   const store = new SessionStore(storeRoot);
   const agent = new GlmAcpAgent(conn as never, {
     glm: {
@@ -1217,11 +1227,11 @@ test("fork checkpoints a settled parent after configuration persists during drai
     protocolVersion: 1,
     clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
   } as never);
-  const { sessionId } = await agent.newSession({ cwd: tmpdir(), mcpServers: [] });
+  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
   try {
     const prompt = agent.prompt({ sessionId, prompt: [{ type: "text", text: "read" }] });
     await readReady;
-    const fork = agent.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    const fork = agent.unstable_forkSession({ sessionId, cwd, mcpServers: [] });
     await new Promise((resolve) => setImmediate(resolve));
     await agent.setSessionMode({ sessionId, modeId: "bypass_permissions" });
     releaseRead();
@@ -1239,8 +1249,8 @@ test("fork checkpoints a settled parent after configuration persists during drai
       sessionStore: store,
       connectSessionMcpServers: async () => new SessionMcpTools([]),
     });
-    await restarted.loadSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
-    await restarted.unstable_forkSession({ sessionId, cwd: tmpdir(), mcpServers: [] });
+    await restarted.loadSession({ sessionId, cwd, mcpServers: [] });
+    await restarted.unstable_forkSession({ sessionId, cwd, mcpServers: [] });
   } finally {
     releaseRead();
     await rm(storeRoot, { recursive: true, force: true });

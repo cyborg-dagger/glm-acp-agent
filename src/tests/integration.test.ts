@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 
@@ -128,65 +128,87 @@ test("end-to-end initialize / new session / prompt round-trip via real SDK trans
   assert.ok(updateKinds.includes("session_info_update"));
 });
 
-test("end-to-end tool call: agent reads a local file from the session cwd", async () => {
-  const { a, b } = pairedStreams();
-  const stub = new StubClient();
-  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-acp-integration-read-"));
-  writeFileSync(pathJoin(dir, "x.ts"), "export const x = 1;", "utf8");
-
-  let callIndex = 0;
-  const glm = {
-    async *streamChat(): AsyncGenerator<GlmStreamChunk> {
-      callIndex++;
-      if (callIndex === 1) {
-        yield {
-          toolCall: {
-            id: "tc1",
-            name: "read_file",
-            arguments: JSON.stringify({ path: "x.ts" }),
-          },
-        };
-        yield { done: true, stopReason: "tool_calls" };
-      } else {
-        yield { text: "Read it." };
-        yield { done: true, stopReason: "stop" };
-      }
-    },
-  };
-
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const _agentConn = new AgentSideConnection(
-    (conn) => new GlmAcpAgent(conn, { glm, sessionStore: null }),
-    a
-  );
-  const clientConn = new ClientSideConnection(() => stub, b);
-
-  await clientConn.initialize({
-    protocolVersion: PROTOCOL_VERSION,
-    // This case covers the agent-process fallback; buffered reads are covered
-    // by the executor and protocol unit tests with divergent buffer content.
+for (const { name, clientCapabilities, readsClient } of [
+  {
+    name: "agent reads a local file from the session cwd",
     clientCapabilities: {},
-  });
-  const session = await clientConn.newSession({ cwd: dir, mcpServers: [] });
-  try {
-    const result = await clientConn.prompt({
-      sessionId: session.sessionId,
-      prompt: [{ type: "text", text: "read it" }],
-    });
+    readsClient: false,
+  },
+  {
+    name: "agent reads the client buffer with read-only fs capability",
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: false } },
+    readsClient: true,
+  },
+  {
+    name: "agent reads the client buffer with read/write fs capabilities",
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+    readsClient: true,
+  },
+] as const) {
+  test(`end-to-end tool call: ${name}`, async () => {
+    const { a, b } = pairedStreams();
+    const stub = new StubClient();
+    const dir = realpathSync(mkdtempSync(pathJoin(osTmpdir(), "glm-acp-integration-read-")));
+    writeFileSync(pathJoin(dir, "x.ts"), "export const x = 1;", "utf8");
+    stub.fileContents.set(pathJoin(dir, "x.ts"), "buffer contents");
 
-    assert.equal(result.stopReason, "end_turn");
-    assert.deepEqual(stub.reads, []);
+    let callIndex = 0;
+    const glm = {
+      async *streamChat(
+        messages: ReadonlyArray<{ role: string; content?: unknown }>
+      ): AsyncGenerator<GlmStreamChunk> {
+        callIndex++;
+        if (callIndex === 1) {
+          yield {
+            toolCall: {
+              id: "tc1",
+              name: "read_file",
+              arguments: JSON.stringify({ path: "x.ts" }),
+            },
+          };
+          yield { done: true, stopReason: "tool_calls" };
+        } else {
+          const toolMsg = messages.find((message) => message.role === "tool");
+          assert.ok(toolMsg, "expected the file read result in the second call");
+          assert.equal(toolMsg.content, readsClient ? "buffer contents" : "export const x = 1;");
+          yield { text: "Read it." };
+          yield { done: true, stopReason: "stop" };
+        }
+      },
+    };
 
-    // The client should have seen `tool_call` and `tool_call_update` notifications.
-    const updateKinds = stub.updates.map(
-      (u) => (u.update as { sessionUpdate: string }).sessionUpdate
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const _agentConn = new AgentSideConnection(
+      (conn) => new GlmAcpAgent(conn, { glm, sessionStore: null }),
+      a
     );
-    assert.ok(updateKinds.includes("tool_call"));
-    assert.ok(updateKinds.includes("tool_call_update"));
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
+    const clientConn = new ClientSideConnection(() => stub, b);
+
+    await clientConn.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities,
+    });
+    const session = await clientConn.newSession({ cwd: dir, mcpServers: [] });
+    try {
+      const result = await clientConn.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "read it" }],
+      });
+
+      assert.equal(result.stopReason, "end_turn");
+      assert.deepEqual(stub.reads, readsClient ? [{ path: pathJoin(dir, "x.ts") }] : []);
+
+      // The client should have seen `tool_call` and `tool_call_update` notifications.
+      const updateKinds = stub.updates.map(
+        (u) => (u.update as { sessionUpdate: string }).sessionUpdate
+      );
+      assert.ok(updateKinds.includes("tool_call"));
+      assert.ok(updateKinds.includes("tool_call_update"));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("end-to-end cancellation via session/cancel notification", async () => {
   const { a, b } = pairedStreams();

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { GlmAcpAgent } from "../protocol/agent.js";
@@ -2202,7 +2202,7 @@ test("prompt converts resource_link and embedded resource blocks", async () => {
 });
 
 test("tool call result is fed back into the next streamChat call", async () => {
-  const dir = mkdtempSync(pathJoin(osTmpdir(), "glm-agent-tool-read-"));
+  const dir = realpathSync(mkdtempSync(pathJoin(osTmpdir(), "glm-agent-tool-read-")));
   writeFileSync(pathJoin(dir, "x.ts"), "export const x = 1;", "utf8");
   const conn = createConnectionStub();
   // With both fs capabilities the executor reads the client's unsaved buffer.

@@ -4,8 +4,8 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { spawn } from "node:child_process";
 import type { Dirent } from "node:fs";
-import { lstat, opendir, writeFile } from "node:fs/promises";
-import { join as pathJoin, resolve as pathResolve } from "node:path";
+import { lstat, opendir, realpath, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join as pathJoin, relative, resolve as pathResolve, sep as pathSeparator } from "node:path";
 import { resolveApiKey } from "../llm/credentials.js";
 import {
   callZaiMcpTool,
@@ -168,8 +168,6 @@ export class ToolExecutor {
       HARD_READ_LIMIT,
       Math.max(1, Math.floor(limitArg) || DEFAULT_READ_LIMIT)
     );
-    const absolutePath = this.resolvePath(path);
-
     await this.connection.sessionUpdate({
       sessionId: this.sessionId,
       update: {
@@ -184,6 +182,7 @@ export class ToolExecutor {
     });
 
     try {
+      const absolutePath = await this.resolveConfinedReadPath(path);
       const page = await this.readTextPage(absolutePath, offset, limit);
       if (page.eof) {
         const content = `[end of file: offset ${offset} is beyond the end of ${path}]`;
@@ -423,7 +422,7 @@ export class ToolExecutor {
   }
 
   /**
-   * Mirror of performWrite for reads, used by read_file and edit_file: when the client
+   * Mirror of performWrite for edit_file reads: when the client
    * advertises BOTH `fs.readTextFile` and `fs.writeTextFile`, read through the
    * client so the edit is computed against the same contents the user sees (a
    * dirty editor buffer). Reading a client buffer we cannot write back would
@@ -445,7 +444,7 @@ export class ToolExecutor {
   }
 
   private async readTextPage(path: string, offset: number, limit: number): Promise<TextPage> {
-    if (this.clientCapabilities?.fs?.readTextFile && this.clientCapabilities?.fs?.writeTextFile) {
+    if (this.clientCapabilities?.fs?.readTextFile) {
       // ACP's line/limit form makes the editor responsible for paging. One
       // lookahead line tells us whether to advertise another request; no page
       // is misrepresented as a whole-buffer line count.
@@ -854,6 +853,38 @@ export class ToolExecutor {
 
   private resolvePath(path: string): string {
     return pathResolve(this.sessionCwd, path);
+  }
+
+  /** Validate confinement, preserving client buffer paths and canonicalizing local reads. */
+  private async resolveConfinedReadPath(path: string): Promise<string> {
+    if (isAbsolute(path)) {
+      throw new Error("absolute paths are not allowed");
+    }
+
+    const workspace = await realpath(this.sessionCwd);
+    const absolutePath = this.resolvePath(path);
+    let target: string;
+    try {
+      target = await realpath(absolutePath);
+    } catch (error) {
+      if (!this.clientCapabilities?.fs?.readTextFile || (error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+      // A new editor buffer may have no disk file yet. Only permit a missing
+      // leaf in an existing, confined parent; a dangling symlink is still an
+      // existing entry and must never use this fallback.
+      const entry = await lstat(absolutePath).catch((statError: NodeJS.ErrnoException) => {
+        if (statError.code === "ENOENT") return null;
+        throw statError;
+      });
+      if (entry) throw error;
+      target = pathJoin(await realpath(dirname(absolutePath)), basename(absolutePath));
+    }
+    const relativeTarget = relative(workspace, target);
+    if (isAbsolute(relativeTarget) || relativeTarget === ".." || relativeTarget.startsWith(`..${pathSeparator}`)) {
+      throw new Error("path must remain inside the session workspace");
+    }
+    return this.clientCapabilities?.fs?.readTextFile ? absolutePath : target;
   }
 
   private async webSearch(

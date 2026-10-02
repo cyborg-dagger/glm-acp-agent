@@ -57,7 +57,7 @@ ACP Client (IDE plugin, CLI, …)
         ├─ GlmClient   ← Z.AI / Zhipu AI Coding Plan Chat Completions  (src/llm/)
         │
         ├─ ToolExecutor ← executes tool calls  (src/tools/)
-        │    ├─ read_file / list_files        → ACP client fs for read_file when read/write are advertised, else Agent process (Node fs); read_file paginated (offset/limit)
+        │    ├─ read_file / list_files        → ACP client fs for read_file when reads are advertised, else Agent process (Node fs); read_file confined and paginated (offset/limit)
         │    ├─ write_file / edit_file        → ACP client fs when advertised (editor-buffer diffs), else Agent process (Node fs)
         │    ├─ list_files / run_command     → Agent process (Node fs / child_process)
         │    ├─ web_search / web_reader      → Z.AI Coding Plan Web MCP (HTTP)
@@ -67,7 +67,7 @@ ACP Client (IDE plugin, CLI, …)
         └─ VisionMcpClient ← spawns `npx @z_ai/mcp-server` on demand
 ```
 
-The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations use paths resolved against the ACP session working directory. When the client advertises `fs.writeTextFile`, writes and edits are routed through the ACP client so they render as native diffs. When it advertises both `fs.readTextFile` and `fs.writeTextFile`, `read_file` and edit-file reads also use the editor buffer; otherwise those reads fall back to the agent process filesystem. Writes and arbitrary shell commands still go through ACP `session/request_permission`, and the permission payload is always the **full** tool arguments — the user approves exactly what will run.
+The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations use paths resolved against the ACP session working directory. `read_file` accepts workspace-relative paths and rejects absolute paths or resolved targets outside the workspace, including escaping symlinks. When the client advertises `fs.readTextFile`, permitted `read_file` calls use the editor buffer, including new buffers whose parent directory exists inside the workspace; otherwise reads use the agent process filesystem. When the client advertises `fs.writeTextFile`, writes and edits are routed through the ACP client so they render as native diffs. Edit-file reads use the editor buffer when both filesystem capabilities are available, and otherwise read from disk. Writes and arbitrary shell commands still go through ACP `session/request_permission`, and the permission payload is always the **full** tool arguments — the user approves exactly what will run.
 
 Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` (and in the `read_file` content preview) are elided to a short head plus a character count. Model-facing tool results are also capped at a UTF-8 byte boundary; write payloads and permission requests remain complete. Progress narration lives in the `todowrite` task list rather than prose, and reasoning tokens are only forwarded as `agent_thought_chunk` when `ACP_GLM_STREAM_THINKING` is not `false` (the default preserves streaming).
 
@@ -77,7 +77,7 @@ Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` (a
 
 | Tool | Runs on | Permission behavior | Description |
 |------|---------|---------------------|-------------|
-| `read_file` | ACP client when both fs read/write capabilities are advertised, otherwise agent process | Always silent | Read a text file or editor buffer, paginated by offset/limit (default 2000 lines, capped at 5000). Local scans are byte-bounded; totals can be unknown and an incomplete line is never given a next offset. |
+| `read_file` | ACP client when fs read capability is advertised, otherwise agent process | Always silent | Read a workspace file or editor buffer using a relative path, paginated by offset/limit (default 2000 lines, capped at 5000). Escaping symlinks are rejected. Local scans are byte-bounded; totals can be unknown and an incomplete line is never given a next offset. |
 | `write_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Write or overwrite a text file. Silent in `accept_edits` and `bypass_permissions`. |
 | `edit_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Replace one exact, unique snippet in an existing file. It refuses an input or editor buffer over the read/edit budget, and re-validates after permission so concurrent edits are not overwritten. Silent in `accept_edits` and `bypass_permissions`. |
 | `todowrite` | Agent process | Always silent | Create or replace the session's structured task list so multi-step progress is tracked instead of narrated in chat. Each call replaces the list; the tool result renders it back to the model. |

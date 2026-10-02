@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -288,31 +288,151 @@ test("empty arguments string is accepted as empty object", async () => {
 // ---------------------------------------------------------------------------
 
 test("read_file reads from the agent process without fs.readTextFile capability", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-")));
   const path = join(dir, "note.txt");
   writeFileSync(path, "from disk", "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", { fs: {} });
+  const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir);
   try {
-    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "note.txt" }));
     assert.equal(result.content, "from disk");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
+test("read_file rejects absolute paths and parent-directory escapes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-confined-"));
+  const outside = `${dir}-secret.txt`;
+  writeFileSync(outside, "secret", "utf8");
+  try {
+    for (const caps of [{ fs: {} }, { fs: { readTextFile: true } }, FULL_CAPS]) {
+      const conn = createConnectionStub({ clientFileContent: "secret" });
+      const exec = new ToolExecutor(conn as never, "s1", caps, undefined, null, null, dir);
+      const absolute = await exec.execute(
+        "tc-absolute",
+        "read_file",
+        JSON.stringify({ path: outside })
+      );
+      assert.match(absolute.content, /absolute paths are not allowed/);
+
+      const parent = await exec.execute(
+        "tc-parent",
+        "read_file",
+        JSON.stringify({ path: `../${basename(outside)}` })
+      );
+      assert.match(parent.content, /path must remain inside the session workspace/);
+      assert.equal(conn.readTextFileCalls.length, 0);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { force: true });
+  }
+});
+
+test("read_file rejects symlinks whose targets escape the session workspace", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-symlink-"));
+  const outside = `${dir}-secret.txt`;
+  writeFileSync(outside, "secret", "utf8");
+  symlinkSync(outside, join(dir, "secret-link"));
+  try {
+    for (const caps of [{ fs: {} }, { fs: { readTextFile: true } }, FULL_CAPS]) {
+      const conn = createConnectionStub({ clientFileContent: "secret" });
+      const exec = new ToolExecutor(conn as never, "s1", caps, undefined, null, null, dir);
+      const result = await exec.execute(
+        "tc-symlink",
+        "read_file",
+        JSON.stringify({ path: "secret-link" })
+      );
+      assert.match(result.content, /path must remain inside the session workspace/);
+      assert.equal(conn.readTextFileCalls.length, 0);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { force: true });
+  }
+});
+
 test("read_file reads the client's unsaved buffer when both fs capabilities are available", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-client-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-client-")));
   const path = join(dir, "note.txt");
   writeFileSync(path, "stale disk", "utf8");
   const conn = createConnectionStub({ clientFileContent: "unsaved buffer" });
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
-    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "note.txt" }));
     assert.equal(result.content, "unsaved buffer");
     assert.deepEqual(conn.readTextFileCalls.map((call) => call.path), [path]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file uses a read-only client's unsaved buffer and preserves pagination", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-only-client-")));
+  writeFileSync(join(dir, "note.txt"), "stale disk", "utf8");
+  const conn = createConnectionStub({ clientFileContent: "buffer-1\nbuffer-2\nbuffer-3\nbuffer-4" });
+  const exec = new ToolExecutor(conn as never, "s1", { fs: { readTextFile: true } }, undefined, null, null, dir);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "note.txt", offset: 2, limit: 2 }));
+    assert.match(result.content, /^buffer-2\nbuffer-3\n/);
+    assert.match(result.content, /pass offset=4/);
+    assert.doesNotMatch(result.content, /stale disk|buffer-1|buffer-4/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file preserves a symlink workspace path when reading an editor buffer", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-alias-")));
+  const alias = `${dir}-alias`;
+  writeFileSync(join(dir, "note.txt"), "stale disk", "utf8");
+  symlinkSync(dir, alias, process.platform === "win32" ? "junction" : "dir");
+  const conn = createConnectionStub();
+  conn.readTextFile = async (params) => {
+    assert.equal(params.path, join(alias, "note.txt"));
+    return { content: "unsaved alias buffer" };
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, alias);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "note.txt" }));
+    assert.equal(result.content, "unsaved alias buffer");
+  } finally {
+    rmSync(alias, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file can read a new editor buffer inside the workspace", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-new-buffer-")));
+  const conn = createConnectionStub({ clientFileContent: "new unsaved buffer" });
+  const exec = new ToolExecutor(conn as never, "s1", { fs: { readTextFile: true } }, undefined, null, null, dir);
+  try {
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "new.txt" }));
+    assert.equal(result.content, "new unsaved buffer");
+    assert.equal(existsSync(join(dir, "new.txt")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file rejects new editor buffers behind escaping or dangling symlinks", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-new-escape-")));
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-outside-")));
+  const conn = createConnectionStub({ clientFileContent: "outside unsaved buffer" });
+  const exec = new ToolExecutor(conn as never, "s1", { fs: { readTextFile: true } }, undefined, null, null, dir);
+  try {
+    symlinkSync(outside, join(dir, "outside"), process.platform === "win32" ? "junction" : "dir");
+    symlinkSync(join(outside, "new.txt"), join(dir, "dangling"));
+    for (const path of ["outside/new.txt", "dangling"]) {
+      const result = await exec.execute(`tc-${path}`, "read_file", JSON.stringify({ path }));
+      assert.match(result.content, /Error reading file:/);
+      assert.doesNotMatch(result.content, /outside unsaved buffer/);
+    }
+    assert.equal(conn.readTextFileCalls.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
   }
 });
 
@@ -378,16 +498,16 @@ test("list_files and run_command execute in the agent process without terminal c
 // ---------------------------------------------------------------------------
 
 test("read_file truncates large files with a range marker", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-truncate-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-truncate-")));
   const path = join(dir, "big.txt");
   writeFileSync(path, Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n"), "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
     const first = await exec.execute(
       "tc1",
       "read_file",
-      JSON.stringify({ path, limit: 4 })
+      JSON.stringify({ path: "big.txt", limit: 4 })
     );
     assert.match(first.content, /line-1/);
     assert.match(first.content, /showing lines 1-4 of (10|11)/);
@@ -396,7 +516,7 @@ test("read_file truncates large files with a range marker", async () => {
     const second = await exec.execute(
       "tc2",
       "read_file",
-      JSON.stringify({ path, offset: 5, limit: 4 })
+      JSON.stringify({ path: "big.txt", offset: 5, limit: 4 })
     );
     assert.match(second.content, /line-5/);
     assert.doesNotMatch(second.content, /line-4\b/);
@@ -406,7 +526,7 @@ test("read_file truncates large files with a range marker", async () => {
 });
 
 test("read_file treats editor line pagination as pagination, not byte truncation", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-page-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-editor-page-")));
   const path = join(dir, "paged.txt");
   writeFileSync(path, "line-1\nline-2\nline-3\nline-4", "utf8");
   const updates: Array<Record<string, unknown>> = [];
@@ -419,12 +539,12 @@ test("read_file treats editor line pagination as pagination, not byte truncation
       return { content: lines.slice(line - 1, line - 1 + limit).join("\n") };
     },
   };
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
     const result = await exec.execute(
       "tc1",
       "read_file",
-      JSON.stringify({ path, limit: 2 }),
+      JSON.stringify({ path: "paged.txt", limit: 2 }),
     );
     assert.match(result.content, /showing lines 1-2 \(total unknown\); pass offset=3/);
     assert.doesNotMatch(result.content, /scan stopped at .*byte read limit/);
@@ -432,7 +552,7 @@ test("read_file treats editor line pagination as pagination, not byte truncation
     const next = await exec.execute(
       "tc2",
       "read_file",
-      JSON.stringify({ path, offset: 3, limit: 2 }),
+      JSON.stringify({ path: "paged.txt", offset: 3, limit: 2 }),
     );
     assert.match(next.content, /^line-3\nline-4(?:\n|$)/);
     assert.doesNotMatch(next.content, /line-1|line-2/);
@@ -442,7 +562,7 @@ test("read_file treats editor line pagination as pagination, not byte truncation
 });
 
 test("read_file renders EOF for a conforming editor at a short or empty offset", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-eof-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-editor-eof-")));
   const path = join(dir, "paged.txt");
   writeFileSync(path, "line-1\nline-2", "utf8");
   const conn = {
@@ -454,21 +574,21 @@ test("read_file renders EOF for a conforming editor at a short or empty offset",
       return { content: lines.slice(line - 1, line - 1 + limit).join("\n") };
     },
   };
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
-    const short = await exec.execute("tc1", "read_file", JSON.stringify({ path, offset: 1, limit: 4 }));
+    const short = await exec.execute("tc1", "read_file", JSON.stringify({ path: "paged.txt", offset: 1, limit: 4 }));
     assert.equal(short.content, "line-1\nline-2");
-    const empty = await exec.execute("tc2", "read_file", JSON.stringify({ path, offset: 3, limit: 2 }));
+    const empty = await exec.execute("tc2", "read_file", JSON.stringify({ path: "paged.txt", offset: 3, limit: 2 }));
     assert.match(empty.content, /end of file: offset 3 is beyond the end of/);
     assert.doesNotMatch(empty.content, /\(2 lines\)/);
-    const farPast = await exec.execute("tc3", "read_file", JSON.stringify({ path, offset: 100, limit: 2 }));
+    const farPast = await exec.execute("tc3", "read_file", JSON.stringify({ path: "paged.txt", offset: 100, limit: 2 }));
     assert.match(farPast.content, /end of file: offset 100 is beyond the end of/);
     assert.doesNotMatch(farPast.content, /99 lines/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("read_file paginates a legacy editor full buffer for a short offset page", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-legacy-page-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-editor-legacy-page-")));
   const path = join(dir, "paged.txt");
   writeFileSync(path, "line-1\nline-2\nline-3", "utf8");
   const updates: Array<Record<string, unknown>> = [];
@@ -479,12 +599,12 @@ test("read_file paginates a legacy editor full buffer for a short offset page", 
       return { content: "line-1\nline-2\nline-3" };
     },
   };
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
     const result = await exec.execute(
       "tc1",
       "read_file",
-      JSON.stringify({ path, offset: 2, limit: 2 }),
+      JSON.stringify({ path: "paged.txt", offset: 2, limit: 2 }),
     );
     assert.match(result.content, /^line-2\nline-3\n/);
     assert.doesNotMatch(result.content, /^line-1\n/);
@@ -495,7 +615,7 @@ test("read_file paginates a legacy editor full buffer for a short offset page", 
 });
 
 test("read_file treats a one-line legacy editor buffer as EOF past its only line", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-editor-legacy-single-line-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-editor-legacy-single-line-")));
   const path = join(dir, "single-line.txt");
   writeFileSync(path, "only-line", "utf8");
   const updates: Array<Record<string, unknown>> = [];
@@ -506,12 +626,12 @@ test("read_file treats a one-line legacy editor buffer as EOF past its only line
       return { content: "only-line" };
     },
   };
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
     const result = await exec.execute(
       "tc1",
       "read_file",
-      JSON.stringify({ path, offset: 2, limit: 2 }),
+      JSON.stringify({ path: "single-line.txt", offset: 2, limit: 2 }),
     );
     assert.match(result.content, /offset 2 is beyond the last line of .* \(1 line\)/);
     assert.doesNotMatch(result.content, /only-line/);
@@ -521,16 +641,16 @@ test("read_file treats a one-line legacy editor buffer as EOF past its only line
 });
 
 test("read_file final page reports end of file without a next-offset hint", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-final-page-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-final-page-")));
   const path = join(dir, "paged.txt");
   writeFileSync(path, Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n"), "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
     const last = await exec.execute(
       "tc1",
       "read_file",
-      JSON.stringify({ path, offset: 7, limit: 4 })
+      JSON.stringify({ path: "paged.txt", offset: 7, limit: 4 })
     );
     assert.match(last.content, /line-10/);
     assert.match(last.content, /showing lines 7-10 of 10/);
@@ -544,16 +664,16 @@ test("read_file final page reports end of file without a next-offset hint", asyn
 });
 
 test("read_file offset beyond EOF returns an EOF result without clamping or a hint", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-past-eof-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-past-eof-")));
   const path = join(dir, "paged.txt");
   writeFileSync(path, Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n"), "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
     const result = await exec.execute(
       "tc1",
       "read_file",
-      JSON.stringify({ path, offset: 11, limit: 4 })
+      JSON.stringify({ path: "paged.txt", offset: 11, limit: 4 })
     );
     assert.match(result.content, /end of file/);
     assert.match(result.content, /offset 11 is beyond the last line/);
@@ -568,7 +688,7 @@ test("read_file offset beyond EOF returns an EOF result without clamping or a hi
 });
 
 test("read_file labels a bounded partial line without reporting an impossible range", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-partial-line-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-partial-line-")));
   const path = join(dir, "partial.txt");
   writeFileSync(path, "abc\ndefgh", "utf8");
   const conn = createConnectionStub();
@@ -578,7 +698,7 @@ test("read_file labels a bounded partial line without reporting an impossible ra
   };
   const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir, () => "default", () => undefined, limits);
   try {
-    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path, offset: 2, limit: 1 }));
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "partial.txt", offset: 2, limit: 1 }));
     assert.match(result.content, /showing complete lines none/);
     assert.match(result.content, /line 2 is incomplete/);
     assert.doesNotMatch(result.content, /complete lines 2-1/);
@@ -589,13 +709,13 @@ test("read_file labels a bounded partial line without reporting an impossible ra
 });
 
 test("read_file elides the client content channel while the tool result stays full", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-elide-content-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-elide-content-")));
   const path = join(dir, "long.txt");
   writeFileSync(path, `${"a".repeat(400)}\nsecond line`, "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
-    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "long.txt" }));
     // The model receives the full page through the tool result...
     assert.ok(result.content.startsWith("a".repeat(400)));
     assert.match(result.content, /second line/);
@@ -614,7 +734,7 @@ test("read_file elides the client content channel while the tool result stays fu
 });
 
 test("read_file bounds a real large local result before it can enter model history", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-bounded-result-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-bounded-result-")));
   const path = join(dir, "large.txt");
   writeFileSync(path, "🙂".repeat(150_000), "utf8");
   const conn = createConnectionStub();
@@ -624,7 +744,7 @@ test("read_file bounds a real large local result before it can enter model histo
   };
   const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir, () => "default", () => undefined, limits);
   try {
-    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "large.txt" }));
     assert.ok(Buffer.byteLength(result.content, "utf8") <= limits.toolResultBytes);
     assert.match(result.content, /bytes omitted/);
     assert.ok(!result.content.includes("\uFFFD"));
@@ -634,13 +754,13 @@ test("read_file bounds a real large local result before it can enter model histo
 });
 
 test("read_file success path emits in_progress and completed updates", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-success-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-success-")));
   const path = join(dir, "x.txt");
   writeFileSync(path, "hello", "utf8");
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
-    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path }));
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "x.txt" }));
     assert.equal(result.content, "hello");
 
     const sequence = conn.updates.map(
@@ -659,11 +779,11 @@ test("read_file success path emits in_progress and completed updates", async () 
 });
 
 test("read_file failure is reported with status=failed and an error message", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "glm-executor-read-fail-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-fail-")));
   const conn = createConnectionStub();
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, dir);
   try {
-    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: join(dir, "missing.txt") }));
+    const result = await exec.execute("tc1", "read_file", JSON.stringify({ path: "missing.txt" }));
     assert.match(result.content, /Error reading file:/);
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "failed");
