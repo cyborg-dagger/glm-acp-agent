@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
 import { PACKAGE_VERSION } from "../package-version.js";
 import type { ChatCompletionContentPart } from "openai/resources/index.js";
@@ -55,6 +54,7 @@ import {
 } from "../llm/glm-client.js";
 import { ToolExecutor, type TodoItem } from "../tools/executor.js";
 import { ProcessSupervisor } from "../tools/process-supervisor.js";
+import { readLocalTextPrefix } from "../tools/file-reader.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
@@ -89,6 +89,9 @@ import {
  * files in their AGENTS.md.
  */
 const PROJECT_CONTEXT_CAP_CHARS = 8 * 1024;
+// Four UTF-8 bytes per character bounds disk I/O while retaining the existing
+// character cap even for non-ASCII project instructions.
+const PROJECT_CONTEXT_CAP_BYTES = PROJECT_CONTEXT_CAP_CHARS * 4;
 
 /**
  * ACP session mode identifiers. These control when the agent requests user
@@ -450,13 +453,15 @@ export class GlmAcpAgent implements Agent {
     try {
       const mcpTools = await setup.tools;
       const toolDefinitions = this.availableToolDefinitions(mcpTools);
+      const agentsMd = await loadProjectContext(params.cwd);
+      if (this.shuttingDown) throw new Error("Agent is shutting down");
 
     const systemPrompt: GlmMessage = {
       role: "system",
       content: buildSystemPrompt({
         cwd: params.cwd,
         tools: toolDefinitions.map((tool) => tool.function.name),
-        agentsMd: loadProjectContext(params.cwd),
+        agentsMd,
       }),
     };
 
@@ -1289,7 +1294,12 @@ export class GlmAcpAgent implements Agent {
         if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
           throw new Error(`Session fork cancelled: ${params.sessionId}`);
         }
-        const response = await this.createFork(params, persisted, provisional);
+        const agentsMd = await loadProjectContext(params.cwd, forkAbortController.signal);
+        if (this.shuttingDown) throw new Error("Agent is shutting down");
+        if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
+          throw new Error(`Session fork cancelled: ${params.sessionId}`);
+        }
+        const response = await this.createFork(params, persisted, provisional, agentsMd);
         provisional = null;
         return response;
       } finally {
@@ -1313,6 +1323,7 @@ export class GlmAcpAgent implements Agent {
     params: ForkSessionRequest,
     persisted: PersistedSession,
     mcpTools: SessionMcpTools,
+    agentsMd: string | undefined,
   ): Promise<ForkSessionResponse> {
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
@@ -1322,7 +1333,8 @@ export class GlmAcpAgent implements Agent {
     const forkedMessages = rebuildRestoredMessages(
       structuredClone(persisted.messages),
       params.cwd,
-      toolDefinitions
+      toolDefinitions,
+      agentsMd,
     );
     const forkLifecycle = new SessionLifecycle();
     const forked: SessionState = {
@@ -1447,6 +1459,8 @@ export class GlmAcpAgent implements Agent {
         }
 
         const toolDefinitions = this.availableToolDefinitions(provisional);
+        const agentsMd = await loadProjectContext(params.cwd, restoreAbortController.signal);
+        this.assertRestoreOwner(lifecycle, lease);
         // Configuration updates remain responsive while MCP setup is in
         // flight. Prompts are gated, so this second live projection keeps
         // those latest settings without reopening the history race.
@@ -1454,7 +1468,8 @@ export class GlmAcpAgent implements Agent {
         const restoredMessages = rebuildRestoredMessages(
           restoreSource.messages,
           params.cwd,
-          toolDefinitions
+          toolDefinitions,
+          agentsMd,
         );
         const restored: SessionState = {
           cwd: params.cwd,
@@ -2258,14 +2273,15 @@ export class GlmAcpAgent implements Agent {
 function rebuildRestoredMessages(
   messages: GlmMessage[],
   cwd: string,
-  toolDefinitions: ReadonlyArray<ToolDefinition>
+  toolDefinitions: ReadonlyArray<ToolDefinition>,
+  agentsMd: string | undefined,
 ): GlmMessage[] {
   const systemPrompt: GlmMessage = {
     role: "system",
     content: buildSystemPrompt({
       cwd,
       tools: toolDefinitions.map((tool) => tool.function.name),
-      agentsMd: loadProjectContext(cwd),
+      agentsMd,
     }),
   };
   return messages[0]?.role === "system"
@@ -2549,23 +2565,26 @@ function expandPromptCommand(
 
 /**
  * Read an `AGENTS.md` (preferred) or `CLAUDE.md` from the session's cwd, returning
- * its contents capped to {@link PROJECT_CONTEXT_CAP_CHARS} characters. Read errors
+ * its asynchronously read prefix capped to {@link PROJECT_CONTEXT_CAP_CHARS}
+ * characters and {@link PROJECT_CONTEXT_CAP_BYTES} bytes consumed. Read errors
  * (file missing, no permission, directory missing) are intentionally swallowed —
  * project context is optional, and a missing file is the common case.
  *
  * Called once at `newSession` time (not per prompt) so the project context is
  * stable across the conversation.
  */
-function loadProjectContext(cwd: string): string | undefined {
+async function loadProjectContext(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
   for (const filename of ["AGENTS.md", "CLAUDE.md"] as const) {
     let contents: string;
     try {
-      contents = readFileSync(pathJoin(cwd, filename), { encoding: "utf-8" });
+      contents = await readLocalTextPrefix(pathJoin(cwd, filename), PROJECT_CONTEXT_CAP_BYTES, signal);
     } catch {
+      if (signal?.aborted) throw new Error("The operation was aborted");
       continue;
     }
     if (contents.length > PROJECT_CONTEXT_CAP_CHARS) {
       contents = contents.slice(0, PROJECT_CONTEXT_CAP_CHARS);
+      if (/[\uD800-\uDBFF]$/.test(contents)) contents = contents.slice(0, -1);
     }
     return contents;
   }

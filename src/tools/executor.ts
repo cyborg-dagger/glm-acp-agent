@@ -69,6 +69,19 @@ const PREVIEW_WALK_BUDGET_BYTES = 262_144;
 /** Marker charged into objects/arrays when the walk budget is exhausted mid-container. */
 const PREVIEW_ELIDED_KEY = "[elided]";
 
+/** Count non-overlapping literal matches; snippet must be non-empty. */
+function countNonOverlappingMatches(text: string, snippet: string): number {
+  let count = 0;
+  for (
+    let index = text.indexOf(snippet);
+    index !== -1;
+    index = text.indexOf(snippet, index + snippet.length)
+  ) {
+    count += 1;
+  }
+  return count;
+}
+
 /** Format a bounded listing while measuring each candidate line only once. */
 export function formatDirectoryListing(
   header: string,
@@ -499,8 +512,7 @@ export class ToolExecutor {
       return this.permissionDenialResult(toolCallId, "Write", permissionResult);
     }
     if (this.signal?.aborted) {
-      await this.markFailed(toolCallId, "Cancelled by turn.");
-      return { content: "Write cancelled by turn." };
+      return this.cancelledEditOutcome(toolCallId, "Write cancelled by turn.");
     }
 
     // Step 3: move to in_progress and execute.
@@ -515,8 +527,7 @@ export class ToolExecutor {
 
     try {
       if (this.signal?.aborted) {
-        await this.markFailed(toolCallId, "Cancelled by turn.");
-        return { content: "Write cancelled by turn." };
+        return this.cancelledEditOutcome(toolCallId, "Write cancelled by turn.");
       }
       await this.performWrite(absolutePath, content);
 
@@ -583,6 +594,9 @@ export class ToolExecutor {
         const response = await this.connection.readTextFile({
           sessionId: this.sessionId, path, line, limit: pageLimit,
         } as never);
+        if (Buffer.byteLength(response.content, "utf8") > this.resourceLimits.fileReadBytes) {
+          throw new Error(`editor buffer exceeds the ${this.resourceLimits.fileReadBytes}-byte read/edit limit`);
+        }
         const lines = response.content.split("\n");
         if (lines.length > 0 && lines.at(-1) === "") lines.pop();
         return lines;
@@ -669,7 +683,7 @@ export class ToolExecutor {
       return { content: `Error editing file: cannot read ${path}: ${message}` };
     }
 
-    const occurrences = current.split(oldText).length - 1;
+    const occurrences = countNonOverlappingMatches(current, oldText);
     if (occurrences === 0) {
       await this.markFailed(toolCallId, "old_text not found in file");
       return {
@@ -699,31 +713,7 @@ export class ToolExecutor {
       return this.permissionDenialResult(toolCallId, "Edit", permissionResult);
     }
     if (this.signal?.aborted) {
-      await this.markFailed(toolCallId, "Cancelled by turn.");
-      return { content: "Edit cancelled by turn." };
-    }
-
-    // The permission prompt can sit in front of the user for a while; re-read
-    // and re-validate so a buffer edited while deciding is not silently
-    // overwritten by this stale snapshot.
-    let latest: string;
-    try {
-      latest = await this.performRead(absolutePath);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await this.markFailed(toolCallId, message);
-      return { content: `Error editing file: cannot re-read ${path}: ${message}` };
-    }
-    const latestOccurrences = latest.split(oldText).length - 1;
-    if (latestOccurrences !== 1) {
-      const reason =
-        latestOccurrences === 0
-          ? "`old_text` is no longer present"
-          : `\`old_text\` now occurs ${latestOccurrences} times`;
-      await this.markFailed(toolCallId, `file changed while waiting for permission (${reason})`);
-      return {
-        content: `Error editing file: ${path} changed while waiting for permission (${reason}). Re-read the file and retry.`,
-      };
+      return this.cancelledEditOutcome(toolCallId, "Edit cancelled by turn.");
     }
 
     await this.announceToolCall({
@@ -734,11 +724,37 @@ export class ToolExecutor {
         status: "in_progress",
       },
     });
+    if (this.signal?.aborted) {
+      return this.cancelledEditOutcome(toolCallId, "Edit cancelled by turn.");
+    }
+
+    // Both permission and progress delivery can wait on the client. Re-read
+    // after those waits so the edit includes changes already in the buffer.
+    // ACP writes replace the whole buffer without a version precondition;
+    // this remains an optimistic read/write, not an atomic compare-and-swap.
+    let latest: string;
+    try {
+      latest = await this.performRead(absolutePath);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.markFailed(toolCallId, message);
+      return { content: `Error editing file: cannot re-read ${path}: ${message}` };
+    }
+    const latestOccurrences = countNonOverlappingMatches(latest, oldText);
+    if (latestOccurrences !== 1) {
+      const reason =
+        latestOccurrences === 0
+          ? "`old_text` is no longer present"
+          : `\`old_text\` now occurs ${latestOccurrences} times`;
+      await this.markFailed(toolCallId, `file changed while waiting for permission or progress delivery (${reason})`);
+      return {
+        content: `Error editing file: ${path} changed while waiting for permission or progress delivery (${reason}). Re-read the file and retry.`,
+      };
+    }
 
     try {
       if (this.signal?.aborted) {
-        await this.markFailed(toolCallId, "Cancelled by turn.");
-        return { content: "Edit cancelled by turn." };
+        return this.cancelledEditOutcome(toolCallId, "Edit cancelled by turn.");
       }
       await this.performWrite(absolutePath, latest.replace(oldText, () => newText));
 
@@ -1313,6 +1329,16 @@ export class ToolExecutor {
         rawOutput: elideForPreview({ error: message }),
       },
     });
+  }
+
+  /**
+   * Shared abort outcome for write_file and edit_file: mark the call failed
+   * and return the cancelled result. Callers still gate on
+   * `this.signal?.aborted` so the check itself stays inline.
+   */
+  private async cancelledEditOutcome(toolCallId: string, content: string): Promise<ToolResult> {
+    await this.markFailed(toolCallId, "Cancelled by turn.");
+    return { content };
   }
 
   /**
