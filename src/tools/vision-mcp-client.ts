@@ -421,11 +421,14 @@ export class StdioVisionMcpClient implements VisionMcpClient {
       if (parsed.jsonrpc !== undefined && parsed.jsonrpc !== "2.0") continue;
       if (Object.hasOwn(parsed, "result") === Object.hasOwn(parsed, "error")) continue;
       const error = parsed.error;
-      if (Object.hasOwn(parsed, "error") && (
-        error === null || typeof error !== "object" || Array.isArray(error) ||
-        (error.message !== undefined && typeof error.message !== "string") ||
-        (error.code !== undefined && typeof error.code !== "string" && typeof error.code !== "number")
-      )) continue;
+      if (Object.hasOwn(parsed, "error")) {
+        if (error === null || typeof error !== "object" || Array.isArray(error)) continue;
+        // An error object without a usable message or code would reject the
+        // call with a garbage message; skip it so the valid reply settles.
+        const hasUsableMessage = typeof error.message === "string";
+        const hasUsableCode = typeof error.code === "string" || typeof error.code === "number";
+        if (!hasUsableMessage && !hasUsableCode) continue;
+      }
       const pending = this.pending.get(parsed.id);
       if (!pending) continue;
       this.pending.delete(parsed.id);

@@ -72,6 +72,8 @@ for (const adapter of adapters) {
         { jsonrpc: "2.0", id: request.id, error: "bad" },
         { jsonrpc: "2.0", id: request.id, error: { message: {} } },
         { jsonrpc: "2.0", id: request.id, error: { code: [] } },
+        { jsonrpc: "2.0", id: request.id, error: {} },
+        { jsonrpc: "2.0", id: request.id, error: { unexpected: 1 } },
         { jsonrpc: "1.0", id: request.id, result: "wrong version" },
       ]) process.stdout.write(JSON.stringify(invalid) + "\\n");
     `), `
