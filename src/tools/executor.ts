@@ -567,6 +567,9 @@ export class ToolExecutor {
         const response = await this.connection.readTextFile({
           sessionId: this.sessionId, path, line, limit: pageLimit,
         } as never);
+        if (Buffer.byteLength(response.content, "utf8") > this.resourceLimits.fileReadBytes) {
+          throw new Error(`editor buffer exceeds the ${this.resourceLimits.fileReadBytes}-byte read/edit limit`);
+        }
         const lines = response.content.split("\n");
         if (lines.length > 0 && lines.at(-1) === "") lines.pop();
         return lines;
