@@ -485,8 +485,7 @@ export class ToolExecutor {
       return this.permissionDenialResult(toolCallId, "Write", permissionResult);
     }
     if (this.signal?.aborted) {
-      await this.markFailed(toolCallId, "Cancelled by turn.");
-      return { content: "Write cancelled by turn." };
+      return this.cancelledEditOutcome(toolCallId, "Write cancelled by turn.");
     }
 
     // Step 3: move to in_progress and execute.
@@ -501,8 +500,7 @@ export class ToolExecutor {
 
     try {
       if (this.signal?.aborted) {
-        await this.markFailed(toolCallId, "Cancelled by turn.");
-        return { content: "Write cancelled by turn." };
+        return this.cancelledEditOutcome(toolCallId, "Write cancelled by turn.");
       }
       await this.performWrite(absolutePath, content);
 
@@ -683,8 +681,7 @@ export class ToolExecutor {
       return this.permissionDenialResult(toolCallId, "Edit", permissionResult);
     }
     if (this.signal?.aborted) {
-      await this.markFailed(toolCallId, "Cancelled by turn.");
-      return { content: "Edit cancelled by turn." };
+      return this.cancelledEditOutcome(toolCallId, "Edit cancelled by turn.");
     }
 
     await this.connection.sessionUpdate({
@@ -696,8 +693,7 @@ export class ToolExecutor {
       },
     });
     if (this.signal?.aborted) {
-      await this.markFailed(toolCallId, "Cancelled by turn.");
-      return { content: "Edit cancelled by turn." };
+      return this.cancelledEditOutcome(toolCallId, "Edit cancelled by turn.");
     }
 
     // Both permission and progress delivery can wait on the client. Re-read
@@ -726,8 +722,7 @@ export class ToolExecutor {
 
     try {
       if (this.signal?.aborted) {
-        await this.markFailed(toolCallId, "Cancelled by turn.");
-        return { content: "Edit cancelled by turn." };
+        return this.cancelledEditOutcome(toolCallId, "Edit cancelled by turn.");
       }
       await this.performWrite(absolutePath, latest.replace(oldText, () => newText));
 
@@ -1297,6 +1292,16 @@ export class ToolExecutor {
         rawOutput: elideForPreview({ error: message }),
       },
     });
+  }
+
+  /**
+   * Shared abort outcome for write_file and edit_file: mark the call failed
+   * and return the cancelled result. Callers still gate on
+   * `this.signal?.aborted` so the check itself stays inline.
+   */
+  private async cancelledEditOutcome(toolCallId: string, content: string): Promise<ToolResult> {
+    await this.markFailed(toolCallId, "Cancelled by turn.");
+    return { content };
   }
 
   /**
