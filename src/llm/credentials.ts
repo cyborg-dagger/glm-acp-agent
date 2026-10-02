@@ -1,4 +1,13 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  ftruncateSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { debug, maskSecret } from "./logger.js";
@@ -69,5 +78,12 @@ export function writeCredentials(apiKey: string, path: string = credentialsPath(
   }
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const body: CredentialsFile = { z_ai_api_key: apiKey };
-  writeFileSync(path, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
+  const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT, 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    ftruncateSync(fd, 0);
+    writeFileSync(fd, JSON.stringify(body, null, 2) + "\n", "utf8");
+  } finally {
+    closeSync(fd);
+  }
 }

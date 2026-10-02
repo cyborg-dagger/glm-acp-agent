@@ -53,9 +53,12 @@ import {
   type ThoughtLevel,
 } from "../llm/glm-client.js";
 import { ToolExecutor, type TodoItem } from "../tools/executor.js";
+import { ProcessSupervisor } from "../tools/process-supervisor.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
+import { SessionLifecycle, type TransitionLease } from "./session-lifecycle.js";
+import { checkModelTransition } from "./model-transition.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import {
   discoverSlashCommands,
@@ -67,6 +70,15 @@ import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
 import { debug, error, isDebugEnabled } from "../llm/logger.js";
+import { validateStreamCompletion } from "../llm/stream-state.js";
+import {
+  appendCompactionNote,
+  assertValidHistory,
+  compactToBudget,
+  estimateMessagesTokens,
+  estimateSerializedTokens,
+  type ContextBudget,
+} from "./context-budget.js";
 
 /**
  * Maximum bytes of AGENTS.md / CLAUDE.md to embed in the system prompt.
@@ -146,6 +158,12 @@ interface SessionState {
    * to observe its abort before mutating shared session state.
    */
   promptPromise: Promise<void> | null;
+  /** True while closeSession is waiting for the active prompt to unwind. */
+  closing: boolean;
+  /** True after closeSession has disposed and removed this session. */
+  closed: boolean;
+  /** De-duplicates MCP cleanup between closeSession and agent shutdown. */
+  disposePromise: Promise<void> | null;
   title: string | null;
   updatedAt: string;
   /** Active model for this session (clients can change via `session/set_model`). */
@@ -172,6 +190,23 @@ interface SessionState {
    * own. Serialized to indices at save time and rebuilt on load.
    */
   displayText: WeakMap<GlmMessage, string>;
+  /** Synchronous gate for replacement and close transitions. */
+  lifecycle: SessionLifecycle;
+}
+
+interface SessionTransition {
+  lifecycle: SessionLifecycle;
+  promise: Promise<unknown> | null;
+  closePromise: Promise<void> | null;
+  original: SessionState | null;
+  restoreAbortController: AbortController | null;
+}
+
+/** A connected MCP client that remains agent-owned until its session installs it. */
+interface PendingMcpSetup {
+  tools: Promise<SessionMcpTools>;
+  release: () => void;
+  dispose: () => Promise<void>;
 }
 
 /** ACP stop reasons that the prompt loop can produce internally. */
@@ -188,6 +223,7 @@ export interface GlmAcpAgentOptions {
       signal?: AbortSignal,
       options?: StreamChatOptions
     ) => AsyncIterable<GlmStreamChunk>;
+    getMaxOutputTokens?: () => number;
   };
   /**
    * Maximum number of model/tool turns per single prompt. Default 100,
@@ -208,6 +244,14 @@ export interface GlmAcpAgentOptions {
    * on first use.
    */
   visionClient?: VisionMcpClient | null;
+  /** Test-only override for the bounded live-restore prompt drain. */
+  sessionDrainTimeoutMs?: number;
+  /** Override session MCP setup for deterministic lifecycle tests. */
+  connectSessionMcpServers?: typeof connectSessionMcpServers;
+  /** Override session MCP setup for shutdown/lifecycle tests. */
+  mcpConnector?: (servers: Parameters<typeof connectSessionMcpServers>[0], signal?: AbortSignal) => Promise<SessionMcpTools>;
+  /** Test-only override for the bounded shutdown prompt-drain deadline. */
+  shutdownDrainTimeoutMs?: number;
 }
 
 /**
@@ -253,6 +297,15 @@ export class GlmAcpAgent implements Agent {
   private sessionStore: SessionStore | null;
   private _visionClient: VisionMcpClient | null;
   private visionClientExplicit: boolean;
+  private sessionDrainTimeoutMs: number;
+  private connectMcpServers: typeof connectSessionMcpServers;
+  private transitions = new Map<string, SessionTransition>();
+  private readonly mcpConnector: NonNullable<GlmAcpAgentOptions["mcpConnector"]>;
+  private readonly pendingSetups = new Set<PendingMcpSetup>();
+  private readonly processSupervisor = new ProcessSupervisor();
+  private shuttingDown = false;
+  private shutdownPromise: Promise<void> | null = null;
+  private readonly shutdownDrainTimeoutMs: number;
 
   constructor(
     private connection: AgentSideConnection,
@@ -269,6 +322,10 @@ export class GlmAcpAgent implements Agent {
         : (options.sessionStore ?? new SessionStore());
     this.visionClientExplicit = "visionClient" in options;
     this._visionClient = options.visionClient ?? null;
+    this.sessionDrainTimeoutMs = options.sessionDrainTimeoutMs ?? 30_000;
+    this.mcpConnector = options.mcpConnector ?? options.connectSessionMcpServers ?? connectSessionMcpServers;
+    this.connectMcpServers = this.mcpConnector;
+    this.shutdownDrainTimeoutMs = options.shutdownDrainTimeoutMs ?? 4_000;
     this.streamThinking = process.env["ACP_GLM_STREAM_THINKING"]?.toLowerCase() !== "false";
   }
 
@@ -375,10 +432,13 @@ export class GlmAcpAgent implements Agent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    if (this.shuttingDown) throw new Error("Agent is shutting down");
     const sessionId = randomUUID();
     debug(`newSession: id=${sessionId} cwd=${params.cwd} model=${getDefaultModel()}`);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers);
-    const toolDefinitions = this.availableToolDefinitions(mcpTools);
+    const setup = this.connectMcpForSession(params.mcpServers);
+    try {
+      const mcpTools = await setup.tools;
+      const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const systemPrompt: GlmMessage = {
       role: "system",
@@ -395,11 +455,22 @@ export class GlmAcpAgent implements Agent {
     // default (thinking on, no explicit reasoning_effort).
     const thoughtLevel = resolveThoughtLevel(model, "max");
 
+    const lifecycle = new SessionLifecycle();
+    this.transitions.set(sessionId, {
+      lifecycle,
+      promise: null,
+      closePromise: null,
+      original: null,
+      restoreAbortController: null,
+    });
     this.sessions.set(sessionId, {
       cwd: params.cwd,
       messages: [systemPrompt],
       abortController: null,
       promptPromise: null,
+      closing: false,
+      closed: false,
+      disposePromise: null,
       title: null,
       updatedAt: new Date().toISOString(),
       model,
@@ -409,16 +480,23 @@ export class GlmAcpAgent implements Agent {
       thoughtLevel,
       commands: discoverSlashCommands(params.cwd),
       displayText: new WeakMap(),
-    });
+      lifecycle,
+      });
 
-    this.scheduleAvailableCommands(sessionId);
+      this.scheduleAvailableCommands(sessionId);
 
-    return {
-      sessionId,
-      models: this.modelsState(model),
-      modes: this.modesState("default"),
-      configOptions: this.configOptionsState(model, thoughtLevel, "default"),
-    };
+      return {
+        sessionId,
+        models: this.modelsState(model),
+        modes: this.modesState("default"),
+        configOptions: this.configOptionsState(model, thoughtLevel, "default"),
+      };
+    } catch (error) {
+      await setup.dispose();
+      throw error;
+    } finally {
+      setup.release();
+    }
   }
 
   /**
@@ -457,6 +535,7 @@ export class GlmAcpAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
+    this.assertConfigurable(params.sessionId, session);
     await this.applySessionModel(params.sessionId, session, params.modelId);
     return {};
   }
@@ -474,6 +553,14 @@ export class GlmAcpAgent implements Agent {
     session: SessionState,
     modelId: string
   ): Promise<void> {
+    if (session.closing || session.closed) throw new Error(`Session is closing: ${sessionId}`);
+    const compatibility = checkModelTransition(session.messages, modelId);
+    if (!compatibility.ok) throw new Error(compatibility.message);
+    // A native-image prompt may still be preprocessing and not yet appear in
+    // history. Keep its selected input capability fixed through that turn.
+    if (session.promptPromise && isVisionNativeModel(session.model) && !isVisionNativeModel(modelId)) {
+      throw new Error("Cannot switch away from an image-capable model during an active prompt. Wait for the prompt to finish and try again.");
+    }
     const available = getAvailableModels();
     const known = available.find((m) => m.modelId === modelId);
     if (!known) {
@@ -582,6 +669,7 @@ export class GlmAcpAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
+    this.assertConfigurable(params.sessionId, session);
     if (params.configId === "mode") {
       // Same reject-don't-coerce policy as thought_level below.
       if (!isSessionModeId(params.value)) {
@@ -682,6 +770,7 @@ export class GlmAcpAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
+    this.assertConfigurable(params.sessionId, session);
     if (!isSessionModeId(params.modeId)) {
       throw new Error(
         `Invalid modeId: ${params.modeId}. Valid modes are: ${SESSION_MODE_IDS.join(", ")}`
@@ -721,28 +810,29 @@ export class GlmAcpAgent implements Agent {
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const session = this.sessions.get(params.sessionId);
-    if (!session) {
+    if (!session || session.closing || session.closed) {
       throw new Error(`Session not found: ${params.sessionId}`);
     }
-
-    // The ACP spec serializes prompts per-session – the client should not send
-    // a new prompt while another is running. Defensively cancel any stale
-    // controller and wait for the previous loop to fully unwind so it stops
-    // mutating session.messages or emitting updates before we start the new
-    // one.
-    if (session.abortController) {
-      session.abortController.abort();
+    if (!session.lifecycle.acceptsPrompts()) {
+      throw new Error(`Session transition in progress: ${params.sessionId}`);
     }
-    if (session.promptPromise) {
-      try {
-        await session.promptPromise;
-      } catch {
-        // The previous loop's failure is already reported back to its caller.
-      }
-    }
+    const generation = session.lifecycle.generation;
+    const ownsPrompt = () => this.ownsSession(params.sessionId, session, generation);
+    const preservesDrainingHistory = () => this.isDrainingOriginal(params.sessionId, session);
 
+    // Reserve this lifecycle synchronously, before preprocessing can await.
+    // Every queued prompt gets a distinct promise and chains behind the prompt
+    // that was current when it arrived; otherwise several callers can all
+    // resume from one old promise and enter the model concurrently.
+    const predecessor = session.promptPromise;
+    session.abortController?.abort();
     const abortController = new AbortController();
     session.abortController = abortController;
+    let resolvePromptPromise!: () => void;
+    const promptPromise = new Promise<void>((resolve) => {
+      resolvePromptPromise = resolve;
+    });
+    session.promptPromise = promptPromise;
 
     // Abort the prompt automatically if the underlying connection closes.
     const onConnectionClose = () => abortController.abort();
@@ -753,59 +843,79 @@ export class GlmAcpAgent implements Agent {
       abortController.abort();
     }
 
-    // Convert ACP content blocks into a GLM user message. Most models receive
-    // plain text, with images preprocessed through Vision MCP. Native vision
-    // models receive OpenAI-style multimodal content parts directly.
-    if (isDebugEnabled()) {
-      for (const line of buildPromptBlockDiagnosticLines(params.prompt)) {
-        debug(line);
-      }
-    }
-    // Clients invoke an advertised command by sending `/name …` as ordinary
-    // prompt text, so expand it here into the instructions its definition
-    // holds. Unknown `/foo` is left alone and reaches the model as prose.
-    const promptBlocks = expandPromptCommand(params.prompt, session.commands);
-    const visionNative = isVisionNativeModel(session.model);
-    const preprocessed = visionNative
-      ? { blocks: promptBlocks, cleanups: [] }
-      : await preprocessImageBlocks(
-          promptBlocks,
-          this.visionClient,
-          abortController.signal
-        );
-    const userContent = visionNative
-      ? renderVisionNativePromptBlocks(preprocessed.blocks)
-      : renderPromptBlocks(preprocessed.blocks).content;
-    const userMessage: GlmMessage = { role: "user", content: userContent };
-    session.messages.push(userMessage);
-
-    // What the user typed, rendered from the blocks as they arrived — before
-    // command expansion and image analysis rewrote them for the model. Kept
-    // separately so `session/load` replays the conversation the user had (and
-    // the title names it), not the one the model saw. Persisted only when the
-    // two actually diverge.
-    const displayText = renderPromptBlocks(params.prompt).plainText;
-    if (displayText !== stringifyUserMessage(userContent)) {
-      session.displayText.set(userMessage, displayText);
-    }
-
     // Echo back the client-supplied messageId on every response (success,
     // cancelled, or error) so the client can correlate the turn.
     const userMessageId = params.messageId ?? undefined;
 
-    let resolvePromptPromise!: () => void;
-    session.promptPromise = new Promise<void>((resolve) => {
-      resolvePromptPromise = resolve;
-    });
+    let preprocessed: { blocks: PromptRequest["prompt"]; cleanups: Array<() => Promise<void>> } | undefined;
+    const cancelledResponse = (): PromptResponse => {
+      const cancelled: PromptResponse = { stopReason: "cancelled" };
+      if (userMessageId) cancelled.userMessageId = userMessageId;
+      return cancelled;
+    };
 
     try {
+      if (predecessor) {
+        try {
+          await predecessor;
+        } catch {
+          // A previous loop's failure is already reported to its caller.
+        }
+      }
+      if (abortController.signal.aborted || !ownsPrompt()) {
+        return cancelledResponse();
+      }
+
+      // Convert ACP content blocks into a GLM user message. Most models receive
+      // plain text, with images preprocessed through Vision MCP. Native vision
+      // models receive OpenAI-style multimodal content parts directly.
+      if (isDebugEnabled()) {
+        for (const line of buildPromptBlockDiagnosticLines(params.prompt)) {
+          debug(line);
+        }
+      }
+      // Clients invoke an advertised command by sending `/name …` as ordinary
+      // prompt text, so expand it here into the instructions its definition
+      // holds. Unknown `/foo` is left alone and reaches the model as prose.
+      const promptBlocks = expandPromptCommand(params.prompt, session.commands);
+      const visionNative = isVisionNativeModel(session.model);
+      preprocessed = visionNative
+        ? { blocks: promptBlocks, cleanups: [] }
+        : await preprocessImageBlocks(
+            promptBlocks,
+            this.visionClient,
+            abortController.signal
+          );
+      if (abortController.signal.aborted || !ownsPrompt()) {
+        return cancelledResponse();
+      }
+      const userContent = visionNative
+        ? renderVisionNativePromptBlocks(preprocessed.blocks)
+        : renderPromptBlocks(preprocessed.blocks).content;
+      const userMessage: GlmMessage = { role: "user", content: userContent };
+      session.messages.push(userMessage);
+
+      // What the user typed, rendered from the blocks as they arrived — before
+      // command expansion and image analysis rewrote them for the model. Kept
+      // separately so `session/load` replays the conversation the user had.
+      const displayText = renderPromptBlocks(params.prompt).plainText;
+      if (displayText !== stringifyUserMessage(userContent)) {
+        session.displayText.set(userMessage, displayText);
+      }
+
       const { stopReason, usage } = await this.runPromptLoop(
         params.sessionId,
-        session,
-        abortController.signal
+      session,
+      abortController.signal,
+      ownsPrompt,
+      preservesDrainingHistory,
+      this.processSupervisor
       );
 
-      session.abortController = null;
+      if (!ownsPrompt()) {
+        return cancelledResponse();
+      }
+      if (session.abortController === abortController) session.abortController = null;
       session.updatedAt = new Date().toISOString();
 
       // Emit a session_info_update with the (possibly first-set) title and
@@ -841,32 +951,32 @@ export class GlmAcpAgent implements Agent {
       error(`prompt error: session=${params.sessionId}`, err instanceof Error ? err.message : String(err));
       // If the abort happened concurrently with another error, prefer the
       // cancelled stop reason – that's what the spec asks for.
-      if (abortController.signal.aborted) {
-        session.abortController = null;
-        const cancelled: PromptResponse = { stopReason: "cancelled" };
-        if (userMessageId) cancelled.userMessageId = userMessageId;
-        return cancelled;
+      if (abortController.signal.aborted || !ownsPrompt()) {
+        return cancelledResponse();
       }
-      session.abortController = null;
       // Surface the error to the user as an agent message so the IDE displays
       // something instead of a silent JSON-RPC error.
       const message = err instanceof Error ? err.message : String(err);
-      await safeSessionUpdate(this.connection, {
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: `\n\n[error] ${message}` },
-        },
-      });
+      if (ownsPrompt()) {
+        await safeSessionUpdate(this.connection, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `\n\n[error] ${message}` },
+          },
+        });
+      }
       throw err;
     } finally {
       connSignal?.removeEventListener("abort", onConnectionClose);
-      // Always resolve the promptPromise so a subsequent prompt can proceed.
-      session.promptPromise = null;
-      resolvePromptPromise();
       for (const cleanup of preprocessed?.cleanups ?? []) {
         try { await cleanup(); } catch { /* best effort */ }
       }
+      // A newer queued prompt may own these fields already. Only the owner
+      // may clear them, and resolution follows all preprocessing/cleanup.
+      if (session.abortController === abortController) session.abortController = null;
+      if (session.promptPromise === promptPromise) session.promptPromise = null;
+      resolvePromptPromise();
     }
   }
 
@@ -876,18 +986,146 @@ export class GlmAcpAgent implements Agent {
   }
 
   async closeSession(params: CloseSessionRequest): Promise<void> {
-    const session = this.sessions.get(params.sessionId);
-    session?.abortController?.abort();
-    if (session) {
-      // Persist final state on close so a subsequent loadSession/resume can
-      // pick the conversation back up. closeSession only releases in-memory
-      // resources; the on-disk record is intentionally retained.
-      this.persistSession(params.sessionId, session);
-      await session.mcpTools?.dispose();
+    const transition = this.transitions.get(params.sessionId);
+    const initial = this.sessions.get(params.sessionId);
+    if (!transition && !initial) return;
+    const record = transition ?? this.registerTransition(params.sessionId, initial!.lifecycle);
+    if (record.closePromise) return record.closePromise;
+
+    if (record.lifecycle.phase === "open") {
+      record.lifecycle.begin("closing");
+    } else {
+      // This also records a close for an unloaded session: the record exists
+      // even while restore has not yet installed its replacement state.
+      record.lifecycle.requestClose();
     }
-    this.sessions.delete(params.sessionId);
-    // Session is gone from memory; its task list must not linger in the map.
-    this.sessionTodos.delete(params.sessionId);
+    record.restoreAbortController?.abort();
+    initial?.abortController?.abort();
+    const closePromise = (async () => {
+      const pendingTransition = record.promise;
+      if (pendingTransition) {
+        try { await pendingTransition; } catch { /* close owns final cleanup */ }
+      }
+
+      // Restore may have swapped while this close was waiting. Resolve the
+      // current map entry now; never dispose or delete a stale captured state.
+      const current = this.sessions.get(params.sessionId);
+      if (current) {
+        current.closing = true;
+        current.abortController?.abort();
+        if (current.promptPromise) {
+          try { await current.promptPromise; } catch { /* resolves in prompt finally */ }
+        }
+        current.closed = true;
+        this.persistSession(params.sessionId, current);
+        await this.disposeSessionTools(current);
+        if (this.sessions.get(params.sessionId) === current) {
+          this.sessions.delete(params.sessionId);
+        }
+        this.sessionTodos.delete(params.sessionId);
+      }
+      if (this.transitions.get(params.sessionId) === record) {
+        this.transitions.delete(params.sessionId);
+      }
+    })();
+    record.closePromise = closePromise;
+    return closePromise;
+  }
+
+  /**
+   * Stop admitting work and release all resources owned by this ACP runtime.
+   * Concurrent close/signal paths share one promise so disposals and process
+   * termination happen once.
+   */
+  shutdown(_reason: "disconnect" | "sigterm" | "sigint" | "fatal"): Promise<void> {
+    void _reason;
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shuttingDown = true;
+    this.shutdownPromise = (async () => {
+      const sessions = [...this.sessions.entries()];
+
+      // Close the lifecycle gates synchronously before aborting prompts. This
+      // makes the in-flight loop retain canonical partial history while its
+      // owned connection suppresses all late UI chunks.
+      for (const [sessionId, record] of this.transitions) {
+        if (record.lifecycle.phase === "open") record.lifecycle.begin("closing");
+        else record.lifecycle.requestClose();
+        record.restoreAbortController?.abort();
+        void sessionId;
+      }
+      for (const [, session] of sessions) {
+        const record = [...this.transitions.values()].find((candidate) => candidate.lifecycle === session.lifecycle);
+        if (record && record.lifecycle.phase === "open") record.lifecycle.begin("closing");
+        else record?.lifecycle.requestClose();
+        record?.restoreAbortController?.abort();
+        session.closing = true;
+        session.abortController?.abort();
+      }
+
+      await this.processSupervisor.terminateAll();
+      const deadlineMs = this.shutdownDrainTimeoutMs;
+      const promptsSettled = await Promise.all(sessions.map(([, session]) =>
+        session.promptPromise
+          ? settlesWithin(session.promptPromise, deadlineMs)
+          : Promise.resolve(true),
+      ));
+
+      const transitions = [...this.transitions.values()]
+        .map((record) => record.promise)
+        .filter((promise): promise is Promise<unknown> => promise !== null);
+      const closes = [...this.transitions.values()]
+        .map((record) => record.closePromise)
+        .filter((close): close is Promise<void> => close !== null);
+      const setups = [...this.pendingSetups].map((setup) => setup.dispose());
+      const auxDrained = await settlesWithin(
+        Promise.allSettled([...transitions, ...closes, ...setups]),
+        deadlineMs,
+      );
+
+      const resourceDisposals: Promise<void>[] = [];
+      for (let index = 0; index < sessions.length; index += 1) {
+        const [sessionId, session] = sessions[index]!;
+        session.closed = true;
+        // A prompt that missed the drain deadline may still hold an unmatched
+        // assistant tool call. Leave the last valid on-disk checkpoint intact.
+        if (promptsSettled[index] === true) this.persistSession(sessionId, session);
+        resourceDisposals.push(this.disposeSessionTools(session));
+        if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
+        this.sessionTodos.delete(sessionId);
+      }
+      this.transitions.clear();
+      if (this._visionClient) resourceDisposals.push(this._visionClient.dispose());
+      let resourceCleanupError: unknown;
+      const resourcesDrained = await settlesWithin(
+        Promise.all(resourceDisposals).catch((error) => {
+          resourceCleanupError = error;
+        }),
+        deadlineMs,
+      );
+
+      if (this.processSupervisor.hasActiveProcesses()) {
+        await this.processSupervisor.forceTerminateAll();
+      }
+      if (this.processSupervisor.hasActiveProcesses()) {
+        throw new Error("Agent shutdown left active command processes");
+      }
+      if (!resourcesDrained) {
+        throw new Error("Agent shutdown timed out waiting for resource cleanup");
+      }
+      if (resourceCleanupError) throw resourceCleanupError;
+      if (!auxDrained || promptsSettled.some((settled) => !settled)) {
+        throw new Error("Agent shutdown timed out waiting for prompt cleanup");
+      }
+    })();
+    return this.shutdownPromise;
+  }
+
+  /** Used by the CLI deadline path before reporting a nonzero exit. */
+  async forceShutdown(): Promise<void> {
+    await this.processSupervisor.forceTerminateAll();
+    if (this.processSupervisor.hasActiveProcesses()) {
+      throw new Error("Agent shutdown left active command processes");
+    }
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -944,72 +1182,113 @@ export class GlmAcpAgent implements Agent {
   // ---------------------------------------------------------------------------
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    const persisted = this.requirePersisted(params.sessionId);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers);
-    const toolDefinitions = this.availableToolDefinitions(mcpTools);
-    await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
-
-    // Restore in-memory state. We do NOT carry over the abortController /
-    // promptPromise — those are transient.
-    const restored: SessionState = {
-      cwd: params.cwd,
-      messages: persisted.messages,
-      abortController: null,
-      promptPromise: null,
-      title: persisted.title,
-      updatedAt: persisted.updatedAt,
-      model: persisted.model,
-      toolDefinitions,
-      mcpTools,
-      mode: persisted.mode,
-      thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
-      commands: discoverSlashCommands(params.cwd),
-      displayText: deserializeDisplayText(persisted.messages, persisted.displayText),
-    };
-    this.sessions.set(params.sessionId, restored);
-
-    // Replay user/assistant text turns so the client can rehydrate its UI.
-    // Tool / system messages are skipped — they're internal and the client
-    // doesn't render them on its own.
-    await this.replayMessages(
-      params.sessionId,
-      persisted.messages,
-      restored.displayText
-    );
-
-    this.scheduleAvailableCommands(params.sessionId);
-
-    return {
-      models: this.modelsState(persisted.model),
-      modes: this.modesState(persisted.mode),
-      configOptions: this.configOptionsState(
-        restored.model,
-        restored.thoughtLevel,
-        restored.mode
-      ),
-    };
+    return this.restoreSession(params, true);
   }
 
   async unstable_forkSession(
     params: ForkSessionRequest
   ): Promise<ForkSessionResponse> {
+    if (this.shuttingDown) throw new Error("Agent is shutting down");
     const source = this.sessions.get(params.sessionId);
-    const persisted = source
-      ? this.snapshot(params.sessionId, source)
-      : this.requirePersisted(params.sessionId);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers ?? []);
+    const record = this.transitions.get(params.sessionId)
+      ?? this.registerTransition(params.sessionId, source?.lifecycle ?? new SessionLifecycle());
+    const lifecycle = record.lifecycle;
+    const lease = lifecycle.begin("snapshotting");
+    record.original = source ?? null;
+    const forkAbortController = new AbortController();
+    record.restoreAbortController = forkAbortController;
+    let deferLeaseRelease = false;
+    const transition = Promise.resolve().then(async (): Promise<ForkSessionResponse> => {
+      let provisional: SessionMcpTools | null = null;
+      let provisionalDisposal: Promise<void> | null = null;
+      const disposeProvisional = (tools: SessionMcpTools): Promise<void> => {
+        if (!provisionalDisposal) provisionalDisposal = tools.dispose();
+        return provisionalDisposal;
+      };
+      try {
+        if (source) {
+          source.abortController?.abort();
+          const { drained, pending } = await this.drainPrompt(source);
+          if (!drained) {
+            deferLeaseRelease = true;
+            this.releaseAfterPromptDrain(params.sessionId, pending, source, lifecycle, lease, record);
+            throw new Error(`Session fork timed out waiting for prompt cleanup: ${lease.generation}`);
+          }
+        }
+        if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
+          throw new Error(`Session fork cancelled: ${params.sessionId}`);
+        }
+        const persisted = source
+          ? this.snapshot(params.sessionId, source)
+          : this.requirePersisted(params.sessionId);
+        assertSettledToolHistory(persisted.messages);
+        // A draining prompt deliberately suppresses its normal final save:
+        // the fork owns its lifecycle while it settles. Checkpoint the exact
+        // settled parent snapshot before any child setup, so a restart cannot
+        // recover the older (and possibly unmatched) tool-call history.
+        if (source) this.persistSession(params.sessionId, source, persisted);
+        const setup = this.connectMcpServers(params.mcpServers ?? [], forkAbortController.signal);
+        void setup.then(
+          (tools) => {
+            if (forkAbortController.signal.aborted) {
+              void disposeProvisional(tools).catch(() => undefined);
+            }
+          },
+          () => undefined
+        );
+        provisional = await waitForAbort(
+          setup,
+          forkAbortController.signal,
+          `Session fork cancelled: ${params.sessionId}`
+        );
+        if (!lifecycle.owns(lease) || lifecycle.closeRequested || this.sessions.get(params.sessionId) !== source) {
+          throw new Error(`Session fork cancelled: ${params.sessionId}`);
+        }
+        const response = this.createFork(params, persisted, provisional);
+        provisional = null;
+        return response;
+      } finally {
+        if (provisional) await disposeProvisional(provisional);
+        if (!deferLeaseRelease) lease.release();
+      }
+    });
+    record.promise = transition;
+    try {
+      return await transition;
+    } finally {
+      if (record.promise === transition) record.promise = null;
+      if (!deferLeaseRelease && record.original === (source ?? null)) record.original = null;
+      if (record.restoreAbortController === forkAbortController) {
+        record.restoreAbortController = null;
+      }
+    }
+  }
+
+  private createFork(
+    params: ForkSessionRequest,
+    persisted: PersistedSession,
+    mcpTools: SessionMcpTools,
+  ): ForkSessionResponse {
     const toolDefinitions = this.availableToolDefinitions(mcpTools);
 
     const newSessionId = randomUUID();
     const forkedTitle =
       persisted.title === null ? null : `${persisted.title} (fork)`;
-    const forkedMessages = structuredClone(persisted.messages);
+    const forkedMessages = rebuildRestoredMessages(
+      structuredClone(persisted.messages),
+      params.cwd,
+      toolDefinitions
+    );
+    const forkLifecycle = new SessionLifecycle();
     const forked: SessionState = {
       cwd: params.cwd,
       // Deep-clone messages so the fork doesn't share state with the parent.
       messages: forkedMessages,
       abortController: null,
       promptPromise: null,
+      closing: false,
+      closed: false,
+      disposePromise: null,
       title: forkedTitle,
       updatedAt: new Date().toISOString(),
       model: persisted.model,
@@ -1020,9 +1299,21 @@ export class GlmAcpAgent implements Agent {
       commands: discoverSlashCommands(params.cwd),
       // Re-key onto the cloned messages: the parent's map is keyed by the
       // originals, which the fork no longer holds.
-      displayText: deserializeDisplayText(forkedMessages, persisted.displayText),
+      displayText: deserializeRestoredDisplayText(
+        persisted.messages,
+        forkedMessages,
+        persisted.displayText
+      ),
+      lifecycle: forkLifecycle,
     };
     this.sessions.set(newSessionId, forked);
+    this.transitions.set(newSessionId, {
+      lifecycle: forkLifecycle,
+      promise: null,
+      closePromise: null,
+      original: null,
+      restoreAbortController: null,
+    });
     this.persistSession(newSessionId, forked);
 
     // Notify on the *created* session id — the parent thread's command list is
@@ -1044,46 +1335,333 @@ export class GlmAcpAgent implements Agent {
   async resumeSession(
     params: ResumeSessionRequest
   ): Promise<ResumeSessionResponse> {
-    const persisted = this.requirePersisted(params.sessionId);
-    const mcpTools = await connectSessionMcpServers(params.mcpServers ?? []);
-    const toolDefinitions = this.availableToolDefinitions(mcpTools);
-    await this.sessions.get(params.sessionId)?.mcpTools?.dispose();
+    return this.restoreSession(params, false);
+  }
 
-    const restored: SessionState = {
-      cwd: params.cwd,
-      messages: persisted.messages,
-      abortController: null,
-      promptPromise: null,
-      title: persisted.title,
-      updatedAt: persisted.updatedAt,
-      model: persisted.model,
-      toolDefinitions,
-      mcpTools,
-      mode: persisted.mode,
-      thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
-      commands: discoverSlashCommands(params.cwd),
-      displayText: deserializeDisplayText(persisted.messages, persisted.displayText),
+  private async restoreSession(
+    params: { sessionId: string; cwd: string; mcpServers?: LoadSessionRequest["mcpServers"] },
+    replay: boolean
+  ): Promise<LoadSessionResponse> {
+    if (this.shuttingDown) throw new Error("Agent is shutting down");
+    const original = this.sessions.get(params.sessionId);
+    const record = this.transitions.get(params.sessionId)
+      ?? this.registerTransition(params.sessionId, original?.lifecycle ?? new SessionLifecycle());
+    const lifecycle = record.lifecycle;
+    const lease = lifecycle.begin("restoring");
+    record.original = original ?? null;
+    const restoreAbortController = new AbortController();
+    record.restoreAbortController = restoreAbortController;
+    let deferLeaseRelease = false;
+
+    const transition = Promise.resolve().then(async (): Promise<LoadSessionResponse> => {
+      let provisional: SessionMcpTools | null = null;
+      let provisionalDisposal: Promise<void> | null = null;
+      let swapped = false;
+      const disposeProvisional = (tools: SessionMcpTools): Promise<void> => {
+        if (!provisionalDisposal) provisionalDisposal = tools.dispose();
+        return provisionalDisposal;
+      };
+      try {
+        let persisted: PersistedSession;
+        if (original) {
+          original.abortController?.abort();
+          const { drained, pending } = await this.drainPrompt(original);
+          if (!drained) {
+            deferLeaseRelease = true;
+            this.releaseAfterPromptDrain(params.sessionId, pending, original, lifecycle, lease, record);
+            throw new Error(`Session restore timed out waiting for prompt cleanup: ${lease.generation}`);
+          }
+          this.assertRestoreOwner(lifecycle, lease);
+          // This must be taken only after the reserved prompt chain settles:
+          // disk can be older than a just-finished live turn.
+          persisted = this.snapshot(params.sessionId, original);
+        } else {
+          persisted = this.requirePersisted(params.sessionId);
+        }
+
+        this.assertRestoreOwner(lifecycle, lease);
+        const setup = this.connectMcpServers(params.mcpServers ?? [], restoreAbortController.signal);
+        void setup.then(
+          (tools) => {
+            if (restoreAbortController.signal.aborted) {
+              void disposeProvisional(tools).catch(() => undefined);
+            }
+          },
+          () => undefined
+        );
+        provisional = await waitForAbort(
+          setup,
+          restoreAbortController.signal,
+          `Session restore cancelled: ${params.sessionId}`
+        );
+        if (this.shuttingDown) throw new Error("Agent is shutting down");
+        if (!lifecycle.owns(lease) || lifecycle.closeRequested) {
+          throw new Error(`Session restore cancelled: ${params.sessionId}`);
+        }
+
+        const toolDefinitions = this.availableToolDefinitions(provisional);
+        // Configuration updates remain responsive while MCP setup is in
+        // flight. Prompts are gated, so this second live projection keeps
+        // those latest settings without reopening the history race.
+        const restoreSource = original ? this.snapshot(params.sessionId, original) : persisted;
+        const restoredMessages = rebuildRestoredMessages(
+          restoreSource.messages,
+          params.cwd,
+          toolDefinitions
+        );
+        const restored: SessionState = {
+          cwd: params.cwd,
+          messages: restoredMessages,
+          abortController: null,
+          promptPromise: null,
+          closing: false,
+          closed: false,
+          disposePromise: null,
+          title: restoreSource.title,
+          updatedAt: restoreSource.updatedAt,
+          model: restoreSource.model,
+          toolDefinitions,
+          mcpTools: provisional,
+          mode: restoreSource.mode,
+          thoughtLevel: resolveThoughtLevel(restoreSource.model, restoreSource.thoughtLevel ?? "max"),
+          commands: discoverSlashCommands(params.cwd),
+          displayText: deserializeRestoredDisplayText(
+            restoreSource.messages,
+            restoredMessages,
+            restoreSource.displayText
+          ),
+          lifecycle,
+        };
+
+        // Replaying a load is part of preparing the replacement. If the
+        // client rejects a replay notification, leave the live original in
+        // place and dispose the provisional resources below.
+        if (replay) {
+          await this.replayMessages(
+            params.sessionId,
+            restoredMessages,
+            restored.displayText,
+            restoreAbortController.signal,
+          );
+        }
+        if (this.shuttingDown) throw new Error("Agent is shutting down");
+        if (lifecycle.closeRequested) {
+          throw new Error(`Session restore cancelled: ${params.sessionId}`);
+        }
+        if (original && this.sessions.get(params.sessionId) === original) {
+          // Configuration setters stay responsive while a load replays, and
+          // they mutate the still-installed original. Carry those latest
+          // values into the replacement instead of installing the values
+          // captured before replay started.
+          restored.model = original.model;
+          restored.mode = original.mode;
+          restored.thoughtLevel = original.thoughtLevel;
+          restored.updatedAt = original.updatedAt;
+        }
+        this.sessions.set(params.sessionId, restored);
+        this.sessionTodos.delete(params.sessionId);
+        swapped = true;
+        // Checkpoint the merged state immediately: it can retain a partially
+        // received turn from the drained prompt, which otherwise exists only
+        // in memory until the next prompt or close.
+        this.persistSession(params.sessionId, restored);
+        // Ownership transfers only after the replacement is installed. The
+        // old resources are released afterwards, so setup and replay failures
+        // still retain a valid original session.
+        if (original) await this.disposeSessionTools(original);
+        if (this.shuttingDown) throw new Error("Agent is shutting down");
+        if (lifecycle.closeRequested) {
+          throw new Error(`Session restore cancelled: ${params.sessionId}`);
+        }
+        this.scheduleAvailableCommands(params.sessionId);
+        return {
+          models: this.modelsState(restored.model),
+          modes: this.modesState(restored.mode),
+          configOptions: this.configOptionsState(restored.model, restored.thoughtLevel, restored.mode),
+        };
+      } catch (err) {
+        if (!swapped && original) {
+          this.persistOriginalIfOwned(params.sessionId, original, lifecycle, lease, record);
+        }
+        if (!swapped) {
+          if (provisional) await disposeProvisional(provisional);
+        }
+        throw err;
+      } finally {
+        if (!deferLeaseRelease) lease.release();
+      }
+    });
+    record.promise = transition;
+    try {
+      return await transition;
+    } finally {
+      if (record.promise === transition) record.promise = null;
+      if (!deferLeaseRelease && record.original === original) record.original = null;
+      if (record.restoreAbortController === restoreAbortController) {
+        record.restoreAbortController = null;
+      }
+      if (
+        this.transitions.get(params.sessionId) === record &&
+        !record.closePromise &&
+        !record.promise &&
+        !this.sessions.has(params.sessionId)
+      ) {
+        this.transitions.delete(params.sessionId);
+      }
+    }
+  }
+
+  private async drainPrompt(
+    session: SessionState
+  ): Promise<{ drained: boolean; pending: Promise<void> | null }> {
+    const pending = session.promptPromise;
+    if (!pending) return { drained: true, pending: null };
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      if (this.sessionDrainTimeoutMs <= 0) queueMicrotask(() => resolve("timeout"));
+      else timer = setTimeout(() => resolve("timeout"), this.sessionDrainTimeoutMs);
+    });
+    const outcome = await Promise.race([
+      pending.then(() => "drained" as const),
+      timeout,
+    ]);
+    if (timer) clearTimeout(timer);
+    return { drained: outcome === "drained", pending };
+  }
+
+  private releaseAfterPromptDrain(
+    sessionId: string,
+    pending: Promise<void> | null,
+    session: SessionState,
+    lifecycle: SessionLifecycle,
+    lease: TransitionLease,
+    record: SessionTransition
+  ): void {
+    // The promise captured when the drain started must be the one observed
+    // here: the prompt's cleanup can null `session.promptPromise` right after
+    // the timeout resolves, and re-reading the field would never attach the
+    // release callback, leaving the lease stuck in `restoring` forever.
+    void pending?.then(() => {
+      this.persistOriginalIfOwned(sessionId, session, lifecycle, lease, record);
+      if (!lifecycle.closeRequested) lease.release();
+      if (record.original === session) record.original = null;
+    });
+  }
+
+  private persistOriginalIfOwned(
+    sessionId: string,
+    session: SessionState,
+    lifecycle: SessionLifecycle,
+    lease: TransitionLease,
+    record: SessionTransition,
+  ): void {
+    if (!lifecycle.owns(lease)) return;
+    if (record.original !== session) return;
+    if (this.sessions.get(sessionId) !== session) return;
+    this.persistSession(sessionId, session);
+  }
+
+  private registerTransition(sessionId: string, lifecycle: SessionLifecycle): SessionTransition {
+    const record: SessionTransition = {
+      lifecycle,
+      promise: null,
+      closePromise: null,
+      original: null,
+      restoreAbortController: null,
     };
-    this.sessions.set(params.sessionId, restored);
+    this.transitions.set(sessionId, record);
+    return record;
+  }
 
-    this.scheduleAvailableCommands(params.sessionId);
-
-    // Resume does NOT replay history — the client keeps its own UI state and
-    // just wants the agent to pick up where it left off.
-    return {
-      models: this.modelsState(persisted.model),
-      modes: this.modesState(persisted.mode),
-      configOptions: this.configOptionsState(
-        restored.model,
-        restored.thoughtLevel,
-        restored.mode
-      ),
-    };
+  private assertRestoreOwner(lifecycle: SessionLifecycle, lease: TransitionLease): void {
+    if (!lifecycle.owns(lease) || lifecycle.closeRequested) {
+      throw new Error("Session restore cancelled");
+    }
   }
 
   // ---------------------------------------------------------------------------
   // Persistence helpers
   // ---------------------------------------------------------------------------
+
+  private ownsSession(sessionId: string, session: SessionState, generation: number): boolean {
+    return this.sessions.get(sessionId) === session
+      && !session.closing
+      && !session.closed
+      && session.lifecycle.phase === "open"
+      && session.lifecycle.generation === generation;
+  }
+
+  private isDrainingOriginal(sessionId: string, session: SessionState): boolean {
+    const record = this.transitions.get(sessionId);
+    if (record?.original === session &&
+        (record.lifecycle.phase === "restoring" || record.lifecycle.phase === "snapshotting")) return true;
+    // A normal close aborts the prompt and waits for it before persisting. The
+    // closing generation must still finish its canonical history (without UI
+    // notifications), otherwise already-received text or an in-flight tool
+    // result disappears from the final checkpoint.
+    return this.sessions.get(sessionId) === session
+      && record?.lifecycle === session.lifecycle
+      && record.lifecycle.phase === "closing"
+      && !session.closed;
+  }
+
+  private ownedPromptConnection(ownsPrompt: () => boolean): AgentSideConnection {
+    const connection = this.connection;
+    return new Proxy(connection, {
+      get(target, property, receiver) {
+        if (property === "sessionUpdate") {
+          return async (params: Parameters<AgentSideConnection["sessionUpdate"]>[0]) => {
+            if (ownsPrompt()) await connection.sessionUpdate(params);
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+
+  private assertConfigurable(sessionId: string, session: SessionState): void {
+    if (session.closing || session.closed || session.lifecycle.closeRequested) {
+      throw new Error(`Session is closing: ${sessionId}`);
+    }
+  }
+
+  /** Track MCP setup until it installs into a session or shutdown disposes it. */
+  private connectMcpForSession(
+    servers: Parameters<typeof connectSessionMcpServers>[0]
+  ): PendingMcpSetup {
+    let disposePromise: Promise<void> | null = null;
+    const source = Promise.resolve().then(() => this.mcpConnector(servers));
+    const setup: PendingMcpSetup = {
+      tools: source.then(async (mcpTools) => {
+        if (this.shuttingDown) {
+          await setup.dispose();
+          throw new Error("Agent is shutting down");
+        }
+        return mcpTools;
+      }),
+      release: () => this.pendingSetups.delete(setup),
+      dispose: () => {
+        if (!disposePromise) {
+          disposePromise = source.then(
+            (mcpTools) => mcpTools.dispose(),
+            () => undefined,
+          ).finally(() => setup.release());
+        }
+        return disposePromise;
+      },
+    };
+    this.pendingSetups.add(setup);
+    void source.catch(() => setup.release());
+    return setup;
+  }
+
+  private disposeSessionTools(session: SessionState): Promise<void> {
+    if (!session.disposePromise) {
+      session.disposePromise = session.mcpTools?.dispose() ?? Promise.resolve();
+    }
+    return session.disposePromise;
+  }
 
   private snapshot(sessionId: string, session: SessionState): PersistedSession {
     const displayText = serializeDisplayText(session.messages, session.displayText);
@@ -1102,10 +1680,15 @@ export class GlmAcpAgent implements Agent {
     };
   }
 
-  private persistSession(sessionId: string, session: SessionState): void {
+  private persistSession(
+    sessionId: string,
+    session: SessionState,
+    persisted = this.snapshot(sessionId, session),
+  ): void {
+    if (this.sessions.get(sessionId) !== session) return;
     if (!this.sessionStore) return;
     try {
-      this.sessionStore.save(this.snapshot(sessionId, session));
+      this.sessionStore.save(persisted);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(
@@ -1128,13 +1711,18 @@ export class GlmAcpAgent implements Agent {
   private async replayMessages(
     sessionId: string,
     messages: GlmMessage[],
-    displayText: SessionState["displayText"]
+    displayText: SessionState["displayText"],
+    signal?: AbortSignal,
   ): Promise<void> {
+    const replayUpdate = (update: Parameters<AgentSideConnection["sessionUpdate"]>[0]) =>
+      signal
+        ? waitForAbort(this.connection.sessionUpdate(update), signal, `Session replay cancelled: ${sessionId}`)
+        : this.connection.sessionUpdate(update);
     for (const msg of messages) {
       if (msg.role === "user") {
         const text = displayText.get(msg) ?? stringifyUserMessage(msg.content);
         if (text.length === 0) continue;
-        await this.connection.sessionUpdate({
+        await replayUpdate({
           sessionId,
           update: {
             sessionUpdate: "user_message_chunk",
@@ -1159,7 +1747,7 @@ export class GlmAcpAgent implements Agent {
                   .join("")
               : "";
         if (text.length === 0) continue;
-        await this.connection.sessionUpdate({
+        await replayUpdate({
           sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
@@ -1183,10 +1771,13 @@ export class GlmAcpAgent implements Agent {
   private async runPromptLoop(
     sessionId: string,
     session: SessionState,
-    signal: AbortSignal
+    signal: AbortSignal,
+    ownsPrompt: () => boolean,
+    preservesDrainingHistory: () => boolean,
+    processSupervisor: ProcessSupervisor
   ): Promise<{ stopReason: InternalStopReason; usage?: Usage }> {
     const executor = new ToolExecutor(
-      this.connection,
+      this.ownedPromptConnection(ownsPrompt),
       sessionId,
       this.clientCapabilities,
       signal,
@@ -1195,21 +1786,45 @@ export class GlmAcpAgent implements Agent {
       session.cwd,
       // Use a thunk so mode changes mid-turn take effect on the next tool call.
       () => this.sessions.get(sessionId)?.mode ?? "default",
-      (todos) => this.sessionTodos.set(sessionId, todos)
+      (todos) => {
+        if (ownsPrompt()) this.sessionTodos.set(sessionId, todos);
+      },
+      undefined,
+      processSupervisor
     );
 
-    let lastUsage: Usage | undefined;
+    let totalUsage: Usage | undefined;
     let overflowRetryCount = 0;
 
-    for (let turn = 0; turn < this.maxTurns; turn++) {
-      if (signal.aborted) return { stopReason: "cancelled" };
-
-      // Proactive compaction: check if history exceeds 90% of context window.
-      const window = getContextWindow(session.model);
-      const limit = Math.floor(window * 0.9);
-      if (estimateTokens(session.messages) > limit) {
-        session.messages = compactMessages(session.messages, Math.floor(window * 0.8));
+    const addUsage = (usage: Usage | undefined): void => {
+      if (!usage) return;
+      if (!totalUsage) {
+        totalUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
       }
+      totalUsage.inputTokens += usage.inputTokens;
+      totalUsage.outputTokens += usage.outputTokens;
+      totalUsage.totalTokens += usage.totalTokens;
+      for (const key of ["cachedReadTokens", "cachedWriteTokens", "thoughtTokens"] as const) {
+        const value = usage[key];
+        if (typeof value !== "number") continue;
+        totalUsage[key] = (totalUsage[key] ?? 0) + value;
+      }
+    };
+
+    const cancelledToolResult = (toolCallId: string): GlmMessage => {
+      return {
+        role: "tool",
+        tool_call_id: toolCallId,
+        content: "Tool call cancelled before execution.",
+      };
+    };
+
+    for (let turn = 0; turn < this.maxTurns; turn++) {
+      if (signal.aborted || !ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
+      const compatibility = checkModelTransition(session.messages, session.model);
+      if (!compatibility.ok) throw new Error(compatibility.message);
+
+      this.compactSessionForRequest(session, false);
 
       debug(`promptLoop: turn=${turn} session=${sessionId} model=${session.model} messages=${session.messages.length}`);
 
@@ -1220,7 +1835,16 @@ export class GlmAcpAgent implements Agent {
       }> = [];
 
       let assistantText = "";
+      let assistantReasoning = "";
       let lastStopReason: string | undefined;
+      let turnUsage: Usage | undefined;
+      let usageCommitted = false;
+      let cancelledDuringStream = false;
+      const commitTurnUsage = (): void => {
+        if (usageCommitted) return;
+        usageCommitted = true;
+        addUsage(turnUsage);
+      };
 
       let retryTurn = false;
       try {
@@ -1231,9 +1855,13 @@ export class GlmAcpAgent implements Agent {
           tools: session.toolDefinitions,
           reasoningEffort: session.thoughtLevel,
         })) {
-          if (signal.aborted) return { stopReason: "cancelled" };
+          if (signal.aborted || !ownsPrompt()) {
+            cancelledDuringStream = true;
+            break;
+          }
 
-          if (chunk.thinking && this.streamThinking) {
+          if (chunk.thinking) assistantReasoning += chunk.thinking;
+          if (chunk.thinking && this.streamThinking && ownsPrompt()) {
             await this.connection.sessionUpdate({
               sessionId,
               update: {
@@ -1243,7 +1871,7 @@ export class GlmAcpAgent implements Agent {
             });
           }
 
-          if (chunk.text) {
+          if (chunk.text && ownsPrompt()) {
             assistantText += chunk.text;
             await this.connection.sessionUpdate({
               sessionId,
@@ -1260,32 +1888,50 @@ export class GlmAcpAgent implements Agent {
           }
 
           if (chunk.usage) {
-            lastUsage = chunk.usage;
+            // A streamed response can repeat its final usage snapshot. Keep
+            // the last snapshot for this model call and merge it once below.
+            turnUsage = chunk.usage;
           }
 
           if (chunk.done) {
             lastStopReason = chunk.stopReason;
           }
         }
+        if (!signal.aborted) {
+          lastStopReason = validateStreamCompletion(lastStopReason, toolCalls);
+          if (lastStopReason === "length" || lastStopReason === "content_filter") {
+            toolCalls.length = 0;
+          }
+        }
       } catch (err) {
-        if (signal.aborted) return { stopReason: "cancelled" };
+        commitTurnUsage();
+        if (signal.aborted) {
+          cancelledDuringStream = true;
+        }
 
         const body = (err as { error?: { code?: string | number } })?.error;
         const isOverflow =
           body?.code === ERR_CONTEXT_OVERFLOW ||
           body?.code === String(ERR_CONTEXT_OVERFLOW);
 
-        if (isOverflow && overflowRetryCount < 1) {
+        if (!cancelledDuringStream && isOverflow && overflowRetryCount < 1) {
           debug(`promptLoop: context overflow (1261) detected, performing emergency compaction`);
-          const window = getContextWindow(session.model);
-          session.messages = compactMessages(session.messages, Math.floor(window * 0.7), {
-            force: true,
-          });
+          const rejectedBytes = this.requestPayloadBytes(session);
+          const changed = this.compactSessionForRequest(session, true);
+          const retryBytes = this.requestPayloadBytes(session);
+          if (!changed || retryBytes >= rejectedBytes) {
+            throw new Error("Context overflow could not reduce the request payload; narrow the current request or start a new session.", { cause: err });
+          }
           overflowRetryCount++;
           retryTurn = true;
-        } else if (isOverflow) {
+        } else if (!cancelledDuringStream && isOverflow) {
           throw new Error("Context overflow persisted after emergency compaction", { cause: err });
-        } else {
+        } else if (!cancelledDuringStream) {
+          // Keep text the client has already seen, but never retain an
+          // incomplete executable tool batch from an interrupted stream.
+          if (assistantText.length > 0) {
+            session.messages.push({ role: "assistant", content: assistantText });
+          }
           throw err;
         }
       }
@@ -1295,39 +1941,111 @@ export class GlmAcpAgent implements Agent {
         continue;
       }
 
-      // Record the assistant turn in history so the model has full context for
-      // the next iteration.
-      if (toolCalls.length > 0) {
-        session.messages.push({
+      commitTurnUsage();
+
+      // Provider continuity is independent of the client's thought display.
+      // Never replay reasoning from a cancelled or truncated response as a
+      // completed reasoning chain.
+      const reasoning = assistantReasoning.length > 0 && !cancelledDuringStream && !signal.aborted &&
+        (lastStopReason === "stop" || lastStopReason === "tool_calls")
+        ? { reasoning_content: assistantReasoning } : {};
+
+      const retainDrainedHistory = preservesDrainingHistory();
+      if (!ownsPrompt() && !retainDrainedHistory) {
+        return { stopReason: "cancelled", usage: totalUsage };
+      }
+
+      // Tool-call turns are retained locally until every declared call has a
+      // terminal result. This prevents a thrown executor error from leaving an
+      // assistant tool batch unmatched in provider or persisted history.
+      const assistantToolMessage: GlmMessage | undefined = toolCalls.length > 0
+        ? {
           role: "assistant",
           content: assistantText.length > 0 ? assistantText : null,
+          ...reasoning,
           tool_calls: toolCalls.map((tc) => ({
             id: tc.id,
             type: "function" as const,
             function: { name: tc.name, arguments: tc.arguments },
           })),
-        });
-      } else if (assistantText.length > 0) {
-        session.messages.push({ role: "assistant", content: assistantText });
+        }
+        : undefined;
+      if (!assistantToolMessage && (assistantText.length > 0 || reasoning.reasoning_content !== undefined)) {
+        session.messages.push({ role: "assistant", content: assistantText || null, ...reasoning });
+      }
+
+      if (cancelledDuringStream || signal.aborted) {
+        if (assistantToolMessage && (ownsPrompt() || retainDrainedHistory)) {
+          session.messages.push(assistantToolMessage, ...toolCalls.map((tc) => cancelledToolResult(tc.id)));
+        }
+        return { stopReason: "cancelled", usage: totalUsage };
       }
 
       // No tool calls => model is done.
       if (toolCalls.length === 0) {
-        return { stopReason: this.mapStopReason(lastStopReason), usage: lastUsage };
+        return { stopReason: this.mapStopReason(lastStopReason), usage: totalUsage };
       }
 
       // Execute tool calls in declaration order and feed each result back.
+      let cancellationObserved = false;
+      const toolResults: GlmMessage[] = [];
+      let toolFailure: Error | undefined;
       for (const tc of toolCalls) {
-        if (signal.aborted) return { stopReason: "cancelled", usage: lastUsage };
+        if (toolFailure) {
+          toolResults.push({ role: "tool", tool_call_id: tc.id,
+            content: "Tool call not started because an earlier tool's outcome is unknown." });
+          continue;
+        }
+        if (signal.aborted || !ownsPrompt()) {
+          if (ownsPrompt() || preservesDrainingHistory()) {
+            toolResults.push(cancelledToolResult(tc.id));
+          }
+          cancellationObserved = true;
+          continue;
+        }
 
-        const result = await executor.execute(tc.id, tc.name, tc.arguments);
+        let result: { content: string };
+        try {
+          result = await executor.execute(tc.id, tc.name, tc.arguments);
+        } catch (cause) {
+          result = {
+            content: "Error: tool execution failed unexpectedly; its outcome may be unknown. Inspect the current state before repeating any side effect.",
+          };
+          if (signal.aborted || !ownsPrompt()) {
+            if (ownsPrompt() || preservesDrainingHistory()) {
+              toolResults.push({ role: "tool", tool_call_id: tc.id, content: result.content });
+            }
+            cancellationObserved = true;
+            continue;
+          }
+          // An executor can fail after an operation has started (for example,
+          // while publishing a client notification). Do not replay it; give
+          // the model one terminal result and state that its side effect is
+          // uncertain so the provider history remains structurally valid.
+          toolFailure = new Error(result.content, { cause });
+        }
         debug(`promptLoop: toolResult id=${tc.id} name=${tc.name} contentLength=${result.content.length}`);
 
-        session.messages.push({
+        const retainToolResult = preservesDrainingHistory();
+        if (!ownsPrompt() && !retainToolResult) {
+          cancellationObserved = true;
+          continue;
+        }
+        toolResults.push({
           role: "tool",
           tool_call_id: tc.id,
           content: result.content,
         });
+        if (signal.aborted || !ownsPrompt()) cancellationObserved = true;
+      }
+
+      if (ownsPrompt() || preservesDrainingHistory()) {
+        session.messages.push(assistantToolMessage!, ...toolResults);
+        if (toolFailure) throw toolFailure;
+      }
+
+      if (cancellationObserved || signal.aborted || !ownsPrompt()) {
+        return { stopReason: "cancelled", usage: totalUsage };
       }
 
       // Loop and continue – GLM expects a follow-up completion now that it has
@@ -1336,6 +2054,7 @@ export class GlmAcpAgent implements Agent {
 
     // Reached MAX_TURNS without resolution. Tell the user why we stopped —
     // without this, hitting the cap is indistinguishable from a normal end.
+    if (!ownsPrompt()) return { stopReason: "cancelled", usage: totalUsage };
     await this.connection.sessionUpdate({
       sessionId,
       update: {
@@ -1346,7 +2065,7 @@ export class GlmAcpAgent implements Agent {
         },
       },
     });
-    return { stopReason: "max_turn_requests", usage: lastUsage };
+    return { stopReason: "max_turn_requests", usage: totalUsage };
   }
 
   private mapStopReason(stopReason: string | undefined): InternalStopReason {
@@ -1367,6 +2086,60 @@ export class GlmAcpAgent implements Agent {
   }
 
   /** Tool schemas we expose for agent-owned local tools plus session MCP tools. */
+  private contextBudget(session: SessionState): ContextBudget {
+    const contextWindow = getContextWindow(session.model);
+    const maxOutputTokens = this.glm.getMaxOutputTokens?.() ?? 32_768;
+    const toolSchemaTokens = estimateSerializedTokens(session.toolDefinitions);
+    return {
+      contextWindow,
+      maxOutputTokens,
+      toolSchemaTokens,
+      safetyTokens: Math.max(4096, Math.floor(contextWindow * 0.05)),
+    };
+  }
+
+  /**
+   * Compact before every provider request. The estimate is a heuristic, so a
+   * provider overflow gets one forceful retry with a byte-level progress test.
+   */
+  private compactSessionForRequest(session: SessionState, force: boolean): boolean {
+    const budget = this.contextBudget(session);
+    const indispensable = estimateMessagesTokens([
+      session.messages[0]!,
+      ...(session.messages.filter(message => message.role === "user").slice(-1)),
+    ]) + budget.maxOutputTokens + budget.toolSchemaTokens + budget.safetyTokens;
+    if (indispensable > budget.contextWindow) {
+      throw new Error("Context too large: system context, current user request, tool schemas, output reservation, and safety margin exceed this model's context window. Narrow the request or choose a larger-context model.");
+    }
+    const result = compactToBudget(session.messages, budget, force);
+    if (!result.changed) return false;
+    let lastUser = -1;
+    for (let index = result.messages.length - 1; index >= 0; index--) {
+      if (result.messages[index]?.role === "user") { lastUser = index; break; }
+    }
+    const messages = result.messages.map((message, index) => {
+      if (index !== lastUser) return message;
+      const replacement = appendCompactionNote(message, result.removedExchanges, result.reducedToolResults);
+      // Compaction notes are model-facing metadata. Keep the original
+      // user-visible rendering for replay even when the message had no
+      // pre-existing display sidecar.
+      session.displayText.set(replacement, session.displayText.get(message) ?? stringifyUserMessage(message.content));
+      return replacement;
+    });
+    assertValidHistory(messages);
+    session.messages = messages;
+    debug(`context budget: heuristic=${result.estimatedTokens} schemas=${budget.toolSchemaTokens} output=${budget.maxOutputTokens} removed=${result.removedExchanges} reducedTools=${result.reducedToolResults}`);
+    return true;
+  }
+
+  private requestPayloadBytes(session: SessionState): number {
+    return Buffer.byteLength(JSON.stringify({
+      messages: session.messages,
+      tools: session.toolDefinitions,
+      max_tokens: this.glm.getMaxOutputTokens?.() ?? 32_768,
+    }), "utf8");
+  }
+
   private availableToolDefinitions(mcpTools: SessionMcpTools | null = null): ToolDefinition[] {
     const names = ["read_file", "write_file", "edit_file", "todowrite", "list_files", "run_command", "web_search", "web_reader"];
     if (this.visionClientExplicit ? this._visionClient !== null : true) {
@@ -1378,6 +2151,30 @@ export class GlmAcpAgent implements Agent {
       ...(mcpTools?.toolDefinitions ?? []),
     ];
   }
+}
+
+/**
+ * Rebuild the leading system prompt for a session entering a new process or
+ * working directory while retaining the conversation messages that follow it.
+ * The returned array is always new so a fork can refresh its prompt without
+ * changing the source session's message history.
+ */
+function rebuildRestoredMessages(
+  messages: GlmMessage[],
+  cwd: string,
+  toolDefinitions: ReadonlyArray<ToolDefinition>
+): GlmMessage[] {
+  const systemPrompt: GlmMessage = {
+    role: "system",
+    content: buildSystemPrompt({
+      cwd,
+      tools: toolDefinitions.map((tool) => tool.function.name),
+      agentsMd: loadProjectContext(cwd),
+    }),
+  };
+  return messages[0]?.role === "system"
+    ? [systemPrompt, ...messages.slice(1)]
+    : [systemPrompt, ...messages];
 }
 
 /**
@@ -1551,6 +2348,22 @@ function deserializeDisplayText(
   return out;
 }
 
+/** Re-key display text when restoring a record that needed a new system message prepended. */
+function deserializeRestoredDisplayText(
+  sourceMessages: ReadonlyArray<GlmMessage>,
+  restoredMessages: ReadonlyArray<GlmMessage>,
+  persisted: Record<string, string> | undefined
+): SessionState["displayText"] {
+  const offset = restoredMessages.length - sourceMessages.length;
+  if (!persisted || offset === 0) {
+    return deserializeDisplayText(restoredMessages, persisted);
+  }
+  const shifted = Object.fromEntries(
+    Object.entries(persisted).map(([index, text]) => [String(Number(index) + offset), text])
+  );
+  return deserializeDisplayText(restoredMessages, shifted);
+}
+
 /** Flatten the `content` of a user message into a plain string for replay. */
 function stringifyUserMessage(content: unknown): string {
   if (typeof content === "string") return content;
@@ -1674,150 +2487,67 @@ async function safeSessionUpdate(
     // best-effort
   }
 }
-
-/**
- * Token cost charged to a single `image_url` content part.
- *
- * Vision-native GLM models tile an image into 14px patches and merge them 2x2,
- * so a full-size input (capped at 1120x1120) costs (1120/14)^2 / 4 = 1600
- * tokens. The wire form — an HTTPS URL or a base64 data URL — says nothing
- * about the decoded dimensions, so charge every image that ceiling:
- * over-counting only makes compaction fire early, while under-counting is what
- * lets an image-heavy session sail past the window and get rejected.
- */
-const IMAGE_PART_TOKENS = 1600;
-
-/**
- * Heuristically estimate the number of tokens in a list of messages.
- * Uses a simple 4-character-per-token rule, which is a safe baseline for
- * English and code, plus a flat per-image charge for native `image_url` parts
- * (see {@link IMAGE_PART_TOKENS}).
- */
-function estimateTokens(messages: GlmMessage[]): number {
-  let chars = 0;
-  let tokens = 0;
-  for (const m of messages) {
-    if (typeof m.content === "string") {
-      chars += m.content.length;
-    } else if (Array.isArray(m.content)) {
-      for (const part of m.content) {
-        if ("text" in part && typeof part.text === "string") {
-          chars += part.text.length;
-        } else if (part.type === "image_url") {
-          tokens += IMAGE_PART_TOKENS;
-        }
+/** Reject the owner immediately while retaining a handler for a late setup result. */
+function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal, message: string): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error(message));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const claim = (): boolean => {
+      if (settled) return false;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      return true;
+    };
+    const onAbort = () => {
+      if (claim()) reject(new Error(message));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        if (claim()) resolve(value);
+      },
+      (error) => {
+        if (claim()) reject(error);
       }
-    }
-    if (m.role === "assistant" && m.tool_calls) {
-      for (const tc of m.tool_calls) {
-        if ("function" in tc) {
-          chars += tc.function.name.length;
-          chars += tc.function.arguments.length;
-        }
-      }
-    }
+    );
+  });
+}
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => true),
+      new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  return tokens + Math.ceil(chars / 4);
 }
 
-/**
- * Prune message history to stay within a target token limit.
- *
- * Strategy:
- * 1. Always keep the System prompt (index 0).
- * 2. Always keep the last `preserveTurns` interaction groups (default 10) to
- *    maintain conversation flow. An interaction group (turn) typically starts
- *    with a user message followed by assistant and tool responses.
- * 3. Evict the largest remaining interaction groups until the total estimate
- *    is below `targetTokens`.
- *
- * `force` is for the emergency path after the provider itself rejected the
- * history. There {@link estimateTokens} has been proven wrong, so it can set
- * neither the stopping point nor what is off limits: the target is halved, and
- * the preserved tail becomes evictable from its oldest end. Only the final turn
- * is sacred — it carries the live user message, and a request without it is not
- * a retry of anything.
- */
-function compactMessages(
-  messages: GlmMessage[],
-  targetTokens: number,
-  { preserveTurns = 10, force = false }: { preserveTurns?: number; force?: boolean } = {}
-): GlmMessage[] {
-  if (messages.length <= 1) return messages;
-
-  const systemPrompt = messages[0];
-  const remaining = messages.slice(1);
-
-  // Group messages into interaction turns. A turn starts with a "user" message.
-  const turns: GlmMessage[][] = [];
-  let currentTurn: GlmMessage[] = [];
-
-  for (const m of remaining) {
-    if (m.role === "user" && currentTurn.length > 0) {
-      turns.push(currentTurn);
-      currentTurn = [];
+/** Reject a fork source whose assistant/tool suffix is not provider-ready. */
+function assertSettledToolHistory(messages: readonly GlmMessage[]): void {
+  let pending: Set<string> | null = null;
+  for (const message of messages) {
+    if (pending) {
+      if (message.role !== "tool" || !pending.has(message.tool_call_id)) {
+        throw new Error(`Cannot fork session: missing tool result for ${[...pending].join(", ")}`);
+      }
+      pending.delete(message.tool_call_id);
+      if (pending.size === 0) pending = null;
+      continue;
     }
-    currentTurn.push(m);
-  }
-  if (currentTurn.length > 0) {
-    turns.push(currentTurn);
-  }
-
-  // The final turn holds the live user message, so it is never evictable —
-  // with nothing else to drop there is no compaction to do.
-  if (turns.length < 2) return messages;
-  if (!force && turns.length <= preserveTurns) return messages;
-
-  let currentEstimate = estimateTokens(messages);
-  if (!force && currentEstimate <= targetTokens) return messages;
-
-  // An estimate already above target names a real reduction to aim for, forced
-  // or not. One that sits *below* target while the provider is rejecting the
-  // payload has been disproven, and stopping on it would spend the single retry
-  // on another oversized request — so halve it instead. Wrong by an unknown
-  // factor still shrinks geometrically, and only that case pays the extra loss.
-  const estimateDisproven = force && currentEstimate <= targetTokens;
-  const effectiveTarget = estimateDisproven
-    ? Math.floor(currentEstimate / 2)
-    : targetTokens;
-
-  debug(
-    `compactMessages: currentEstimate=${currentEstimate} target=${effectiveTarget} turns=${turns.length} force=${force}`
-  );
-
-  const sized = turns.map((turn, index) => ({ index, tokens: estimateTokens(turn) }));
-  const protectedFrom = turns.length - preserveTurns;
-  const evictedIndices = new Set<number>();
-
-  // Largest first, among the turns outside the preserved tail.
-  const candidateTurns = sized
-    .filter((c) => c.index < protectedFrom)
-    .sort((a, b) => b.tokens - a.tokens);
-  for (const c of candidateTurns) {
-    if (currentEstimate <= effectiveTarget) break;
-    evictedIndices.add(c.index);
-    currentEstimate -= c.tokens;
-  }
-
-  // Still over, and forced? Then the preserved tail is itself the problem — a
-  // run of image-heavy prompts can exceed the window on its own, leaving the
-  // candidates above unable to reach the target however many are dropped. Eat
-  // into the tail from its oldest end so the freshest context survives.
-  if (force) {
-    for (let i = Math.max(protectedFrom, 0); i < turns.length - 1; i++) {
-      if (currentEstimate <= effectiveTarget) break;
-      evictedIndices.add(i);
-      currentEstimate -= sized[i].tokens;
+    if (message.role === "tool") {
+      throw new Error(`Cannot fork session: orphan tool result ${message.tool_call_id}`);
+    }
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      const ids = message.tool_calls.map((call) => call.id);
+      if (new Set(ids).size !== ids.length) {
+        throw new Error("Cannot fork session: duplicate tool call ids");
+      }
+      pending = new Set(ids);
     }
   }
-
-  const compacted: GlmMessage[] = [systemPrompt];
-  for (let i = 0; i < turns.length; i++) {
-    if (!evictedIndices.has(i)) {
-      compacted.push(...turns[i]);
-    }
+  if (pending) {
+    throw new Error(`Cannot fork session: missing tool result for ${[...pending].join(", ")}`);
   }
-
-  debug(`compactMessages: done, newEstimate=${estimateTokens(compacted)} messageCount=${compacted.length}`);
-  return compacted;
 }

@@ -8,7 +8,12 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["20.19.0", "22.13.0", "24"]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -16,8 +21,18 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Configure Git Bash for command tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $gitSh = Get-Command sh.exe -ErrorAction SilentlyContinue
+          if ($null -eq $gitSh) {
+            throw "Git Bash sh.exe is required by the run_command tests on Windows."
+          }
+          Split-Path $gitSh.Source -Parent | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install dependencies
         run: npm ci
@@ -34,10 +49,15 @@ jobs:
       - name: Check registry manifest version sync
         run: node dist/registry/sync-manifest.js --check
 
-      - name: Set up Bun
+      - name: Packed package CLI smoke test
+        run: node scripts/packed-cli-smoke.mjs
+
+      - name: Set up Bun (Linux Node 22)
+        if: runner.os == 'Linux' && matrix.node == '22.13.0'
         uses: oven-sh/setup-bun@v2
 
       - name: Bunx smoke test (packed tarball)
+        if: runner.os == 'Linux' && matrix.node == '22.13.0'
         run: |
           npm pack --pack-destination "$RUNNER_TEMP"
           VERSION=$(node -p "require('./package.json').version")

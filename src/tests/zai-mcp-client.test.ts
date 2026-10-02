@@ -97,6 +97,32 @@ test("ZaiMcpClient initializes, sends initialized, discovers tools, and calls a 
   assert.equal(calls[3]?.headers.get("Mcp-Name"), "webSearchPrime");
 });
 
+test("ZaiMcpClient discovers every page and sends the opaque cursor unchanged", async () => {
+  const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+  const { calls, fetchStub } = createFetchStub([
+    jsonResponse({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } }, { sessionId: "zai-page" }),
+    new Response(null, { status: 202 }),
+    jsonResponse({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "webSearchPrime" }], nextCursor: "opaque/zai-2" } }),
+    jsonResponse({ jsonrpc: "2.0", id: 3, result: { tools: [{ name: "secondTool" }] } }),
+    jsonResponse({ jsonrpc: "2.0", id: 4, result: { content: [{ type: "text", text: "ok" }] } }),
+    jsonResponse({ jsonrpc: "2.0", id: 5, result: { content: [{ type: "text", text: "second ok" }] } }),
+  ]);
+
+  const client = new ZaiMcpClient(fetchStub as typeof fetch);
+  await client.callTool({ endpoint, toolName: "webSearchPrime", arguments: { query: "test" }, apiKey: "test-key" });
+  await client.callTool({ endpoint, toolName: "secondTool", arguments: {}, apiKey: "test-key" });
+
+  assert.deepEqual(calls.slice(2, 4).map((call) => call.body.params), [
+    undefined,
+    { cursor: "opaque/zai-2" },
+  ]);
+  assert.deepEqual(calls[4]?.body.params, {
+    name: "webSearchPrime",
+    arguments: { query: "test" },
+  });
+  assert.deepEqual(calls[5]?.body.params, { name: "secondTool", arguments: {} });
+});
+
 test("ZaiMcpClient discovers tools after initialization and caches them", async () => {
   const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
   const { calls, fetchStub } = createFetchStub([
@@ -470,4 +496,19 @@ test("ZaiMcpClient retries once on -32602 arg-validation error and re-discovers 
     name: "webSearchPrime",
     arguments: { search_query: "test" },
   });
+});
+
+test("ZaiMcpClient rejects a discovered catalog with duplicate tool names", async () => {
+  const endpoint = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+  const { fetchStub } = createFetchStub([
+    jsonResponse({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } }, { sessionId: "zai-dup" }),
+    new Response(null, { status: 202 }),
+    jsonResponse({ jsonrpc: "2.0", id: 2, result: { tools: [{ name: "webSearchPrime" }, { name: "webSearchPrime" }] } }),
+  ]);
+
+  const client = new ZaiMcpClient(fetchStub as typeof fetch);
+  await assert.rejects(
+    client.callTool({ endpoint, toolName: "webSearchPrime", arguments: { query: "test" }, apiKey: "test-key" }),
+    /duplicate tool name/i,
+  );
 });

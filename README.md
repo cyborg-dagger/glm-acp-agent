@@ -4,6 +4,10 @@ An [Agent Client Protocol (ACP)](https://agentclientprotocol.com) agent written 
 
 The agent connects to any ACP-compatible IDE or client over **stdio**, streams responses back in real time, and can call a rich set of tools to interact with the user's file system, terminal, and the web.
 
+Streaming responses must include a supported terminal finish reason. An early connection close is reported as an interrupted response, with received text retained for session replay. Tool calls run only after a complete `tool_calls` response; calls in output-limit (`length`) or filtered (`content_filter`) responses are discarded and the corresponding stop reason is preserved.
+
+Completed provider reasoning is retained unchanged in conversation history and saved sessions for subsequent model calls, even when thought display is disabled. `ACP_GLM_STREAM_THINKING=false` controls client display only. Reasoning from cancelled, incomplete, or output-limited responses is not replayed as a completed reasoning chain.
+
 ---
 
 ## Coding Plan Only
@@ -34,7 +38,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Image input via Coding Plan-native vision or Vision MCP** – `promptCapabilities.image` is advertised; `glm-5.3-flash` sends supported pasted ACP image blocks directly as native `image_url` content parts, while the other advertised coding models (including default `glm-5.3`) route them through Z.AI Vision MCP (`@z_ai/mcp-server`). `glm-5v-turbo` keeps the same native-vision path when re-added via `ACP_GLM_AVAILABLE_MODELS` — it is no longer on the Coding Plan allowlist. Direct chat-image-only models (e.g. `glm-4v-plus`) are intentionally not used.
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Nine built-in tools** (see below)
-- **Self-sufficient local tools** – file reads/writes, directory listings, and shell commands run in the agent process, so they do not depend on ACP client `fs` or `terminal` capabilities
+- **Self-sufficient local tools** – directory listings and shell commands always run in the agent process; file tools fall back to local filesystem access when ACP client `fs` capabilities are unavailable
 - **Configurable permissions** – `write_file` and `run_command` behavior depends on the active session mode (prompts by default)
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
 - **Protocol-correct tool statuses** – `pending` → `in_progress` → `completed` / `failed`
@@ -53,7 +57,7 @@ ACP Client (IDE plugin, CLI, …)
         ├─ GlmClient   ← Z.AI / Zhipu AI Coding Plan Chat Completions  (src/llm/)
         │
         ├─ ToolExecutor ← executes tool calls  (src/tools/)
-        │    ├─ read_file / list_files        → Agent process (Node fs); read_file paginated (offset/limit)
+        │    ├─ read_file / list_files        → ACP client fs for read_file when reads are advertised, else Agent process (Node fs); read_file confined and paginated (offset/limit)
         │    ├─ write_file / edit_file        → ACP client fs when advertised (editor-buffer diffs), else Agent process (Node fs)
         │    ├─ list_files / run_command     → Agent process (Node fs / child_process)
         │    ├─ web_search / web_reader      → Z.AI Coding Plan Web MCP (HTTP)
@@ -63,9 +67,9 @@ ACP Client (IDE plugin, CLI, …)
         └─ VisionMcpClient ← spawns `npx @z_ai/mcp-server` on demand
 ```
 
-The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations run inside the agent process with paths resolved against the ACP session working directory. When the client advertises `fs.writeTextFile` / `fs.readTextFile`, writes and edit-file reads are routed through the ACP client instead, so edits land in the editor buffer and render as native diffs; otherwise the agent process touches the filesystem directly. Writes and arbitrary shell commands still go through ACP `session/request_permission`, and the permission payload is always the **full** tool arguments — the user approves exactly what will run.
+The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations use paths resolved against the ACP session working directory. `read_file` accepts workspace-relative paths and rejects absolute paths or resolved targets outside the workspace, including escaping symlinks. When the client advertises `fs.readTextFile`, permitted `read_file` calls use the editor buffer, including new buffers whose parent directory exists inside the workspace; otherwise reads use the agent process filesystem. When the client advertises `fs.writeTextFile`, writes and edits are routed through the ACP client so they render as native diffs. Edit-file reads use the editor buffer when both filesystem capabilities are available, and otherwise read from disk. Writes and arbitrary shell commands still go through ACP `session/request_permission`, and the permission payload is always the **full** tool arguments — the user approves exactly what will run.
 
-Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` (and in the `read_file` content preview) are elided to a short head plus a character count, while the model keeps receiving complete payloads through the tool-result channel. Progress narration lives in the `todowrite` task list rather than prose, and reasoning tokens are only forwarded as `agent_thought_chunk` when `ACP_GLM_STREAM_THINKING` is not `false` (the default preserves streaming).
+Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` (and in the `read_file` content preview) are elided to a short head plus a character count. Model-facing tool results are also capped at a UTF-8 byte boundary; write payloads and permission requests remain complete. Progress narration lives in the `todowrite` task list rather than prose, and reasoning tokens are only forwarded as `agent_thought_chunk` when `ACP_GLM_STREAM_THINKING` is not `false` (the default preserves streaming).
 
 ---
 
@@ -73,12 +77,12 @@ Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` (a
 
 | Tool | Runs on | Permission behavior | Description |
 |------|---------|---------------------|-------------|
-| `read_file` | Agent process | Always silent | Read a text file, paginated by offset/limit (default 2000 lines, capped at 5000); the result reports the shown range, advertises the next offset only while lines remain, and reports EOF past the last line |
+| `read_file` | ACP client when fs read capability is advertised, otherwise agent process | Always silent | Read a workspace file or editor buffer using a relative path, paginated by offset/limit (default 2000 lines, capped at 5000). Escaping symlinks are rejected. Local scans are byte-bounded; totals can be unknown and an incomplete line is never given a next offset. |
 | `write_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Write or overwrite a text file. Silent in `accept_edits` and `bypass_permissions`. |
-| `edit_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Replace one exact, unique snippet in an existing file — a surgical edit instead of a full rewrite. Re-reads and re-validates after the permission prompt so concurrent edits are not overwritten. Silent in `accept_edits` and `bypass_permissions`. |
+| `edit_file` | Agent process (ACP client `fs` when advertised) | Mode-dependent | Replace one exact, unique snippet in an existing file. It refuses an input or editor buffer over the read/edit budget, and re-validates after permission so concurrent edits are not overwritten. Silent in `accept_edits` and `bypass_permissions`. |
 | `todowrite` | Agent process | Always silent | Create or replace the session's structured task list so multi-step progress is tracked instead of narrated in chat. Each call replaces the list; the tool result renders it back to the model. |
-| `list_files` | Agent process | Always silent | List a directory using Node filesystem APIs |
-| `run_command` | Agent process | Mode-dependent | Run an arbitrary shell command. Silent only in `bypass_permissions`. |
+| `list_files` | Agent process | Always silent | List a directory through a bounded iterator; a truncated result is a disclosed subset. |
+| `run_command` | Agent process | Mode-dependent | Run an arbitrary shell command; cancelling a turn terminates its shell process group, while intentionally backgrounded processes survive a normal shell exit. Silent only in `bypass_permissions`. |
 | `web_search` | Agent (Z.AI Coding Plan MCP) | Always silent | Search the web — returns titles, URLs, and summaries |
 | `web_reader` | Agent (Z.AI Coding Plan MCP) | Always silent | Fetch and parse a web page (markdown or plain text) |
 | `image_analysis` | Agent (Z.AI Vision MCP, stdio) | Always silent | Analyze a local image path or remote URL using `@z_ai/mcp-server` |
@@ -129,7 +133,7 @@ as prose, so typing a slash by accident never fails the turn.
 
 ## Prerequisites
 
-- **Node.js** 20 or later (native `fetch` and Web Streams required)
+- **Node.js** 20.19.0+, 22.13.0+, or 24+ (native `fetch` and Web Streams required)
 - **npm** 9 or later
 - A **Z.AI API key** — obtain one at <https://z.ai/manage-apikey/apikey-list>
 
@@ -181,6 +185,12 @@ The agent reads its configuration from environment variables, plus an optional c
 | `ACP_GLM_BASE_URL` | No | `https://api.z.ai/api/coding/paas/v4` | Override the API base URL |
 | `ACP_GLM_MAX_TOKENS` | No | `32768` | Cap on `max_tokens` for each completion |
 | `ACP_GLM_MAX_TURNS` | No | `100` | Max model/tool turns per prompt (also settable via `--max-turns`) |
+| `ACP_GLM_COMMAND_TIMEOUT_MS` | No | `120000` | Deadline for each `run_command`, in milliseconds. Invalid values fall back to the default with a stderr warning. |
+| `ACP_GLM_COMMAND_OUTPUT_LIMIT_BYTES` | No | `65536` | Maximum combined bytes captured from each `run_command` stdout and stderr. Further output is drained and reported as truncated. Invalid values fall back to the default with a stderr warning. |
+| `ACP_GLM_TOOL_RESULT_LIMIT_BYTES` | No | `262144` | Inclusive UTF-8 byte limit for every model-facing tool result. It preserves a prefix and suffix with an omitted-bytes marker; values below 128 fall back with a stderr warning. |
+| `ACP_GLM_READ_FILE_LIMIT_BYTES` | No | `8388608` | Maximum local bytes consumed while reading a page or whole file for `edit_file`. A bounded scan may not know the total line count. |
+| `ACP_GLM_LIST_FILES_MAX_ENTRIES` | No | `2000` | Maximum entries collected by `list_files`; larger directories return a disclosed subset. |
+| `ACP_GLM_LIST_FILES_LIMIT_BYTES` | No | `262144` | Maximum bytes assembled for a `list_files` result before its truncation marker. |
 | `ACP_GLM_THINKING` | No | auto-detected | Force thinking mode `true` / `false` |
 | `ACP_GLM_STREAM_THINKING` | No | `true` | Forward reasoning tokens to the client as `agent_thought_chunk`; set `false` to keep reasoning off the wire (the model still thinks — only the client-side stream is silenced) |
 | `ACP_GLM_SESSION_DIR` | No | `$XDG_STATE_HOME/glm-acp-agent/sessions` | Where session JSON files are persisted |
@@ -240,6 +250,8 @@ The endpoint validates `reasoning_effort` against `none | minimal | low | medium
 
 `ACP_GLM_PROMPT_IMAGES=false` still hides the image-attachment capability at session startup. With that flag set, clients should not offer image attachments at all.
 
+Switching to a text-only model is rejected while retained conversation history contains native images. Keep an image-capable model or start a text-only session with a textual description; images are never silently discarded or analyzed as part of a model switch. During an active prompt on a native-image model, wait for the turn to finish before switching to text-only capability. Other compatible selections affect subsequent model calls, while an in-flight call keeps its captured model and reasoning level. Restored histories receive the same compatibility check before a provider request.
+
 ### Vision MCP
 
 For `glm-5.3-flash` (built-in) and `glm-5v-turbo` (opt-in via `ACP_GLM_AVAILABLE_MODELS`), pasted ACP image blocks with `image/jpeg`, `image/jpg`, or `image/png` are sent directly to chat completions as `image_url` content parts. HTTPS image URLs are forwarded as URLs; inline base64 data is sent as a `data:<mime>;base64,...` URI. Unsupported image MIME types are rejected client-side with an inline `<image_unsupported_format>` annotation so the prompt can continue without a provider 4xx.
@@ -295,7 +307,7 @@ npm run dev        # tsc --watch
 #### 1. Prerequisites
 
 - A recent build of [Zed](https://zed.dev/download) that supports the `agent_servers` setting
-- Node.js 20 or later on your `PATH` (`node --version`)
+- Node.js 20.19.0+, 22.13.0+, or 24+ on your `PATH` (`node --version`)
 - A Z.AI API key — create one at <https://z.ai/manage-apikey/apikey-list>
 
 #### 2. Install the agent

@@ -3,8 +3,9 @@ import type {
   ClientCapabilities,
 } from "@agentclientprotocol/sdk";
 import { spawn } from "node:child_process";
-import { lstat, readdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { isAbsolute, join as pathJoin, relative, resolve as pathResolve, sep as pathSeparator } from "node:path";
+import type { Dirent } from "node:fs";
+import { lstat, opendir, realpath, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join as pathJoin, relative, resolve as pathResolve, sep as pathSeparator } from "node:path";
 import { resolveApiKey } from "../llm/credentials.js";
 import {
   callZaiMcpTool,
@@ -14,6 +15,15 @@ import {
 import type { SessionMcpTools } from "./session-mcp-client.js";
 import type { VisionMcpClient } from "./vision-mcp-client.js";
 import type { SessionModeId } from "../protocol/agent.js";
+import {
+  readCommandLimits,
+  type CommandLimits,
+} from "./command-limits.js";
+import { ProcessSupervisor } from "./process-supervisor.js";
+import { readResourceLimits, type ResourceLimits } from "./resource-limits.js";
+import { boundToolResult, takeUtf8Prefix } from "./tool-output.js";
+import { readLocalTextFileBounded, readLocalTextPage, type TextPage } from "./file-reader.js";
+import { validateToolArguments } from "./argument-validation.js";
 
 /**
  * Result returned after executing a tool call against the ACP client.
@@ -39,6 +49,8 @@ export interface TodoItem {
 const DEFAULT_READ_LIMIT = 2000;
 /** Upper bound for an explicit limit — keeps one call from flooding the context. */
 const HARD_READ_LIMIT = 5000;
+/** Valid ACP line number that is beyond any practical editor buffer. */
+const EDITOR_EOF_PROBE_LINE = 0xffffffff;
 /** Strings longer than this are elided in client-facing previews (UI cards), never in tool results. */
 const PREVIEW_STRING_LIMIT = 240;
 const PREVIEW_HEAD = 120;
@@ -82,7 +94,9 @@ export class ToolExecutor {
     private sessionMcpTools: SessionMcpTools | null = null,
     private sessionCwd: string = process.cwd(),
     private getMode: () => SessionModeId = () => "default",
-    private setTodos: (todos: TodoItem[]) => void = () => undefined
+    private setTodos: (todos: TodoItem[]) => void = () => undefined,
+    private resourceLimits: ResourceLimits = readResourceLimits(),
+    private processSupervisor: ProcessSupervisor | null = null,
   ) {}
 
   /**
@@ -95,19 +109,15 @@ export class ToolExecutor {
     toolName: string,
     rawArguments: string
   ): Promise<ToolResult> {
-    let args: Record<string, unknown>;
-    try {
-      args =
-        rawArguments.trim().length === 0
-          ? {}
-          : (JSON.parse(rawArguments) as Record<string, unknown>);
-    } catch {
-      const message = `Error: could not parse tool arguments as JSON: ${rawArguments}`;
+    const validation = validateToolArguments(toolName, rawArguments);
+    if (!validation.ok) {
+      const message = `Error: ${validation.message}`;
       await this.failedToolCall(toolCallId, toolName, {}, message);
-      return { content: message };
+      return { content: boundToolResult(message, this.resourceLimits.toolResultBytes) };
     }
+    const args = validation.value;
 
-    switch (toolName) {
+    const result = await (async (): Promise<ToolResult> => { switch (toolName) {
       case "read_file":
         return this.readFile(toolCallId, args);
       case "write_file":
@@ -134,7 +144,10 @@ export class ToolExecutor {
         await this.failedToolCall(toolCallId, toolName, args, message);
         return { content: message };
       }
-    }
+    }} )();
+    // This is the sole boundary before a result becomes a model-history tool
+    // message. Permission arguments and write payloads never cross this path.
+    return { content: boundToolResult(result.content, this.resourceLimits.toolResultBytes) };
   }
 
   // ---------------------------------------------------------------------------
@@ -170,20 +183,23 @@ export class ToolExecutor {
 
     try {
       const absolutePath = await this.resolveConfinedReadPath(path);
-      const full = this.clientCapabilities?.fs?.readTextFile
-        ? (await this.connection.readTextFile({ sessionId: this.sessionId, path: absolutePath }))
-            .content
-        : await readFile(absolutePath, "utf8");
-      const lines = full.split("\n");
-      // split() turns a trailing newline into a phantom empty last line; drop
-      // it so the reported line count matches what an editor shows.
-      if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-      const totalLines = lines.length;
-
-      // Past EOF: report it plainly instead of clamping back into the last
-      // line — clamping made the "next chunk" hint reappear forever.
-      if (offset > totalLines) {
-        const content = `[end of file: offset ${offset} is beyond the last line of ${path} (${totalLines} line${totalLines === 1 ? "" : "s"})]`;
+      const page = await this.readTextPage(absolutePath, offset, limit);
+      if (page.eof) {
+        const content = `[end of file: offset ${offset} is beyond the end of ${path}]`;
+        await this.connection.sessionUpdate({
+          sessionId: this.sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            status: "completed",
+            content: [{ type: "content", content: { type: "text", text: content } }],
+            rawOutput: elideForPreview({ content }),
+          },
+        });
+        return { content };
+      }
+      if (page.totalLines !== undefined && offset > page.totalLines) {
+        const content = `[end of file: offset ${offset} is beyond the last line of ${path} (${page.totalLines} line${page.totalLines === 1 ? "" : "s"})]`;
         await this.connection.sessionUpdate({
           sessionId: this.sessionId,
           update: {
@@ -197,15 +213,18 @@ export class ToolExecutor {
         return { content };
       }
 
-      const start = offset;
-      const end = Math.min(start + limit - 1, totalLines);
-      let content = lines.slice(start - 1, end).join("\n");
-      // Only advertise a next offset while lines remain — a hint on the final
-      // page would send the model back into the EOF branch above on a loop.
-      if (end < totalLines) {
-        content += `\n[showing lines ${start}-${end} of ${totalLines}; pass offset=${end + 1} to read the next chunk]`;
-      } else if (start > 1) {
-        content += `\n[showing lines ${start}-${end} of ${totalLines}; end of file]`;
+      let content = page.text;
+      const shown = page.lastCompleteLine >= page.firstLine
+        ? `${page.firstLine}-${page.lastCompleteLine}`
+        : "none";
+      if (page.incompleteLine !== undefined) {
+        content += `${content ? "\n" : ""}[showing complete lines ${shown}; line ${page.incompleteLine} is incomplete because the ${this.resourceLimits.fileReadBytes}-byte scan limit was reached. Narrow the input or use an explicitly bounded command for byte-level inspection.]`;
+      } else if (page.truncated) {
+        content += `\n[scan stopped at the ${this.resourceLimits.fileReadBytes}-byte read limit after line ${page.lastCompleteLine}; total lines are unknown${page.nextLine === undefined ? ". Narrow the input or use an explicitly bounded command for byte-level inspection." : `; pass offset=${page.nextLine} to continue`} ]`;
+      } else if (page.nextLine !== undefined) {
+        content += `\n[showing lines ${shown}${page.totalLines === undefined ? " (total unknown)" : ` of ${page.totalLines}`}; pass offset=${page.nextLine} to read the next chunk]`;
+      } else if (page.totalLines !== undefined && offset > 1) {
+        content += `\n[showing lines ${shown} of ${page.totalLines}; end of file]`;
       }
 
       await this.connection.sessionUpdate({
@@ -340,9 +359,17 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Write cancelled by user." };
     }
+    if (permissionResult.type === "aborted") {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Write cancelled by turn." };
+    }
     if (permissionResult.type === "reject") {
       await this.markFailed(toolCallId, "Rejected by user.");
       return { content: "Write rejected by user." };
+    }
+    if (this.signal?.aborted) {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Write cancelled by turn." };
     }
 
     // Step 3: move to in_progress and execute.
@@ -356,6 +383,10 @@ export class ToolExecutor {
     });
 
     try {
+      if (this.signal?.aborted) {
+        await this.markFailed(toolCallId, "Cancelled by turn.");
+        return { content: "Write cancelled by turn." };
+      }
       await this.performWrite(absolutePath, content);
 
       await this.connection.sessionUpdate({
@@ -391,7 +422,7 @@ export class ToolExecutor {
   }
 
   /**
-   * Mirror of performWrite for reads, used by edit_file: when the client
+   * Mirror of performWrite for edit_file reads: when the client
    * advertises BOTH `fs.readTextFile` and `fs.writeTextFile`, read through the
    * client so the edit is computed against the same contents the user sees (a
    * dirty editor buffer). Reading a client buffer we cannot write back would
@@ -404,9 +435,63 @@ export class ToolExecutor {
       this.clientCapabilities?.fs?.writeTextFile
     ) {
       const response = await this.connection.readTextFile({ sessionId: this.sessionId, path });
+      if (Buffer.byteLength(response.content, "utf8") > this.resourceLimits.fileReadBytes) {
+        throw new Error(`editor buffer exceeds the ${this.resourceLimits.fileReadBytes}-byte read/edit limit`);
+      }
       return response.content;
     }
-    return readFile(path, "utf8");
+    return readLocalTextFileBounded(path, this.resourceLimits.fileReadBytes, this.signal);
+  }
+
+  private async readTextPage(path: string, offset: number, limit: number): Promise<TextPage> {
+    if (this.clientCapabilities?.fs?.readTextFile) {
+      // ACP's line/limit form makes the editor responsible for paging. One
+      // lookahead line tells us whether to advertise another request; no page
+      // is misrepresented as a whole-buffer line count.
+      const readEditorLines = async (line: number, pageLimit: number): Promise<string[]> => {
+        const response = await this.connection.readTextFile({
+          sessionId: this.sessionId, path, line, limit: pageLimit,
+        } as never);
+        const lines = response.content.split("\n");
+        if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+        return lines;
+      };
+      let lines = await readEditorLines(offset, limit + 1);
+      let legacyFullBuffer = false;
+      if (offset > 1 && lines.length > 0 && lines.length <= limit + 1) {
+        // A few older ACP clients ignore line/limit and return a short full
+        // buffer. A short file is indistinguishable from a conforming page,
+        // so probe a far-beyond-EOF line before deciding which line numbers
+        // the response represents. ACP defines line as a uint32, so this is
+        // valid for conforming clients and cannot be a real file line here.
+        const probe = await readEditorLines(EDITOR_EOF_PROBE_LINE, 1);
+        if (probe.length > 0) {
+          lines = probe;
+          legacyFullBuffer = true;
+        }
+      }
+      // Older ACP clients ignore line/limit and return the complete buffer.
+      // Retain their correct local pagination instead of treating the first
+      // lines as the requested offset; conforming clients stay on the bounded
+      // lookahead path below.
+      if (legacyFullBuffer || lines.length > limit + 1) {
+        const totalLines = lines.length;
+        if (offset > totalLines) return { text: "", firstLine: offset, lastCompleteLine: totalLines, totalLines, truncated: false };
+        const visible = lines.slice(offset - 1, offset - 1 + limit);
+        const end = offset + visible.length - 1;
+        return { text: visible.join("\n"), firstLine: offset, lastCompleteLine: end, totalLines,
+          ...(end < totalLines ? { nextLine: end + 1 } : {}), truncated: false };
+      }
+      const hasNext = lines.length > limit;
+      const visible = lines.slice(0, limit);
+      const atEof = !hasNext && visible.length === 0;
+      const totalLines = hasNext || atEof ? undefined : offset - 1 + visible.length;
+      return { text: visible.join("\n"), firstLine: offset, lastCompleteLine: offset + visible.length - 1,
+        ...(totalLines === undefined ? {} : { totalLines }),
+        ...(hasNext ? { nextLine: offset + visible.length } : {}), truncated: false,
+        ...(atEof ? { eof: true } : {}), };
+    }
+    return readLocalTextPage(path, offset, limit, this.resourceLimits.fileReadBytes, this.signal);
   }
 
   private async editFile(
@@ -484,9 +569,17 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Edit cancelled by user." };
     }
+    if (permissionResult.type === "aborted") {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Edit cancelled by turn." };
+    }
     if (permissionResult.type === "reject") {
       await this.markFailed(toolCallId, "Rejected by user.");
       return { content: "Edit rejected by user." };
+    }
+    if (this.signal?.aborted) {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Edit cancelled by turn." };
     }
 
     // The permission prompt can sit in front of the user for a while; re-read
@@ -522,7 +615,11 @@ export class ToolExecutor {
     });
 
     try {
-      await this.performWrite(absolutePath, latest.replace(oldText, newText));
+      if (this.signal?.aborted) {
+        await this.markFailed(toolCallId, "Cancelled by turn.");
+        return { content: "Edit cancelled by turn." };
+      }
+      await this.performWrite(absolutePath, latest.replace(oldText, () => newText));
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -572,18 +669,47 @@ export class ToolExecutor {
     });
 
     try {
-      const entries = await readdir(absolutePath, { withFileTypes: true });
-      const lines = await Promise.all(
-        entries
-          .sort((a, b) => a.name.localeCompare(b.name))
-          .map(async (entry) => {
-            const entryPath = pathJoin(absolutePath, entry.name);
-            const info = await lstat(entryPath);
-            const type = entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "link" : "file";
-            return `${type}\t${info.size}\t${entry.name}`;
-          })
-      );
-      const output = [`Listing for ${path} (${absolutePath})`, ...lines].join("\n");
+      const directory = await opendir(absolutePath);
+      const entries: Dirent[] = [];
+      let entryLimitReached = false;
+      try {
+        for await (const entry of directory) {
+          if (entries.length >= this.resourceLimits.listEntries) {
+            entryLimitReached = true;
+            break;
+          }
+          entries.push(entry);
+        }
+      } finally {
+        await directory.close().catch(() => undefined);
+      }
+      const sorted = entries.sort((a, b) => a.name.localeCompare(b.name));
+      const lines = await mapWithConcurrency(sorted, this.resourceLimits.fsConcurrency, async entry => {
+        const info = await lstat(pathJoin(absolutePath, entry.name));
+        const type = entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "link" : "file";
+        return `${type}\t${info.size}\t${entry.name}`;
+      });
+      const outputLines = [`Listing for ${path} (${absolutePath})`];
+      let byteLimitReached = Buffer.byteLength(outputLines[0]!, "utf8") > this.resourceLimits.listBytes;
+      if (!byteLimitReached) {
+        for (const line of lines) {
+          if (Buffer.byteLength([...outputLines, line].join("\n"), "utf8") > this.resourceLimits.listBytes) {
+            byteLimitReached = true;
+            break;
+          }
+          outputLines.push(line);
+        }
+      }
+      const marker = `[listing truncated: returned a subset; entries=${this.resourceLimits.listEntries}, bytes=${this.resourceLimits.listBytes}]`;
+      const listingTruncated = entryLimitReached || byteLimitReached;
+      const output = listingTruncated
+        ? (() => {
+            const markerBytes = Buffer.byteLength(marker, "utf8");
+            const prefixBudget = Math.max(0, this.resourceLimits.listBytes - markerBytes - 1);
+            const prefix = takeUtf8Prefix(outputLines.join("\n"), prefixBudget);
+            return `${prefix ? `${prefix}\n` : ""}${marker}`;
+          })()
+        : outputLines.join("\n");
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -651,6 +777,10 @@ export class ToolExecutor {
       await this.markFailed(toolCallId, "Cancelled by user.");
       return { content: "Command cancelled by user." };
     }
+    if (permissionResult.type === "aborted") {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Command cancelled by turn." };
+    }
     if (permissionResult.type === "reject") {
       await this.markFailed(toolCallId, "Rejected by user.");
       return { content: "Command rejected by user." };
@@ -672,13 +802,35 @@ export class ToolExecutor {
       },
     });
 
+    if (this.signal?.aborted) {
+      await this.markFailed(toolCallId, "Cancelled by turn.");
+      return { content: "Command cancelled by turn." };
+    }
+
     try {
-      const { stdout, stderr, exitCode, signal } = await runShellCommand(
+      const limits = readCommandLimits();
+      const result = await runShellCommand(
         command,
         this.sessionCwd,
-        this.signal
+        this.signal,
+        limits,
+        this.processSupervisor
       );
-      const output = formatCommandOutput({ stdout, stderr, exitCode, signal });
+      const output = formatCommandOutput(result, limits);
+
+      if (result.timedOut) {
+        await this.connection.sessionUpdate({
+          sessionId: this.sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            status: "failed",
+            content: [{ type: "content", content: { type: "text", text: output } }],
+            rawOutput: elideForPreview(result),
+          },
+        });
+        return { content: output };
+      }
 
       await this.connection.sessionUpdate({
         sessionId: this.sessionId,
@@ -687,7 +839,7 @@ export class ToolExecutor {
           toolCallId,
           status: "completed",
           content: [{ type: "content", content: { type: "text", text: output } }],
-          rawOutput: elideForPreview({ stdout, stderr, exitCode, signal }),
+          rawOutput: elideForPreview(result),
         },
       });
 
@@ -703,19 +855,36 @@ export class ToolExecutor {
     return pathResolve(this.sessionCwd, path);
   }
 
-  /** Resolve an existing file without allowing reads outside the session workspace. */
+  /** Validate confinement, preserving client buffer paths and canonicalizing local reads. */
   private async resolveConfinedReadPath(path: string): Promise<string> {
     if (isAbsolute(path)) {
       throw new Error("absolute paths are not allowed");
     }
 
     const workspace = await realpath(this.sessionCwd);
-    const target = await realpath(pathResolve(workspace, path));
+    const absolutePath = this.resolvePath(path);
+    let target: string;
+    try {
+      target = await realpath(absolutePath);
+    } catch (error) {
+      if (!this.clientCapabilities?.fs?.readTextFile || (error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+      // A new editor buffer may have no disk file yet. Only permit a missing
+      // leaf in an existing, confined parent; a dangling symlink is still an
+      // existing entry and must never use this fallback.
+      const entry = await lstat(absolutePath).catch((statError: NodeJS.ErrnoException) => {
+        if (statError.code === "ENOENT") return null;
+        throw statError;
+      });
+      if (entry) throw error;
+      target = pathJoin(await realpath(dirname(absolutePath)), basename(absolutePath));
+    }
     const relativeTarget = relative(workspace, target);
-    if (relativeTarget === ".." || relativeTarget.startsWith(`..${pathSeparator}`)) {
+    if (isAbsolute(relativeTarget) || relativeTarget === ".." || relativeTarget.startsWith(`..${pathSeparator}`)) {
       throw new Error("path must remain inside the session workspace");
     }
-    return target;
+    return this.clientCapabilities?.fs?.readTextFile ? absolutePath : target;
   }
 
   private async webSearch(
@@ -959,9 +1128,14 @@ export class ToolExecutor {
     | { type: "allow" }
     | { type: "reject" }
     | { type: "cancelled" }
+    | { type: "aborted" }
     | { type: "error"; message: string }
   > {
     const mode = this.getMode();
+
+    if (this.signal?.aborted) {
+      return { type: "aborted" };
+    }
 
     // bypass_permissions: allow everything without prompting
     if (mode === "bypass_permissions") {
@@ -975,7 +1149,7 @@ export class ToolExecutor {
 
     // default mode (or accept_edits with execute): prompt for permission
     try {
-      const permissionResponse = await this.connection.requestPermission({
+      const permissionPromise = this.connection.requestPermission({
         sessionId: this.sessionId,
         toolCall: {
           toolCallId: args.toolCallId,
@@ -994,21 +1168,48 @@ export class ToolExecutor {
         ],
       });
 
-      if (permissionResponse.outcome.outcome === "cancelled") {
-        return { type: "cancelled" };
+      if (!this.signal) {
+        return this.permissionOutcome(await permissionPromise);
       }
-      if (
-        permissionResponse.outcome.outcome === "selected" &&
-        permissionResponse.outcome.optionId === "reject"
-      ) {
-        return { type: "reject" };
+
+      let abortHandler: (() => void) | undefined;
+      const abortPromise = new Promise<"aborted">((resolve) => {
+        abortHandler = () => resolve("aborted");
+        this.signal!.addEventListener("abort", abortHandler, { once: true });
+        if (this.signal!.aborted) abortHandler();
+      });
+      try {
+        const outcome = await Promise.race([
+          permissionPromise.then((response) => ({ kind: "response" as const, response })),
+          abortPromise.then(() => ({ kind: "aborted" as const })),
+        ]);
+        if (outcome.kind === "aborted") {
+          return { type: "aborted" };
+        }
+        return this.permissionOutcome(outcome.response);
+      } finally {
+        if (abortHandler) this.signal.removeEventListener("abort", abortHandler);
       }
-      return { type: "allow" };
     } catch (err) {
       // Transport failure: return error so caller can handle appropriately
       const message = err instanceof Error ? err.message : String(err);
       return { type: "error", message };
     }
+  }
+
+  private permissionOutcome(permissionResponse: {
+    outcome: { outcome: string; optionId?: string };
+  }): { type: "allow" } | { type: "reject" } | { type: "cancelled" } {
+    if (permissionResponse.outcome.outcome === "cancelled") {
+      return { type: "cancelled" };
+    }
+    if (
+      permissionResponse.outcome.outcome === "selected" &&
+      permissionResponse.outcome.optionId === "reject"
+    ) {
+      return { type: "reject" };
+    }
+    return { type: "allow" };
   }
 
   /** Mark an in-progress tool call as failed. */
@@ -1166,15 +1367,34 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+async function mapWithConcurrency<T, R>(items: readonly T[], concurrency: number, mapper: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 function runShellCommand(
   command: string,
   cwd: string,
-  signal?: AbortSignal
-): Promise<{ stdout: string; stderr: string; exitCode: number | null; signal: NodeJS.Signals | null }> {
+  signal?: AbortSignal,
+  limits: CommandLimits = readCommandLimits(),
+  processSupervisor: ProcessSupervisor | null = null
+): Promise<ShellCommandResult> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("The operation was aborted"));
+      return;
+    }
     const child = spawn("sh", ["-c", command], {
       cwd,
-      signal,
       // Run the shell in its own process group so that background processes
       // (nohup, disown, &) survive after the main sh -c exits and don't
       // receive signals aimed at this agent. The child must stay ref'd: while
@@ -1186,23 +1406,90 @@ function runShellCommand(
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    // Register synchronously, before any cancellation listener can observe
+    // the command. A normal shell exit releases background descendants; an
+    // aborted/timed-out command stays owned through TERM/KILL escalation.
+    const managed = processSupervisor?.register(child) ?? null;
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
+    let capturedBytes = 0;
+    let outputTruncated = false;
     let settled = false;
+    let abortRequested = false;
+    let timedOut = false;
+    let streamDestroyTimer: NodeJS.Timeout | undefined;
 
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    const capture = (target: Buffer[], chunk: Buffer | Uint8Array) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = limits.outputLimitBytes - capturedBytes;
+      if (remaining <= 0) {
+        if (buffer.length > 0) outputTruncated = true;
+        return;
+      }
+      const bytes = Math.min(remaining, buffer.length);
+      if (bytes > 0) {
+        // Copy the retained prefix. A subarray would keep the entire incoming
+        // chunk alive, allowing one noisy write to bypass the memory bound.
+        target.push(Buffer.from(buffer.subarray(0, bytes)));
+        capturedBytes += bytes;
+      }
+      if (bytes < buffer.length) outputTruncated = true;
+    };
+
+    const terminateAndEscalate = () => {
+      if (managed) {
+        void managed.terminate(abortRequested ? "abort" : "timeout");
+        return;
+      }
+      terminateProcessTree(child);
+      setTimeout(() => {
+        if (!isProcessGroupAlive(child.pid)) return;
+        terminateProcessTree(child, true);
+      }, 250);
+    };
+
+    const onAbort = () => {
+      if (settled) return;
+      abortRequested = true;
+      terminateAndEscalate();
+    };
+    const onTimeout = () => {
+      if (settled) return;
+      timedOut = true;
+      terminateAndEscalate();
+    };
+    const cleanup = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (streamDestroyTimer) clearTimeout(streamDestroyTimer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    const timeoutTimer = setTimeout(onTimeout, limits.timeoutMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+
+    child.stdout.on("data", (chunk: Buffer) => capture(stdout, chunk));
+    child.stderr.on("data", (chunk: Buffer) => capture(stderr, chunk));
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
+      cleanup();
+      // A failed spawn owns no live group; release the registration so a later
+      // runtime shutdown cannot wait on a child that never existed.
+      managed?.releaseAfterNormalExit();
       reject(err);
     });
-    child.on("exit", () => {
+    child.on("exit", (_exitCode, exitSignal) => {
+      // The shell is the command's foreground process. Once it exits normally,
+      // only inherited pipes from intentionally backgrounded work may remain;
+      // do not let the deadline kill that work during the short drain grace.
+      clearTimeout(timeoutTimer);
+      if (!abortRequested && !timedOut && exitSignal === null) managed?.releaseAfterNormalExit();
       // The shell exited. Normal commands will close their streams immediately,
       // firing "close" within milliseconds. For daemons that inherit stdio and
       // keep pipes open, forcefully destroy the streams after a brief grace
       // period so "close" fires and the Promise can resolve.
-      setTimeout(() => {
+      streamDestroyTimer = setTimeout(() => {
         if (!settled) {
           child.stdout.destroy();
           child.stderr.destroy();
@@ -1212,14 +1499,77 @@ function runShellCommand(
     child.on("close", (exitCode, closeSignal) => {
       if (settled) return;
       settled = true;
+      cleanup();
       resolve({
-        stdout: Buffer.concat(stdout).toString("utf8"),
-        stderr: Buffer.concat(stderr).toString("utf8"),
+        stdout: decodeCapturedOutput(stdout),
+        stderr: decodeCapturedOutput(stderr),
         exitCode,
         signal: closeSignal,
+        outputTruncated,
+        timedOut,
       });
     });
   });
+}
+
+export function isProcessGroupAlive(pid: number | undefined): boolean {
+  if (!pid) return false;
+  if (process.platform === "win32") {
+    // No POSIX process groups here: keep the previous behavior of leaving the
+    // escalation timer armed (taskkill on a dead pid fails harmlessly).
+    return true;
+  }
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    // ESRCH: the process group no longer exists. EPERM: it exists but is owned
+    // by another user — still alive, so leave escalation armed.
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+interface ShellCommandResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  outputTruncated: boolean;
+  timedOut: boolean;
+}
+
+function terminateProcessTree(child: ReturnType<typeof spawn>, force = false): void {
+  if (!child.pid) return;
+  const signal: NodeJS.Signals = force ? "SIGKILL" : "SIGTERM";
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    killer.on("error", () => {
+      try {
+        child.kill(signal);
+      } catch {
+        /* already exited */
+      }
+    });
+    killer.unref();
+    return;
+  }
+
+  try {
+    // detached=true makes the shell the process-group leader. A negative PID
+    // targets the whole group, including foreground descendants.
+    process.kill(-child.pid, signal);
+  } catch {
+    // The shell may have exited between the abort event and this call. Fall
+    // back to the direct child so the cancellation still settles promptly.
+    try {
+      child.kill(signal);
+    } catch {
+      /* already exited */
+    }
+  }
 }
 
 function formatCommandOutput(result: {
@@ -1227,12 +1577,79 @@ function formatCommandOutput(result: {
   stderr: string;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
-}): string {
+  outputTruncated?: boolean;
+  timedOut?: boolean;
+}, limits?: CommandLimits): string {
   const lines = [`Exit code: ${result.exitCode ?? "unknown"}`];
   if (result.signal) lines.push(`Signal: ${result.signal}`);
+  if (result.timedOut && limits) lines.push(`Command timed out after ${limits.timeoutMs} ms.`);
+  if (result.outputTruncated && limits) {
+    lines.push(`Output truncated: command output exceeded ${limits.outputLimitBytes} bytes.`);
+  }
   lines.push("", "STDOUT:", result.stdout.length > 0 ? result.stdout : "(empty)");
   lines.push("", "STDERR:", result.stderr.length > 0 ? result.stderr : "(empty)");
   return lines.join("\n");
+}
+
+/**
+ * Decode captured bytes without allowing malformed or partial UTF-8 to turn
+ * into a replacement character that is larger than the bytes we retained.
+ * Invalid bytes are discarded; valid UTF-8 sequences are copied unchanged.
+ */
+function decodeCapturedOutput(chunks: Buffer[]): string {
+  const bytes = Buffer.concat(chunks);
+  const valid: number[] = [];
+  let index = 0;
+  while (index < bytes.length) {
+    const first = bytes[index]!;
+    let length = 0;
+    if (first <= 0x7f) {
+      length = 1;
+    } else if (first >= 0xc2 && first <= 0xdf) {
+      length = validUtf8Continuation(bytes, index, 2) ? 2 : 0;
+    } else if (first === 0xe0) {
+      length = validUtf8Continuation(bytes, index, 3, 0xa0) ? 3 : 0;
+    } else if (first >= 0xe1 && first <= 0xec) {
+      length = validUtf8Continuation(bytes, index, 3) ? 3 : 0;
+    } else if (first === 0xed) {
+      length = validUtf8Continuation(bytes, index, 3, undefined, 0x9f) ? 3 : 0;
+    } else if (first >= 0xee && first <= 0xef) {
+      length = validUtf8Continuation(bytes, index, 3) ? 3 : 0;
+    } else if (first === 0xf0) {
+      length = validUtf8Continuation(bytes, index, 4, 0x90) ? 4 : 0;
+    } else if (first >= 0xf1 && first <= 0xf3) {
+      length = validUtf8Continuation(bytes, index, 4) ? 4 : 0;
+    } else if (first === 0xf4) {
+      length = validUtf8Continuation(bytes, index, 4, undefined, 0x8f) ? 4 : 0;
+    }
+
+    if (length > 0) {
+      for (let offset = 0; offset < length; offset++) valid.push(bytes[index + offset]!);
+      index += length;
+    } else {
+      index++;
+    }
+  }
+  return Buffer.from(valid).toString("utf8");
+}
+
+function validUtf8Continuation(
+  bytes: Buffer,
+  start: number,
+  length: number,
+  minimumSecond?: number,
+  maximumSecond?: number
+): boolean {
+  if (start + length > bytes.length) return false;
+  const second = bytes[start + 1]!;
+  if (minimumSecond !== undefined && second < minimumSecond) return false;
+  if (maximumSecond !== undefined && second > maximumSecond) return false;
+  if (second < 0x80 || second > 0xbf) return false;
+  for (let offset = 2; offset < length; offset++) {
+    const value = bytes[start + offset]!;
+    if (value < 0x80 || value > 0xbf) return false;
+  }
+  return true;
 }
 
 function unwrapVisionText(mcpResult: unknown): string {

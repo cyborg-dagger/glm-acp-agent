@@ -21,11 +21,12 @@ function withTmp<T>(fn: (dir: string) => T): T {
 
 test("credentialsPath honours XDG_CONFIG_HOME", () => {
   const old = process.env["XDG_CONFIG_HOME"];
+  const configuredRoot = join(tmpdir(), "custom", "xdg");
   try {
-    process.env["XDG_CONFIG_HOME"] = "/custom/xdg";
+    process.env["XDG_CONFIG_HOME"] = configuredRoot;
     assert.equal(
       credentialsPath(),
-      "/custom/xdg/glm-acp-agent/credentials.json"
+      join(configuredRoot, "glm-acp-agent", "credentials.json")
     );
   } finally {
     if (old === undefined) delete process.env["XDG_CONFIG_HOME"];
@@ -63,6 +64,19 @@ test("writeCredentials writes a 0600-permission file", () => {
     writeCredentials("k", path);
     const mode = statSync(path).mode & 0o777;
     assert.equal(mode, 0o600);
+  });
+});
+
+test("writeCredentials restricts an existing credentials file before replacing it", () => {
+  if (process.platform === "win32") return; // POSIX-only
+  withTmp((dir) => {
+    const path = join(dir, "credentials.json");
+    writeFileSync(path, '{"z_ai_api_key":"old-key"}\n', { mode: 0o644 });
+
+    writeCredentials("new-key", path);
+
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.equal(readCredentialsKey(path), "new-key");
   });
 });
 
