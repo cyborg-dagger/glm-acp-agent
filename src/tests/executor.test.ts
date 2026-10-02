@@ -179,7 +179,9 @@ function jsonResponse(
   return new Response(JSON.stringify(body), { ...init, headers });
 }
 
-function createFetchStub(responses: Response[]) {
+type FetchResponse = Response | ((request: Record<string, unknown>) => Response);
+
+function createFetchStub(responses: FetchResponse[]) {
   const calls: FetchCall[] = [];
   const fetchStub = async (url: string | URL | Request, init?: RequestInit) => {
     assert.ok(init, "fetch init is required");
@@ -189,7 +191,7 @@ function createFetchStub(responses: Response[]) {
     calls.push({ url: String(url), init, body, headers });
     const response = responses.shift();
     assert.ok(response, "unexpected fetch call");
-    return response;
+    return typeof response === "function" ? response(body) : response;
   };
   return { calls, fetchStub };
 }
@@ -213,7 +215,7 @@ async function withStoredApiKey<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 async function withMockedFetch<T>(
-  responses: Response[],
+  responses: FetchResponse[],
   fn: (calls: FetchCall[]) => Promise<T>
 ): Promise<T> {
   const oldFetch = globalThis.fetch;
@@ -1801,23 +1803,23 @@ test("web_search uses stored credentials and calls the Coding Plan MCP search to
   await withStoredApiKey(async () => {
     await withMockedFetch(
       [
-        jsonResponse(
+        request => jsonResponse(
           {
             jsonrpc: "2.0",
-            id: 1,
+            id: request.id,
             result: { protocolVersion: "2025-06-18", capabilities: {} },
           },
           { sessionId: "search-session" }
         ),
         new Response(null, { status: 202 }),
-        jsonResponse({
+        request => jsonResponse({
           jsonrpc: "2.0",
-          id: 2,
+          id: request.id,
           result: { tools: [{ name: "webSearchPrime", inputSchema: { properties: { search_query: { type: "string" } } } }] },
         }),
-        jsonResponse({
+        request => jsonResponse({
           jsonrpc: "2.0",
-          id: 3,
+          id: request.id,
           result: {
             content: [
               {
@@ -1871,20 +1873,20 @@ test("web_reader calls the Coding Plan MCP reader tool and formats reader_result
     process.env["Z_AI_API_KEY"] = "from-env";
     await withMockedFetch(
       [
-        jsonResponse({
+        request => jsonResponse({
           jsonrpc: "2.0",
-          id: 1,
+          id: request.id,
           result: { protocolVersion: "2025-06-18", capabilities: {} },
         }),
         new Response(null, { status: 202 }),
-        jsonResponse({
+        request => jsonResponse({
           jsonrpc: "2.0",
-          id: 2,
+          id: request.id,
           result: { tools: [{ name: "webReader" }] },
         }),
-        jsonResponse({
+        request => jsonResponse({
           jsonrpc: "2.0",
-          id: 3,
+          id: request.id,
           result: {
             content: [
               {
