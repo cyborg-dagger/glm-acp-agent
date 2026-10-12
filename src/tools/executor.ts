@@ -1047,6 +1047,7 @@ export class ToolExecutor {
       );
     }
 
+    // Step 1: announce the read as pending; approval follows before traffic.
     await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
@@ -1054,9 +1055,37 @@ export class ToolExecutor {
         toolCallId,
         title: elideStringForPreview(`Read URL: ${url}`),
         kind: "fetch",
-        status: "in_progress",
+        status: "pending",
         locations: url.length <= LOCATION_STRING_LIMIT ? [{ path: url }] : [],
         rawInput: elideForPreview(args),
+      },
+    });
+
+    // Step 2: ask before any reader traffic. The permission payload is the
+    // full arguments - the URL can carry sensitive data in its path or query,
+    // so the user must approve exactly what will be sent to the Z.AI reader.
+    const permissionResult = await this.maybeRequestPermission({
+      toolCallId,
+      kind: "fetch",
+      rawInput: args,
+      title: `Read URL: ${url}`,
+      locations: [{ path: url }],
+    });
+
+    // Fail closed: every outcome that is not an explicit allow (including any
+    // future variant) stops here instead of reaching the network below.
+    if (permissionResult.type !== "allow") {
+      return this.permissionDenialResult(toolCallId, "URL read", permissionResult);
+    }
+
+    // Step 3: announce in_progress; an interrupted announcement proves the
+    // reader request below never started.
+    await this.announceToolCall({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "in_progress",
       },
     });
 
@@ -1206,7 +1235,7 @@ export class ToolExecutor {
    */
   private async maybeRequestPermission(args: {
     toolCallId: string;
-    kind: "write" | "execute";
+    kind: "write" | "execute" | "fetch";
     rawInput: unknown;
     title: string;
     locations?: Array<{ path: string }>;
@@ -1234,7 +1263,7 @@ export class ToolExecutor {
         toolCall: {
           toolCallId: args.toolCallId,
           title: args.title,
-          kind: args.kind === "write" ? "edit" : "execute",
+          kind: args.kind === "write" ? "edit" : args.kind,
           status: "pending",
           locations: args.locations ?? [],
           // Passed through verbatim: callers hand us the full payload so the
@@ -1296,7 +1325,7 @@ export class ToolExecutor {
    */
   private async permissionDenialResult(
     toolCallId: string,
-    action: "Write" | "Edit" | "Command",
+    action: "Write" | "Edit" | "Command" | "URL read",
     permissionResult: Exclude<PermissionDecision, { type: "allow" }>
   ): Promise<ToolResult> {
     switch (permissionResult.type) {

@@ -21,6 +21,7 @@ interface StubTerminal {
 
 function createConnectionStub(opts: {
   permission?: "allow" | "reject" | "cancelled" | "missing" | "unoffered" | "unknown" | "null" | "empty" | "nonstring";
+  permissionError?: boolean;
   readError?: boolean;
   writeError?: boolean;
   terminalOutput?: string;
@@ -81,6 +82,7 @@ function createConnectionStub(opts: {
     async requestPermission(params: unknown) {
       permissionRequests.push(params);
       if (opts.onPermission) opts.onPermission();
+      if (opts.permissionError) throw new Error("permission transport failed");
       switch (opts.permission ?? "allow") {
         case "allow":
           return { outcome: { outcome: "selected", optionId: "allow" } };
@@ -2162,6 +2164,22 @@ test("web_reader calls the Coding Plan MCP reader tool and formats reader_result
         assert.match(result.content, /^# Example/);
         assert.match(result.content, /URL: https:\/\/example\.com\//);
         assert.match(result.content, /Main body/);
+        assert.equal(conn.permissionRequests.length, 1);
+        assert.deepEqual(conn.permissionRequests[0], {
+          sessionId: "s1",
+          toolCall: {
+            toolCallId: "tc-web-reader",
+            title: "Read URL: https://example.com/",
+            kind: "fetch",
+            status: "pending",
+            locations: [{ path: "https://example.com/" }],
+            rawInput: { url: "https://example.com/", return_format: "markdown" },
+          },
+          options: [
+            { kind: "allow_once", name: "Allow", optionId: "allow" },
+            { kind: "reject_once", name: "Skip", optionId: "reject" },
+          ],
+        });
         assert.ok(calls.every((call) => call.url === "https://api.z.ai/api/mcp/web_reader/mcp"));
         assert.equal(calls[3]?.headers.get("Mcp-Name"), "webReader");
         assert.deepEqual(calls[3]?.body.params, {
@@ -2174,6 +2192,179 @@ test("web_reader calls the Coding Plan MCP reader tool and formats reader_result
     if (oldEnv === undefined) delete process.env["Z_AI_API_KEY"];
     else process.env["Z_AI_API_KEY"] = oldEnv;
   }
+});
+
+test("web_reader rejected by user makes no network requests", async () => {
+  await withMockedFetch([], async (calls) => {
+    const conn = createConnectionStub({ permission: "reject" });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    const result = await exec.execute(
+      "tc-web-reader-reject",
+      "web_reader",
+      JSON.stringify({ url: "https://example.com/" })
+    );
+
+    assert.equal(result.content, "URL read rejected by user.");
+    assert.equal(conn.permissionRequests.length, 1);
+    assert.equal(calls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  });
+});
+
+test("web_reader cancelled by user makes no network requests", async () => {
+  await withMockedFetch([], async (calls) => {
+    const conn = createConnectionStub({ permission: "cancelled" });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    const result = await exec.execute(
+      "tc-web-reader-cancelled",
+      "web_reader",
+      JSON.stringify({ url: "https://example.com/" })
+    );
+
+    assert.equal(result.content, "URL read cancelled by user.");
+    assert.equal(conn.permissionRequests.length, 1);
+    assert.equal(calls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  });
+});
+
+for (const permission of [
+  "missing", "unoffered", "unknown", "null", "empty", "nonstring",
+] as const) {
+  test(`web_reader rejects unexpected ${permission} permission outcomes without network requests`, async () => {
+    await withMockedFetch([], async (calls) => {
+      const conn = createConnectionStub({ permission });
+      const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+      const result = await exec.execute(
+        "tc-web-reader-invalid-permission",
+        "web_reader",
+        JSON.stringify({ url: "https://example.com/" })
+      );
+
+      assert.equal(result.content, "URL read rejected by user.");
+      assert.equal(conn.permissionRequests.length, 1);
+      assert.equal(calls.length, 0);
+      const last = conn.updates.at(-1) as { update: { status?: string } };
+      assert.equal(last.update.status, "failed");
+    });
+  });
+}
+
+test("web_reader permission transport errors make no network requests", async () => {
+  await withMockedFetch([], async (calls) => {
+    const conn = createConnectionStub({ permissionError: true });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    const result = await exec.execute(
+      "tc-web-reader-permission-error",
+      "web_reader",
+      JSON.stringify({ url: "https://example.com/" })
+    );
+
+    assert.match(result.content, /Error requesting permission: permission transport failed/);
+    assert.equal(conn.permissionRequests.length, 1);
+    assert.equal(calls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  });
+});
+
+test("web_reader follows session modes for permission requests", async () => {
+  const oldEnv = process.env["Z_AI_API_KEY"];
+  try {
+    for (const mode of ["default", "accept_edits", "bypass_permissions"] as const) {
+      // The MCP client caches by endpoint + API key; isolate each four-call fixture.
+      process.env["Z_AI_API_KEY"] = `from-env-web-reader-${mode}`;
+      await withMockedFetch(
+        [
+          request => jsonResponse({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: { protocolVersion: "2025-06-18", capabilities: {} },
+          }),
+          new Response(null, { status: 202 }),
+          request => jsonResponse({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: { tools: [{ name: "webReader" }] },
+          }),
+          request => jsonResponse({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    reader_result: {
+                      title: "Example",
+                      url: "https://example.com/",
+                      content: "Main body",
+                    },
+                  }),
+                },
+              ],
+            },
+          }),
+        ],
+        async (calls) => {
+          const conn = createConnectionStub();
+          const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, undefined, () => mode);
+          const result = await exec.execute(
+            "tc-web-reader-mode",
+            "web_reader",
+            JSON.stringify({ url: "https://example.com/", return_format: "markdown" })
+          );
+
+          assert.equal(conn.permissionRequests.length, mode === "bypass_permissions" ? 0 : 1);
+          assert.match(result.content, /^# Example/);
+          assert.equal(calls.length, 4);
+          assert.deepEqual(calls[3]?.body.params, {
+            name: "webReader",
+            arguments: { url: "https://example.com/", return_format: "markdown" },
+          });
+        }
+      );
+    }
+  } finally {
+    if (oldEnv === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = oldEnv;
+  }
+});
+
+test("web_reader makes no network requests after the turn aborts while permission is pending", async () => {
+  const abortController = new AbortController();
+  let permissionStarted!: () => void;
+  let resolvePermission!: () => void;
+  const started = new Promise<void>((resolve) => { permissionStarted = resolve; });
+  const conn = {
+    updates: [] as Array<Record<string, unknown>>,
+    async sessionUpdate(payload: Record<string, unknown>) { this.updates.push(payload); },
+    async requestPermission() {
+      permissionStarted();
+      return new Promise<{ outcome: { outcome: "selected"; optionId: "allow" } }>((resolve) => {
+        resolvePermission = () => resolve({ outcome: { outcome: "selected", optionId: "allow" } });
+      });
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, abortController.signal);
+  await withMockedFetch([], async (calls) => {
+    const pending = exec.execute(
+      "tc1",
+      "web_reader",
+      JSON.stringify({ url: "https://example.com/" })
+    );
+    await started;
+    abortController.abort();
+    resolvePermission();
+    const result = await pending;
+
+    assert.equal(result.content, "URL read cancelled by turn.");
+    assert.equal(calls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  });
 });
 
 test("web_search reports Coding Plan 1113 MCP errors as actionable failed tool results", async () => {

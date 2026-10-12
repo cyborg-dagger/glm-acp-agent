@@ -102,7 +102,7 @@ The agent does not run tools inside an OS or container sandbox. Shell commands a
 | `list_files` | Agent process | Always silent | List a directory through a bounded iterator; a truncated result is a disclosed subset. |
 | `run_command` | Agent process | Mode-dependent | Run an arbitrary shell command; cancelling a turn terminates its shell process group, while intentionally backgrounded processes survive a normal shell exit. Silent only in `bypass_permissions`. |
 | `web_search` | Agent (Z.AI Coding Plan MCP) | Always silent | Search the web — returns titles, URLs, and summaries |
-| `web_reader` | Agent (Z.AI Coding Plan MCP) | Always silent | Fetch and parse a web page (markdown or plain text) |
+| `web_reader` | Agent (Z.AI Coding Plan MCP) | Mode-dependent | Fetch and parse a web page (markdown or plain text). The approval prompt carries the full URL; rejection, cancellation, or permission transport errors make no network request. Silent only in `bypass_permissions`. |
 | `image_analysis` | Agent (Z.AI Vision MCP, stdio) | Always silent | Analyze a local image path or remote URL using `@z_ai/mcp-server` |
 
 Editor edits use an optimistic read followed by a full-buffer write. ACP's `fs/write_text_file` request has no version precondition, so edits made during that write RPC can still race with the replacement. The final read preserves unrelated changes already present and rejects a target snippet that has disappeared or become ambiguous.
@@ -111,13 +111,13 @@ Editor edits use an optimistic read followed by a full-buffer write. ACP's `fs/w
 
 Clients can use `session/set_mode` to drive the permission policy:
 
-| Mode ID | Name | `write_file` | `run_command` |
-|---|---|---|---|
-| `default` | Ask for permission | **Prompt** | **Prompt** |
-| `accept_edits` | Auto-approve edits | Silent | **Prompt** |
-| `bypass_permissions` | Bypass all permissions | Silent | Silent |
+| Mode ID | Name | `write_file` | `run_command` | `web_reader` |
+|---|---|---|---|---|
+| `default` | Ask for permission | **Prompt** | **Prompt** | **Prompt** |
+| `accept_edits` | Auto-approve edits | Silent | **Prompt** | **Prompt** |
+| `bypass_permissions` | Bypass all permissions | Silent | Silent | Silent |
 
-Reads, listings, and MCP tool calls are always silent across all modes.
+Reads, listings, `web_search`, and session MCP tool calls are always silent across all modes, while `web_reader` follows the mode-dependent approval above.
 
 Permission prompts always carry the full, unelided tool arguments, so the user approves exactly what will run. The prompt offers exactly `allow` and `reject`, and a tool runs only when the response selects `allow` with outcome `selected`; anything else — a missing or unrecognised option id, an unknown outcome string, or a null/absent response — is treated as reject. An explicit `cancelled` outcome remains distinct from rejection.
 
