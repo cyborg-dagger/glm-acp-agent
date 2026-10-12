@@ -351,7 +351,9 @@ export class ToolExecutor {
     if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const absolutePath = await this.resolveConfinedReadPath(path);
+      if (this.signal?.aborted) throw new Error("The operation was aborted");
       const page = await this.readTextPage(absolutePath, offset, limit);
+      if (this.signal?.aborted) throw new Error("The operation was aborted");
       if (page.eof) {
         const content = `[end of file: offset ${offset} is beyond the end of ${path}]`;
         await this.connection.sessionUpdate({
@@ -605,15 +607,33 @@ export class ToolExecutor {
       // lookahead line tells us whether to advertise another request; no page
       // is misrepresented as a whole-buffer line count.
       const readEditorLines = async (line: number, pageLimit: number): Promise<string[]> => {
-        const response = await this.connection.readTextFile({
+        const signal = this.signal;
+        if (signal?.aborted) throw new Error("The operation was aborted");
+        const readPromise = this.connection.readTextFile({
           sessionId: this.sessionId, path, line, limit: pageLimit,
         } as never);
-        if (Buffer.byteLength(response.content, "utf8") > this.resourceLimits.fileReadBytes) {
-          throw new Error(`editor buffer exceeds the ${this.resourceLimits.fileReadBytes}-byte read/edit limit`);
+        let abortHandler: (() => void) | undefined;
+        try {
+          // Stop waiting on abort, not the already-admitted remote read. The
+          // race keeps its late rejection observed and discards late content.
+          const response = await (signal ? Promise.race([
+            readPromise,
+            new Promise<never>((_resolve, reject) => {
+              abortHandler = () => reject(new Error("The operation was aborted"));
+              signal.addEventListener("abort", abortHandler, { once: true });
+              if (signal.aborted) abortHandler();
+            }),
+          ]) : readPromise);
+          if (signal?.aborted) throw new Error("The operation was aborted");
+          if (Buffer.byteLength(response.content, "utf8") > this.resourceLimits.fileReadBytes) {
+            throw new Error(`editor buffer exceeds the ${this.resourceLimits.fileReadBytes}-byte read/edit limit`);
+          }
+          const lines = response.content.split("\n");
+          if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+          return lines;
+        } finally {
+          if (abortHandler) signal!.removeEventListener("abort", abortHandler);
         }
-        const lines = response.content.split("\n");
-        if (lines.length > 0 && lines.at(-1) === "") lines.pop();
-        return lines;
       };
       let lines = await readEditorLines(offset, limit + 1);
       let legacyFullBuffer = false;

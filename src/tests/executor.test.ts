@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { getEventListeners } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -111,6 +112,30 @@ const FULL_CAPS = {
   fs: { readTextFile: true, writeTextFile: true },
   terminal: true,
 };
+
+function deferredRead<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
+
+async function withinReadDeadline<T>(promise: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("read did not settle within test deadline")), 2_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -445,6 +470,27 @@ test("read_file rejects paths and symlinks that escape the session workspace", a
   }
 });
 
+test("read_file rejects a missing editor leaf beneath an existing outside parent", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-read-missing-leaf-workspace-")));
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), "glm-read-missing-leaf-outside-")));
+  const path = join(outside, "unsaved.txt");
+  try {
+    assert.equal(existsSync(path), false);
+    for (const caps of [{ fs: { readTextFile: true } }, FULL_CAPS]) {
+      const conn = createConnectionStub({ clientFileContent: "must not read outside buffer" });
+      const exec = new ToolExecutor(conn as never, "s1", caps, undefined, null, null, dir);
+      const result = await exec.execute("outside-leaf", "read_file", JSON.stringify({ path }));
+      assert.match(result.content, /path must remain inside the session workspace/);
+      assert.equal(conn.readTextFileCalls.length, 0);
+      const last = conn.updates.at(-1) as { update: { status?: string } };
+      assert.equal(last.update.status, "failed");
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 test("read_file accepts absolute paths that resolve inside the workspace", async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-absolute-")));
   const path = join(dir, "note.txt");
@@ -542,6 +588,116 @@ test("read_file follows an in-workspace symlink to another workspace file", asyn
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const caps of [{ fs: { readTextFile: true } }, FULL_CAPS]) {
+  const clientKind = caps === FULL_CAPS ? "read+write" : "read-only";
+
+  test(`read_file cancellation during confinement prevents client reads (${clientKind})`, async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-read-abort-confinement-")));
+    const controller = new AbortController();
+    const held = deferredRead<void>();
+    const started = deferredRead<void>();
+    const conn = createConnectionStub({ clientFileContent: "late buffer contents" });
+    const exec = new ToolExecutor(conn as never, "s1", caps, controller.signal, null, null, dir);
+    const paths = exec as unknown as { resolveConfinedReadPath(path: string): Promise<string> };
+    const resolvePath = paths.resolveConfinedReadPath.bind(exec);
+    paths.resolveConfinedReadPath = async path => {
+      started.resolve();
+      await held.promise;
+      return resolvePath(path);
+    };
+    const pending = exec.execute("read-abort-path", "read_file", JSON.stringify({ path: "buffer.txt" }));
+    try {
+      await withinReadDeadline(started.promise);
+      controller.abort();
+      held.resolve();
+      const result = await withinReadDeadline(pending);
+      assert.match(result.content, /The operation was aborted/);
+      assert.equal(conn.readTextFileCalls.length, 0);
+      const statuses = conn.updates.map(update => (update.update as { status?: string }).status);
+      assert.deepEqual(statuses, ["in_progress", "failed"]);
+      assert.doesNotMatch(JSON.stringify(conn.updates), /late buffer contents/);
+    } finally {
+      controller.abort();
+      held.resolve();
+      await withinReadDeadline(Promise.allSettled([pending]));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test(`read_file cancellation in the first editor page prevents the EOF probe (${clientKind})`, async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-read-abort-first-page-")));
+    const controller = new AbortController();
+    const requestedLines: Array<number | undefined> = [];
+    const conn = createConnectionStub();
+    conn.readTextFile = async (params: { sessionId: string; path: string; line?: number }) => {
+      conn.readTextFileCalls.push(params);
+      requestedLines.push(params.line);
+      controller.abort();
+      return { content: "late first-page content" };
+    };
+    const exec = new ToolExecutor(conn as never, "s1", caps, controller.signal, null, null, dir);
+    try {
+      const result = await withinReadDeadline(exec.execute("read-abort-page", "read_file", JSON.stringify({
+        path: "buffer.txt", offset: 2, limit: 2,
+      })));
+      assert.match(result.content, /The operation was aborted/);
+      assert.deepEqual(requestedLines, [2]);
+      assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+      const statuses = conn.updates.map(update => (update.update as { status?: string }).status);
+      assert.deepEqual(statuses, ["in_progress", "failed"]);
+      assert.doesNotMatch(JSON.stringify(conn.updates), /late first-page content/);
+    } finally {
+      controller.abort();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const lateOutcome of ["resolve", "reject"] as const) {
+    test(`read_file cancellation settles a pending editor read and ignores late ${lateOutcome} (${clientKind})`, async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-read-abort-pending-")));
+      const controller = new AbortController();
+      const held = deferredRead<{ content: string }>();
+      const started = deferredRead<void>();
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+      process.on("unhandledRejection", onUnhandled);
+      const conn = createConnectionStub();
+      conn.readTextFile = params => {
+        conn.readTextFileCalls.push(params);
+        started.resolve();
+        return held.promise;
+      };
+      const exec = new ToolExecutor(conn as never, "s1", caps, controller.signal, null, null, dir);
+      const pending = exec.execute("read-abort-pending", "read_file", JSON.stringify({ path: "buffer.txt" }));
+      try {
+        await withinReadDeadline(started.promise);
+        controller.abort();
+        const result = await withinReadDeadline(pending);
+        assert.equal(result.content, "Error reading file: The operation was aborted");
+        assert.equal(conn.readTextFileCalls.length, 1, "the already-admitted RPC is not undone");
+        assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+        const statuses = conn.updates.map(update => (update.update as { status?: string }).status);
+        assert.deepEqual(statuses, ["in_progress", "failed"]);
+        const beforeLateSettlement = JSON.stringify(conn.updates);
+        if (lateOutcome === "resolve") held.resolve({ content: "late remote secret" });
+        else held.reject(new Error("late editor transport rejection"));
+        await new Promise<void>(resolve => setImmediate(resolve));
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(JSON.stringify(conn.updates), beforeLateSettlement);
+        assert.doesNotMatch(JSON.stringify(conn.updates), /late remote secret/);
+        assert.deepEqual(unhandled, []);
+      } finally {
+        controller.abort();
+        held.resolve({ content: "teardown" });
+        await withinReadDeadline(Promise.allSettled([pending]));
+        await new Promise<void>(resolve => setImmediate(resolve));
+        process.off("unhandledRejection", onUnhandled);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+}
 
 test("read_file truncates large files with a range marker", async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-read-truncate-")));
@@ -2328,6 +2484,36 @@ test("web_reader rejected by user makes no network requests", async () => {
     assert.equal(result.content, "URL read rejected by user.");
     assert.equal(conn.permissionRequests.length, 1);
     assert.equal(calls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  });
+});
+
+test("web_reader rejects a long URL with full approval payload and bounded tool cards", async () => {
+  const url = `https://example.com/${"s".repeat(50_000)}`;
+  await withMockedFetch([], async calls => {
+    const conn = createConnectionStub({ permission: "reject" });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    const result = await exec.execute("long-url", "web_reader", JSON.stringify({ url }));
+    assert.equal(result.content, "URL read rejected by user.");
+    assert.equal(calls.length, 0);
+    assert.equal(conn.permissionRequests.length, 1);
+    const permission = conn.permissionRequests[0] as { toolCall: Record<string, unknown> };
+    assert.deepEqual(permission.toolCall, {
+      toolCallId: "long-url",
+      title: `Read URL: ${url}`,
+      kind: "fetch",
+      status: "pending",
+      locations: [{ path: url }],
+      rawInput: { url },
+    });
+    const card = conn.updates[0]?.update as { title: string; locations: unknown[]; rawInput: { url: string } };
+    assert.ok(card.title.length <= 240);
+    assert.ok(card.rawInput.url.length <= 240);
+    assert.notEqual(card.title, permission.toolCall.title);
+    assert.notEqual(card.rawInput.url, url);
+    assert.deepEqual(card.locations, []);
+    for (const update of conn.updates) assert.ok(Buffer.byteLength(JSON.stringify(update), "utf8") < 16_384);
     const last = conn.updates.at(-1) as { update: { status?: string } };
     assert.equal(last.update.status, "failed");
   });
