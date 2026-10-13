@@ -3081,13 +3081,17 @@ test("image_analysis rejects a local image_source outside the workspace and make
     const vision = recordingVisionClient(visionCalls);
     const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision, null, dir);
     for (const path of [outsidePath, join("..", basename(outsidePath))]) {
+      conn.updates.length = 0;
       const result = await exec.execute(
         "tc-image-outside",
         "image_analysis",
         JSON.stringify({ image_source: path, prompt: "describe" })
       );
       assert.match(result.content, /path must remain inside the session workspace/);
-      const last = conn.updates.at(-1) as { update: { status?: string } };
+      assertInitialImageAnnouncement(conn, "tc-image-outside", { image_source: path, prompt: "describe" });
+      assert.equal(conn.updates.length, 2);
+      const last = conn.updates.at(-1) as { update: { sessionUpdate?: string; status?: string } };
+      assert.equal(last.update.sessionUpdate, "tool_call_update");
       assert.equal(last.update.status, "failed");
     }
     assert.equal(visionCalls.length, 0);
@@ -3115,7 +3119,10 @@ test("image_analysis passes the resolved workspace path to vision for a local im
       visionCalls.map((c) => ({ toolName: c.toolName, source: c.args["image_source"] })),
       [{ toolName: "image_analysis", source: join(dir, "cat.png") }]
     );
-    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assertInitialImageAnnouncement(conn, "tc-image-inside", { image_source: "cat.png", prompt: "describe" });
+    assert.equal(conn.updates.length, 2);
+    const last = conn.updates.at(-1) as { update: { sessionUpdate?: string; status?: string } };
+    assert.equal(last.update.sessionUpdate, "tool_call_update");
     assert.equal(last.update.status, "completed");
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -3139,7 +3146,10 @@ test("image_analysis rejects a workspace symlink pointing outside and makes no v
     );
     assert.match(result.content, /path must remain inside the session workspace/);
     assert.equal(visionCalls.length, 0);
-    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assertInitialImageAnnouncement(conn, "tc-image-symlink", { image_source: "escape.png", prompt: "describe" });
+    assert.equal(conn.updates.length, 2);
+    const last = conn.updates.at(-1) as { update: { sessionUpdate?: string; status?: string } };
+    assert.equal(last.update.sessionUpdate, "tool_call_update");
     assert.equal(last.update.status, "failed");
   } finally {
     rmSync(dir, { recursive: true, force: true });
