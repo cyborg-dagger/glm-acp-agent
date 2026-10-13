@@ -2602,6 +2602,27 @@ function fakeVisionClient(impl: VisionMcpClient["callTool"]): VisionMcpClient {
   };
 }
 
+function assertInitialImageAnnouncement(
+  conn: { updates: Array<Record<string, unknown>> },
+  toolCallId: string,
+  args: Record<string, unknown>,
+  status: "pending" | "in_progress" = "in_progress",
+): void {
+  const source = String(args["image_source"]);
+  assert.deepEqual(conn.updates[0], {
+    sessionId: "s1",
+    update: {
+      sessionUpdate: "tool_call",
+      toolCallId,
+      title: `Analyze image: ${source}`,
+      kind: "fetch",
+      status,
+      locations: [{ path: source }],
+      rawInput: args,
+    },
+  });
+}
+
 test("image_analysis routes through the injected vision client and returns the text", async () => {
   const conn = createConnectionStub();
   const vision = fakeVisionClient(async (toolName, args) => {
@@ -2632,7 +2653,10 @@ test("image_analysis surfaces vision errors as a failed tool result", async () =
     JSON.stringify({ image_source: "/tmp/x.png" })
   );
   assert.match(result.content, /quota exceeded/);
-  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assertInitialImageAnnouncement(conn, "tc1", { image_source: "/tmp/x.png" });
+  assert.equal(conn.updates.length, 2);
+  const last = conn.updates.at(-1) as { update: { sessionUpdate?: string; status?: string } };
+  assert.equal(last.update.sessionUpdate, "tool_call_update");
   assert.equal(last.update.status, "failed");
 });
 
@@ -2671,6 +2695,80 @@ function failAfter(ms: number, message: string): Promise<never> {
   });
   failure.catch(() => { /* handled by whoever wins the race */ });
   return failure;
+}
+
+const imagePathBackslash = String.fromCharCode(92);
+const nonLocalImageSources = [
+  ["HTTP URL without slashes", "https:attacker.example/x.png"],
+  ["HTTP URL with backslashes", ["http:", "", "attacker.example", "x.png"].join(imagePathBackslash)],
+  ["FTP scheme", "ftp://attacker.example/x.png"],
+  ["file scheme", "file:///outside-workspace.png"],
+  ["data scheme", "data:image/png;base64,AA=="],
+  ["custom scheme", "vision+remote:attacker.example/x.png"],
+  ["drive-relative scheme-like source", "C:cat.png"],
+  ["embedded tab", "ht" + String.fromCharCode(9) + "tps://attacker.example/x.png"],
+  ["embedded newline", "ht" + String.fromCharCode(10) + "tps://attacker.example/x.png"],
+  ["embedded carriage return", "ht" + String.fromCharCode(13) + "tps://attacker.example/x.png"],
+  ["leading NUL", String.fromCharCode(0) + "https://attacker.example/x.png"],
+  ["DEL in a path", "images/" + String.fromCharCode(127) + "cat.png"],
+  ["control in a Windows drive path", "C:/images/" + String.fromCharCode(9) + "cat.png"],
+  ["protocol-relative source", "//attacker.example/x.png"],
+  ["UNC source", imagePathBackslash.repeat(2) + "attacker.example" + imagePathBackslash + "x.png"],
+  ["mixed network-authority prefix", "/" + imagePathBackslash + "attacker.example/x.png"],
+] as const;
+
+for (const [label, source] of nonLocalImageSources) {
+  test(`image_analysis requires approval for ${label}`, async () => {
+    const args = { image_source: source, prompt: "describe" };
+    for (const mode of ["default", "accept_edits"] as const) {
+      const conn = createConnectionStub({ permission: "reject" });
+      const calls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+      const exec = new ToolExecutor(
+        conn as never, "s1", FULL_CAPS, undefined, recordingVisionClient(calls),
+        null, process.cwd(), () => mode,
+      );
+      const result = await exec.execute("tc-non-local", "image_analysis", JSON.stringify(args));
+      assert.equal(result.content, "Image analysis rejected by user.");
+      assert.equal(conn.permissionRequests.length, 1);
+      const request = conn.permissionRequests[0] as { toolCall: { rawInput: unknown; locations: unknown } };
+      assert.deepEqual(request.toolCall.rawInput, args);
+      assert.deepEqual(request.toolCall.locations, [{ path: source }]);
+      assert.equal(calls.length, 0);
+      assertInitialImageAnnouncement(conn, "tc-non-local", args, "pending");
+    }
+
+    const conn = createConnectionStub({ permission: "allow" });
+    const calls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, recordingVisionClient(calls));
+    const result = await exec.execute("tc-non-local-allowed", "image_analysis", JSON.stringify(args));
+    assert.equal(result.content, "A tabby cat.");
+    assert.equal(conn.permissionRequests.length, 1);
+    assert.deepEqual(calls, [{ toolName: "image_analysis", args }]);
+    assertInitialImageAnnouncement(conn, "tc-non-local-allowed", args, "pending");
+    assert.deepEqual(conn.updates.map(({ update }) => {
+      const event = update as { sessionUpdate: string; status: string };
+      return [event.sessionUpdate, event.status];
+    }), [["tool_call", "pending"], ["tool_call_update", "in_progress"], ["tool_call_update", "completed"]]);
+  });
+}
+
+for (const [label, source] of [
+  ["relative", "images/cat.png"],
+  ["absolute", "/workspace/images/cat.png"],
+  ["spaces", "images/my cat.png"],
+  ["Windows forward slashes", "C:/images/cat.png"],
+  ["Windows backslashes", ["C:", "images", "cat.png"].join(imagePathBackslash)],
+] as const) {
+  test(`image_analysis does not request approval for ${label} local path syntax`, async () => {
+    const conn = createConnectionStub({ permission: "reject" });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, fakeVisionClient(async () => ({
+      content: [{ type: "text", text: "A tabby cat." }],
+    })));
+    const args = { image_source: source };
+    await exec.execute("tc-local-syntax", "image_analysis", JSON.stringify(args));
+    assert.equal(conn.permissionRequests.length, 0);
+    assertInitialImageAnnouncement(conn, "tc-local-syntax", args);
+  });
 }
 
 test("image_analysis rejected by user makes no vision calls for remote image sources", async () => {
@@ -2879,6 +2977,8 @@ test("image_analysis does not prompt for local image sources", async () => {
   const conn = createConnectionStub({ permission: "reject" });
   const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
   const vision = fakeVisionClient(async (toolName, args) => {
+    assertInitialImageAnnouncement(conn, "tc-image-local", { image_source: "/tmp/cat.png", prompt: "describe" });
+    assert.equal(conn.updates.length, 1, "local analysis is announced before Vision dispatch");
     visionCalls.push({ toolName, args });
     assert.equal(args["image_source"], "/tmp/cat.png");
     return { content: [{ type: "text", text: "A tabby cat." }] };
@@ -2893,7 +2993,10 @@ test("image_analysis does not prompt for local image sources", async () => {
   assert.equal(result.content, "A tabby cat.");
   assert.equal(conn.permissionRequests.length, 0);
   assert.equal(visionCalls.length, 1);
-  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assertInitialImageAnnouncement(conn, "tc-image-local", { image_source: "/tmp/cat.png", prompt: "describe" });
+  assert.equal(conn.updates.length, 2);
+  const last = conn.updates.at(-1) as { update: { sessionUpdate?: string; status?: string } };
+  assert.equal(last.update.sessionUpdate, "tool_call_update");
   assert.equal(last.update.status, "completed");
 });
 

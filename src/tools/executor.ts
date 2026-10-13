@@ -70,11 +70,17 @@ const PREVIEW_WALK_BUDGET_BYTES = 262_144;
 const PREVIEW_ELIDED_KEY = "[elided]";
 
 /**
- * Whether an image_source is a remote http(s) URL — the only form that makes
- * the Vision MCP perform network egress (and thus needs the fetch gate).
+ * Skip approval only for clearly local paths. The Vision MCP owns source
+ * parsing, so alternate schemes, network-style paths, and parser-sensitive
+ * controls must not silently reach it. A Windows drive is not a URL scheme.
  */
-function isRemoteHttpUrl(source: string): boolean {
-  return /^https?:\/\//i.test(source);
+function isLocalImagePath(source: string): boolean {
+  for (let index = 0; index < source.length; index++) {
+    const code = source.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return false;
+  }
+  if (/^[\\\\/]{2}/.test(source)) return false;
+  return /^[a-z]:[\\\\/]/i.test(source) || !/^[a-z][a-z0-9+.-]*:/i.test(source);
 }
 
 /** Count non-overlapping literal matches; snippet must be non-empty. */
@@ -1153,27 +1159,25 @@ export class ToolExecutor {
       );
     }
 
-    // A remote URL makes the Vision MCP perform network egress, so URL fetches
-    // are gated exactly like web_reader: approval before any traffic. Local
-    // paths skip the gate (confining local reads is a separate concern).
-    if (isRemoteHttpUrl(imageSource)) {
-      // Step 1: announce the analysis as pending; approval follows before traffic.
-      await this.announceToolCall({
-        sessionId: this.sessionId,
-        update: {
-          sessionUpdate: "tool_call",
-          toolCallId,
-          title: elideStringForPreview(`Analyze image: ${imageSource}`),
-          kind: "fetch",
-          status: "pending",
-          locations: imageSource.length <= LOCATION_STRING_LIMIT ? [{ path: imageSource }] : [],
-          rawInput: elideForPreview(args),
-        },
-      });
+    const isLocalSource = isLocalImagePath(imageSource);
+    // Every source gets an initial card before confinement or Vision dispatch.
+    // Only clearly local paths skip approval; all other forms fail closed.
+    await this.announceToolCall({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: elideStringForPreview(`Analyze image: ${imageSource}`),
+        kind: "fetch",
+        status: isLocalSource ? "in_progress" : "pending",
+        locations: imageSource.length <= LOCATION_STRING_LIMIT ? [{ path: imageSource }] : [],
+        rawInput: elideForPreview(args),
+      },
+    });
 
-      // Step 2: ask before any fetch traffic. The permission payload is the
-      // full arguments - the URL can carry sensitive data in its path or query,
-      // so the user must approve exactly what will be sent to the Vision MCP.
+    if (!isLocalSource) {
+      // Ask before dispatching a non-local source. Keep the full arguments so
+      // the user approves exactly what will be sent to the Vision MCP.
       const permissionResult = await this.maybeRequestPermission({
         toolCallId,
         kind: "fetch",

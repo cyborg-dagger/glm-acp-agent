@@ -39,7 +39,7 @@ Built-in web tools use Coding Plan-compatible MCP endpoints, not the general `/a
 - **Session persistence** – conversations are written to `~/.local/state/glm-acp-agent/sessions/` and can be reloaded via `session/load`, branched via `session/fork`, or resumed without replay via `session/resume`
 - **Nine built-in tools** (see below)
 - **Self-sufficient local tools** – directory listings and shell commands always run in the agent process; file tools fall back to local filesystem access when ACP client `fs` capabilities are unavailable
-- **Configurable permissions** – `write_file`, `run_command`, `web_reader`, and remote-URL `image_analysis` behavior depends on the active session mode (prompts by default)
+- **Configurable permissions** – `write_file`, `run_command`, `web_reader`, and non-local `image_analysis` behavior depends on the active session mode (prompts by default)
 - **Protocol-correct stop reasons** – maps model and runtime conditions to ACP `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled`
 - **Protocol-correct tool statuses** – `pending` → `in_progress` → `completed` / `failed`
 - **Token usage reporting** – aggregated usage is returned on the `session/prompt` response
@@ -67,7 +67,7 @@ ACP Client (IDE plugin, CLI, …)
         └─ VisionMcpClient ← spawns `npx @z_ai/mcp-server` on demand
 ```
 
-The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations use paths resolved against the ACP session working directory. When the client advertises `fs.writeTextFile`, writes and edits are routed through the ACP client so they render as native diffs. When it advertises both `fs.readTextFile` and `fs.writeTextFile`, `read_file` and edit-file reads also use the editor buffer; otherwise those reads fall back to the agent process filesystem. Writes and arbitrary shell commands still go through ACP `session/request_permission`, as do `web_reader` calls and `image_analysis` calls whose `image_source` is a remote http(s) URL, and the permission payload is always the **full** tool arguments — the user approves exactly what will run.
+The agent process needs network access to `api.z.ai` for chat completions and Web MCP, plus `npx` available on `PATH` so it can launch `@z_ai/mcp-server` for vision. Filesystem and shell operations use paths resolved against the ACP session working directory. When the client advertises `fs.writeTextFile`, writes and edits are routed through the ACP client so they render as native diffs. When it advertises both `fs.readTextFile` and `fs.writeTextFile`, `read_file` and edit-file reads also use the editor buffer; otherwise those reads fall back to the agent process filesystem. Writes and arbitrary shell commands still go through ACP `session/request_permission`, as do `web_reader` calls and `image_analysis` calls whose `image_source` is a non-local source, and the permission payload is always the **full** tool arguments — the user approves exactly what will run.
 
 Client-facing tool cards stay compact: long strings in `rawInput`/`rawOutput` are elided to a short head plus a character count, and every completed or failed card's visible text — including the `read_file` content preview — is bounded to an aggregate 16 KiB UTF-8 budget; oversized previews end with `[… N bytes elided in preview; full result sent to model]` and card titles are elided to 240 characters. The model still receives the full tool result, capped at 256 KiB by `ACP_GLM_TOOL_RESULT_LIMIT_BYTES`; write payloads and permission requests remain complete. Progress narration lives in the `todowrite` task list rather than prose, and reasoning tokens are only forwarded as `agent_thought_chunk` when `ACP_GLM_STREAM_THINKING` is not `false` (the default preserves streaming).
 
@@ -87,7 +87,7 @@ Before provider requests, the agent estimates context use with a heuristic rathe
 
 ### Trust boundary
 
-The agent does not run tools inside an OS or container sandbox. Shell commands and local filesystem fallbacks run with the agent process's OS-user permissions; shell children inherit its environment, and commands can access the network available to that user. ACP permission prompts and session modes govern consent behavior but do not provide process isolation. Built-in network tools follow that consent model: `web_search` is deliberately silent because its query goes only to Z.AI's service (there is no attacker-chosen host), `web_reader` fetches only the approved initial URL (redirects followed by the reader service are not re-prompted), and `image_analysis` fetches a remote URL only after approval. Treat workspaces, prompts, and MCP configurations as trusted, and use external OS/container isolation when you need a stronger boundary.
+The agent does not run tools inside an OS or container sandbox. Shell commands and local filesystem fallbacks run with the agent process's OS-user permissions; shell children inherit its environment, and commands can access the network available to that user. ACP permission prompts and session modes govern consent behavior but do not provide process isolation. Built-in network tools follow that consent model: `web_search` is deliberately silent because its query goes only to Z.AI's service (there is no attacker-chosen host), `web_reader` fetches only the approved initial URL (redirects followed by the reader service are not re-prompted), and `image_analysis` passes non-local sources to Vision only after approval. Treat workspaces, prompts, and MCP configurations as trusted, and use external OS/container isolation when you need a stronger boundary.
 
 ---
 
@@ -103,7 +103,7 @@ The agent does not run tools inside an OS or container sandbox. Shell commands a
 | `run_command` | Agent process | Mode-dependent | Run an arbitrary shell command; cancelling a turn terminates its shell process group, while intentionally backgrounded processes survive a normal shell exit. Silent only in `bypass_permissions`. |
 | `web_search` | Agent (Z.AI Coding Plan MCP) | Always silent | Search the web — returns titles, URLs, and summaries. Deliberately silent egress: the query goes to Z.AI's service only; there is no attacker-chosen host. |
 | `web_reader` | Agent (Z.AI Coding Plan MCP) | Mode-dependent | Fetch and parse a web page (markdown or plain text). The approval prompt carries the full URL; rejection, cancellation, or permission transport errors make no network request. The approval covers the initial URL — redirects followed by the reader service are not re-prompted. Silent only in `bypass_permissions`. |
-| `image_analysis` | Agent (Z.AI Vision MCP, stdio) | Mode-dependent (URL) | Analyze a local image path or remote URL using `@z_ai/mcp-server`. A remote http(s) URL requires approval first: the prompt carries the full `image_source`, and rejection, cancellation, or permission transport errors make no Vision MCP call. URLs are silent only in `bypass_permissions`; local paths stay silent in all modes. |
+| `image_analysis` | Agent (Z.AI Vision MCP, stdio) | Mode-dependent (non-local) | Analyze a local image path or remote URL using `@z_ai/mcp-server`. A non-local source requires approval first: the prompt carries the full `image_source`, and rejection, cancellation, or permission transport errors make no Vision MCP call. Non-local sources are silent only in `bypass_permissions`; clearly local paths stay silent in all modes. |
 
 Editor edits use an optimistic read followed by a full-buffer write. ACP's `fs/write_text_file` request has no version precondition, so edits made during that write RPC can still race with the replacement. The final read preserves unrelated changes already present and rejects a target snippet that has disappeared or become ambiguous.
 
@@ -111,13 +111,15 @@ Editor edits use an optimistic read followed by a full-buffer write. ACP's `fs/w
 
 Clients can use `session/set_mode` to drive the permission policy:
 
-| Mode ID | Name | `write_file` | `run_command` | `web_reader` | `image_analysis` (URL) |
+| Mode ID | Name | `write_file` | `run_command` | `web_reader` | `image_analysis` (non-local) |
 |---|---|---|---|---|---|
 | `default` | Ask for permission | **Prompt** | **Prompt** | **Prompt** | **Prompt** |
 | `accept_edits` | Auto-approve edits | Silent | **Prompt** | **Prompt** | **Prompt** |
 | `bypass_permissions` | Bypass all permissions | Silent | Silent | Silent | Silent |
 
-Reads, listings, `web_search`, and session MCP tool calls are always silent across all modes, while `web_reader` and `image_analysis` with a remote http(s) URL follow the mode-dependent approval above. Local `image_analysis` paths stay silent in every mode.
+Reads, listings, `web_search`, and session MCP tool calls are always silent across all modes, while `web_reader` and `image_analysis` with a non-local source follow the mode-dependent approval above. Local `image_analysis` paths stay silent in every mode.
+
+`image_analysis` skips approval only for clearly local paths: ordinary relative/absolute paths and absolute Windows drive paths such as `C:/images/cat.png`. Scheme-bearing sources (including nonstandard HTTP forms and `file:`/`data:`), network-style paths (`//host/...` or UNC paths), and sources containing ASCII control characters require approval. This conservative classification does not normalize the source or add format support to the Vision MCP. Local analysis still announces an `in_progress` tool card before dispatch; silent means no permission prompt, not no progress card.
 
 Permission prompts always carry the full, unelided tool arguments, so the user approves exactly what will run. The prompt offers exactly `allow` and `reject`, and a tool runs only when the response selects `allow` with outcome `selected`; anything else — a missing or unrecognised option id, an unknown outcome string, or a null/absent response — is treated as reject. An explicit `cancelled` outcome remains distinct from rejection.
 
@@ -288,7 +290,7 @@ Prerequisites:
 - `npx` on `PATH` (Node 18+ / npm 9+).
 - The same `Z_AI_API_KEY` used for chat completions; the agent forwards it to the MCP server as `Z_AI_API_KEY` plus `Z_AI_MODE=ZAI`.
 
-The model can also call `image_analysis` explicitly with `{ image_source: "/path/or/url", prompt?: "…" }`. A remote http(s) URL requires the same ACP permission approval as `web_reader` before the Vision MCP call — the prompt carries the full `image_source`, and only `bypass_permissions` skips it — while local paths stay silent. Vision failures (missing `npx`, MCP startup, quota) are surfaced as actionable errors but never abort the prompt; an inline `<image_analysis_error>` annotation is used so the conversation can continue.
+The model can also call `image_analysis` explicitly with `{ image_source: "/path/or/url", prompt?: "…" }`. A non-local source requires the same ACP permission approval as `web_reader` before the Vision MCP call — the prompt carries the full `image_source`, and only `bypass_permissions` skips it — while local paths stay silent. Vision failures (missing `npx`, MCP startup, quota) are surfaced as actionable errors but never abort the prompt; an inline `<image_analysis_error>` annotation is used so the conversation can continue.
 
 ---
 
