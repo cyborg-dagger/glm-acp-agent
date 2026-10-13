@@ -2333,7 +2333,7 @@ test("web_reader follows session modes for permission requests", async () => {
   }
 });
 
-test("web_reader makes no network requests after the turn aborts while permission is pending", async () => {
+test("web_reader makes no network requests after the turn aborts while the permission prompt stays unanswered", async () => {
   const abortController = new AbortController();
   let permissionStarted!: () => void;
   let resolvePermission!: () => void;
@@ -2357,13 +2357,37 @@ test("web_reader makes no network requests after the turn aborts while permissio
     );
     await started;
     abortController.abort();
-    resolvePermission();
-    const result = await pending;
 
-    assert.equal(result.content, "URL read cancelled by turn.");
+    // Cancellation must settle on its own while the prompt is still unanswered.
+    // A regression that waits for the permission answer trips this timeout
+    // instead of silently passing.
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        pending,
+        new Promise<never>((_, reject) => {
+          settleTimer = setTimeout(
+            () => reject(new Error("execute() did not settle after abort; cancellation waits for the pending permission")),
+            500
+          );
+        }),
+      ]);
+
+      assert.equal(result.content, "URL read cancelled by turn.");
+      assert.equal(calls.length, 0);
+      const last = conn.updates.at(-1) as { update: { status?: string } };
+      assert.equal(last.update.status, "failed");
+    } finally {
+      if (settleTimer !== undefined) clearTimeout(settleTimer);
+    }
+
+    // Answering the stale prompt afterwards is a no-op: no network request and
+    // no further status update may appear.
+    resolvePermission();
+    await pending;
     assert.equal(calls.length, 0);
-    const last = conn.updates.at(-1) as { update: { status?: string } };
-    assert.equal(last.update.status, "failed");
+    const finalUpdate = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(finalUpdate.update.status, "failed");
   });
 });
 
