@@ -2608,7 +2608,7 @@ function assertInitialImageAnnouncement(
   args: Record<string, unknown>,
   status: "pending" | "in_progress" = "in_progress",
 ): void {
-  const source = String(args["image_source"]);
+  const source = String(args["image_source"]).trim();
   assert.deepEqual(conn.updates[0], {
     sessionId: "s1",
     update: {
@@ -2699,6 +2699,7 @@ function failAfter(ms: number, message: string): Promise<never> {
 
 const imagePathBackslash = String.fromCharCode(92);
 const nonLocalImageSources = [
+  ["whitespace-padded HTTP source", " " + String.fromCharCode(9) + "https:attacker.example/x.png" + String.fromCharCode(10)],
   ["HTTP URL without slashes", "https:attacker.example/x.png"],
   ["HTTP URL with backslashes", ["http:", "", "attacker.example", "x.png"].join(imagePathBackslash)],
   ["FTP scheme", "ftp://attacker.example/x.png"],
@@ -2732,7 +2733,7 @@ for (const [label, source] of nonLocalImageSources) {
       assert.equal(conn.permissionRequests.length, 1);
       const request = conn.permissionRequests[0] as { toolCall: { rawInput: unknown; locations: unknown } };
       assert.deepEqual(request.toolCall.rawInput, args);
-      assert.deepEqual(request.toolCall.locations, [{ path: source }]);
+      assert.deepEqual(request.toolCall.locations, [{ path: source.trim() }]);
       assert.equal(calls.length, 0);
       assertInitialImageAnnouncement(conn, "tc-non-local", args, "pending");
     }
@@ -2743,7 +2744,7 @@ for (const [label, source] of nonLocalImageSources) {
     const result = await exec.execute("tc-non-local-allowed", "image_analysis", JSON.stringify(args));
     assert.equal(result.content, "A tabby cat.");
     assert.equal(conn.permissionRequests.length, 1);
-    assert.deepEqual(calls, [{ toolName: "image_analysis", args }]);
+    assert.deepEqual(calls, [{ toolName: "image_analysis", args: { ...args, image_source: source.trim() } }]);
     assertInitialImageAnnouncement(conn, "tc-non-local-allowed", args, "pending");
     assert.deepEqual(conn.updates.map(({ update }) => {
       const event = update as { sessionUpdate: string; status: string };
@@ -2755,6 +2756,7 @@ for (const [label, source] of nonLocalImageSources) {
 for (const [label, source] of [
   ["relative", "images/cat.png"],
   ["absolute", "/workspace/images/cat.png"],
+  ["boundary whitespace", String.fromCharCode(9) + "images/cat.png" + String.fromCharCode(10)],
   ["spaces", "images/my cat.png"],
   ["Windows forward slashes", "C:/images/cat.png"],
   ["Windows backslashes", ["C:", "images", "cat.png"].join(imagePathBackslash)],
