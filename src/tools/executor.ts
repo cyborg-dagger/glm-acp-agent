@@ -4,8 +4,8 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { spawn } from "node:child_process";
 import type { Dirent } from "node:fs";
-import { lstat, opendir, writeFile } from "node:fs/promises";
-import { join as pathJoin, resolve as pathResolve } from "node:path";
+import { lstat, opendir, realpath, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join as pathJoin, relative, resolve as pathResolve, sep as pathSeparator } from "node:path";
 import { resolveApiKey } from "../llm/credentials.js";
 import {
   callZaiMcpTool,
@@ -68,6 +68,27 @@ const PREVIEW_DEPTH_MARKER = "[nested]";
 const PREVIEW_WALK_BUDGET_BYTES = 262_144;
 /** Marker charged into objects/arrays when the walk budget is exhausted mid-container. */
 const PREVIEW_ELIDED_KEY = "[elided]";
+/** Message carried by read-path abort errors; matches Node's conventional abort text. */
+const ABORTED_MESSAGE = "The operation was aborted";
+
+/**
+ * Skip approval only for clearly local paths. The Vision MCP owns source
+ * parsing, so alternate schemes, network-style paths, and parser-sensitive
+ * controls must not silently reach it. A Windows drive is not a URL scheme.
+ */
+function isLocalImagePath(source: string): boolean {
+  for (let index = 0; index < source.length; index++) {
+    const code = source.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return false;
+  }
+  if (/^[\\\\/]{2}/.test(source)) return false;
+  return /^[a-z]:[\\\\/]/i.test(source) || !/^[a-z][a-z0-9+.-]*:/i.test(source);
+}
+
+/** Fresh abort error per throw site so each gets its own stack trace. */
+function abortedError(): Error {
+  return new Error(ABORTED_MESSAGE);
+}
 
 /** Count non-overlapping literal matches; snippet must be non-empty. */
 function countNonOverlappingMatches(text: string, snippet: string): number {
@@ -320,7 +341,6 @@ export class ToolExecutor {
       HARD_READ_LIMIT,
       Math.max(1, Math.floor(limitArg) || DEFAULT_READ_LIMIT)
     );
-    const absolutePath = this.resolvePath(path);
 
     await this.announceToolCall({
       sessionId: this.sessionId,
@@ -337,7 +357,12 @@ export class ToolExecutor {
 
     if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
+      const absolutePath = await this.resolveConfinedReadPath(path, {
+        clientRead: this.clientCapabilities?.fs?.readTextFile === true,
+      });
+      if (this.signal?.aborted) throw abortedError();
       const page = await this.readTextPage(absolutePath, offset, limit);
+      if (this.signal?.aborted) throw abortedError();
       if (page.eof) {
         const content = `[end of file: offset ${offset} is beyond the end of ${path}]`;
         await this.connection.sessionUpdate({
@@ -564,7 +589,7 @@ export class ToolExecutor {
   }
 
   /**
-   * Mirror of performWrite for reads, used by read_file and edit_file: when the client
+   * Mirror of performWrite for reads, used by edit_file: when the client
    * advertises BOTH `fs.readTextFile` and `fs.writeTextFile`, read through the
    * client so the edit is computed against the same contents the user sees (a
    * dirty editor buffer). Reading a client buffer we cannot write back would
@@ -586,20 +611,38 @@ export class ToolExecutor {
   }
 
   private async readTextPage(path: string, offset: number, limit: number): Promise<TextPage> {
-    if (this.clientCapabilities?.fs?.readTextFile && this.clientCapabilities?.fs?.writeTextFile) {
+    if (this.clientCapabilities?.fs?.readTextFile) {
       // ACP's line/limit form makes the editor responsible for paging. One
       // lookahead line tells us whether to advertise another request; no page
       // is misrepresented as a whole-buffer line count.
       const readEditorLines = async (line: number, pageLimit: number): Promise<string[]> => {
-        const response = await this.connection.readTextFile({
+        const signal = this.signal;
+        if (signal?.aborted) throw abortedError();
+        const readPromise = this.connection.readTextFile({
           sessionId: this.sessionId, path, line, limit: pageLimit,
         } as never);
-        if (Buffer.byteLength(response.content, "utf8") > this.resourceLimits.fileReadBytes) {
-          throw new Error(`editor buffer exceeds the ${this.resourceLimits.fileReadBytes}-byte read/edit limit`);
+        let abortHandler: (() => void) | undefined;
+        try {
+          // Stop waiting on abort, not the already-admitted remote read. The
+          // race keeps its late rejection observed and discards late content.
+          const response = await (signal ? Promise.race([
+            readPromise,
+            new Promise<never>((_resolve, reject) => {
+              abortHandler = () => reject(abortedError());
+              signal.addEventListener("abort", abortHandler, { once: true });
+              if (signal.aborted) abortHandler();
+            }),
+          ]) : readPromise);
+          if (signal?.aborted) throw abortedError();
+          if (Buffer.byteLength(response.content, "utf8") > this.resourceLimits.fileReadBytes) {
+            throw new Error(`editor buffer exceeds the ${this.resourceLimits.fileReadBytes}-byte read/edit limit`);
+          }
+          const lines = response.content.split("\n");
+          if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+          return lines;
+        } finally {
+          if (abortHandler) signal!.removeEventListener("abort", abortHandler);
         }
-        const lines = response.content.split("\n");
-        if (lines.length > 0 && lines.at(-1) === "") lines.pop();
-        return lines;
       };
       let lines = await readEditorLines(offset, limit + 1);
       let legacyFullBuffer = false;
@@ -790,7 +833,6 @@ export class ToolExecutor {
       );
     }
     const path = rawPath.trim();
-    const absolutePath = this.resolvePath(path);
 
     await this.announceToolCall({
       sessionId: this.sessionId,
@@ -807,6 +849,7 @@ export class ToolExecutor {
 
     if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
+      const absolutePath = await this.resolveConfinedReadPath(path);
       const directory = await opendir(absolutePath);
       const entries: Dirent[] = [];
       let entryLimitReached = false;
@@ -969,6 +1012,57 @@ export class ToolExecutor {
     return pathResolve(this.sessionCwd, path);
   }
 
+  /**
+   * Resolve a read path and confine it to the session workspace.
+   *
+   * The canonicalized target must sit inside the canonicalized workspace:
+   * parent traversal and symlinks that resolve outside are rejected, while
+   * absolute paths that stay inside remain valid. Only an explicit client
+   * read preserves the caller's absolute alias and permits a missing editor
+   * buffer. Agent-side callers always require an existing canonical target,
+   * regardless of the client's capabilities. Local reads use that path so the
+   * open lands on the same file the containment check validated. This
+   * realpath preflight closes static symlink escapes; it is containment
+   * hardening, not a race-proof sandbox - a concurrent swap between check
+   * and open can still redirect a local read.
+   */
+  private async resolveConfinedReadPath(
+    path: string,
+    { clientRead }: { clientRead: boolean } = { clientRead: false },
+  ): Promise<string> {
+    const workspace = await realpath(this.sessionCwd);
+    const absolutePath = this.resolvePath(path);
+    let target: string;
+    try {
+      target = await realpath(absolutePath);
+    } catch (error) {
+      if (
+        !clientRead ||
+        (error as NodeJS.ErrnoException).code !== "ENOENT"
+      ) {
+        throw error;
+      }
+      // A new editor buffer may have no disk file yet. Only permit a missing
+      // leaf in an existing, confined parent; a dangling symlink is still an
+      // existing entry and must never use this fallback.
+      const entry = await lstat(absolutePath).catch((statError: NodeJS.ErrnoException) => {
+        if (statError.code === "ENOENT") return null;
+        throw statError;
+      });
+      if (entry) throw error;
+      target = pathJoin(await realpath(dirname(absolutePath)), basename(absolutePath));
+    }
+    const relativeTarget = relative(workspace, target);
+    if (
+      isAbsolute(relativeTarget) ||
+      relativeTarget === ".." ||
+      relativeTarget.startsWith(`..${pathSeparator}`)
+    ) {
+      throw new Error("path must remain inside the session workspace");
+    }
+    return clientRead ? absolutePath : target;
+  }
+
   private async webSearch(
     toolCallId: string,
     args: Record<string, unknown>
@@ -1047,6 +1141,7 @@ export class ToolExecutor {
       );
     }
 
+    // Step 1: announce the read as pending; approval follows before traffic.
     await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
@@ -1054,9 +1149,37 @@ export class ToolExecutor {
         toolCallId,
         title: elideStringForPreview(`Read URL: ${url}`),
         kind: "fetch",
-        status: "in_progress",
+        status: "pending",
         locations: url.length <= LOCATION_STRING_LIMIT ? [{ path: url }] : [],
         rawInput: elideForPreview(args),
+      },
+    });
+
+    // Step 2: ask before any reader traffic. The permission payload is the
+    // full arguments - the URL can carry sensitive data in its path or query,
+    // so the user must approve exactly what will be sent to the Z.AI reader.
+    const permissionResult = await this.maybeRequestPermission({
+      toolCallId,
+      kind: "fetch",
+      rawInput: args,
+      title: `Read URL: ${url}`,
+      locations: [{ path: url }],
+    });
+
+    // Fail closed: every outcome that is not an explicit allow (including any
+    // future variant) stops here instead of reaching the network below.
+    if (permissionResult.type !== "allow") {
+      return this.permissionDenialResult(toolCallId, "URL read", permissionResult);
+    }
+
+    // Step 3: announce in_progress; an interrupted announcement proves the
+    // reader request below never started.
+    await this.announceToolCall({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "in_progress",
       },
     });
 
@@ -1116,6 +1239,9 @@ export class ToolExecutor {
       );
     }
 
+    const isLocalSource = isLocalImagePath(imageSource);
+    // Every source gets an initial card before confinement or Vision dispatch.
+    // Only clearly local paths skip approval; all other forms fail closed.
     await this.announceToolCall({
       sessionId: this.sessionId,
       update: {
@@ -1123,15 +1249,51 @@ export class ToolExecutor {
         toolCallId,
         title: elideStringForPreview(`Analyze image: ${imageSource}`),
         kind: "fetch",
-        status: "in_progress",
+        status: isLocalSource ? "in_progress" : "pending",
         locations: imageSource.length <= LOCATION_STRING_LIMIT ? [{ path: imageSource }] : [],
         rawInput: elideForPreview(args),
       },
     });
 
+    if (!isLocalSource) {
+      // Ask before dispatching a non-local source. Keep the full arguments so
+      // the user approves exactly what will be sent to the Vision MCP.
+      const permissionResult = await this.maybeRequestPermission({
+        toolCallId,
+        kind: "fetch",
+        rawInput: args,
+        title: `Analyze image: ${imageSource}`,
+        locations: [{ path: imageSource }],
+      });
+
+      // Fail closed: every outcome that is not an explicit allow (including any
+      // future variant) stops here instead of reaching the network below.
+      if (permissionResult.type !== "allow") {
+        return this.permissionDenialResult(toolCallId, "Image analysis", permissionResult);
+      }
+
+      // Step 3: announce in_progress; an interrupted announcement proves the
+      // vision request below never started.
+      await this.announceToolCall({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "in_progress",
+        },
+      });
+    }
+
     if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
-      const visionArgs: Record<string, unknown> = { image_source: imageSource };
+      // The Vision MCP subprocess opens the image from disk itself, so a local
+      // path is resolved and confined before any upload happens: an
+      // outside-workspace path is rejected here and the subprocess never runs.
+      // URL sources skip this check - they are approval-gated above instead.
+      const confinedPath = isLocalSource
+        ? await this.resolveConfinedReadPath(imageSource)
+        : imageSource;
+      const visionArgs: Record<string, unknown> = { image_source: confinedPath };
       if (prompt) visionArgs["prompt"] = prompt;
       const mcpResult = await this.visionClient.callTool("image_analysis", visionArgs, this.signal);
       const text = unwrapVisionText(mcpResult);
@@ -1206,7 +1368,7 @@ export class ToolExecutor {
    */
   private async maybeRequestPermission(args: {
     toolCallId: string;
-    kind: "write" | "execute";
+    kind: "write" | "execute" | "fetch";
     rawInput: unknown;
     title: string;
     locations?: Array<{ path: string }>;
@@ -1234,7 +1396,7 @@ export class ToolExecutor {
         toolCall: {
           toolCallId: args.toolCallId,
           title: args.title,
-          kind: args.kind === "write" ? "edit" : "execute",
+          kind: args.kind === "write" ? "edit" : args.kind,
           status: "pending",
           locations: args.locations ?? [],
           // Passed through verbatim: callers hand us the full payload so the
@@ -1296,7 +1458,7 @@ export class ToolExecutor {
    */
   private async permissionDenialResult(
     toolCallId: string,
-    action: "Write" | "Edit" | "Command",
+    action: "Write" | "Edit" | "Command" | "URL read" | "Image analysis",
     permissionResult: Exclude<PermissionDecision, { type: "allow" }>
   ): Promise<ToolResult> {
     switch (permissionResult.type) {

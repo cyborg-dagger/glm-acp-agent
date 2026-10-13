@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import type { ChatCompletionAssistantMessageParam, ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/index.js";
 import type { ModelInfo, Usage } from "@agentclientprotocol/sdk";
+import { Agent, fetch as undiciFetch, type Dispatcher } from "undici";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { resolveApiKey } from "./credentials.js";
 import { debug, error, warn } from "./logger.js";
@@ -163,6 +164,97 @@ export class ModelStreamIdleTimeoutError extends Error {
   override name = "ModelStreamIdleTimeoutError";
 }
 
+/**
+ * Retries on one provider request. This is the OpenAI client's `maxRetries`:
+ * the initial open plus two retries, for connection failures and for HTTP
+ * 408, 409, 429, and 5xx. There is no second loop around the client — that
+ * would run this policy again on every open.
+ */
+export const PROVIDER_MAX_RETRIES = 2;
+
+const TRANSPORT_CAUSE_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EPIPE",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+]);
+
+/**
+ * A provider call failed before any HTTP status arrived.
+ *
+ * `APIConnectionError` is the OpenAI SDK's message for that case ("Connection
+ * error."). A socket reset while the body is already streaming surfaces as the
+ * raw cause code instead, and still means this client should not be reused.
+ * An error that carries an HTTP status is a provider response, not a drop.
+ * Status is checked first: `APIConnectionError` is an `APIError` and can
+ * carry a numeric `status`, and that response must not be treated as a drop.
+ */
+export function isRecoverableTransportError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  if (numericHttpStatus(err) !== undefined) return false;
+  if (err instanceof OpenAI.APIConnectionError) return true;
+  let current: unknown = err;
+  for (let depth = 0; depth < 6 && current && typeof current === "object"; depth++) {
+    if (numericHttpStatus(current) !== undefined) return false;
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && TRANSPORT_CAUSE_CODES.has(code)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+function numericHttpStatus(err: object): number | undefined {
+  if (!("status" in err)) return undefined;
+  const status = (err as { status?: unknown }).status;
+  return typeof status === "number" ? status : undefined;
+}
+
+function readRetryCount(init: RequestInit | undefined): number {
+  const raw = headerValue(init?.headers, "x-stainless-retry-count");
+  const parsed = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function headerValue(headers: HeadersInit | undefined, name: string): string | undefined {
+  if (!headers) return undefined;
+  if (headers instanceof Headers) return headers.get(name) ?? undefined;
+  if (Array.isArray(headers)) {
+    const found = headers.find(([key]) => key.toLowerCase() === name);
+    return found?.[1];
+  }
+  const record = headers as Record<string, string>;
+  return record[name] ?? record[name.toLowerCase()];
+}
+
+function transportCauseCode(err: unknown): string | undefined {
+  let current: unknown = err;
+  for (let depth = 0; depth < 6 && current && typeof current === "object"; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && code.length > 0) return code;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/** Statuses the OpenAI client retries when `maxRetries` is still remaining. */
+function isSdkRetryableStatus(status: number): boolean {
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+/** One undici pool and the fetches currently inside it. */
+interface ProviderPool {
+  inflight: number;
+  /** A newer pool has taken over. Close this one when `inflight` hits zero. */
+  retired: boolean;
+  closed: boolean;
+}
+
 /** Default base URL for the Z.AI / Zhipu OpenAI-compatible API (Coding endpoint). */
 const DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
@@ -280,22 +372,27 @@ export function getDefaultModel(): string {
  * so no Zhipu-specific SDK is required. The Z.AI service speaks the OpenAI
  * Chat Completions wire format, plus a few GLM-specific extras (like the
  * `thinking` field and `delta.reasoning_content` for reasoning tokens).
+ *
+ * Each instance owns an undici connection pool. `new OpenAI({ apiKey, baseURL })`
+ * alone uses `globalThis.fetch` and Node's shared pool, so replacing the
+ * wrapper would not open a new connection. After a dropped connection the
+ * next request uses a new pool immediately. Every attempt, including an SDK
+ * retry that was already waiting, resolves that live pool. The previous pool
+ * is closed once its own fetches have returned, so a response another session
+ * is still reading can finish; it is not destroyed, which would abort that read.
  */
 export class GlmClient {
   private client: OpenAI;
+  private dispatcher: Dispatcher;
+  /** Fetches currently inside each pool. A retired pool closes at zero. */
+  private readonly pools = new Map<Dispatcher, ProviderPool>();
+  private readonly baseURL: string;
   private maxTokens: number;
   /** Resolved once at construction; later env changes cannot affect a running client. */
   private readonly streamIdleTimeoutMs: number;
 
   constructor() {
-    const apiKey = resolveApiKey();
-    if (!apiKey) {
-      throw new Error(
-        "No API key found. Set the Z_AI_API_KEY environment variable, or run `glm-acp-agent --setup` to store one."
-      );
-    }
-
-    const baseURL = process.env["ACP_GLM_BASE_URL"] ?? DEFAULT_BASE_URL;
+    this.baseURL = process.env["ACP_GLM_BASE_URL"] ?? DEFAULT_BASE_URL;
     // 32768 leaves room for whole-file writes and GLM thinking tokens in the
     // same turn; reasoning counts against this cap, so a small value starves
     // the actual content and trips finish_reason=length ("output limit
@@ -306,7 +403,140 @@ export class GlmClient {
     // env re-reads cannot change behaviour mid-session.
     this.streamIdleTimeoutMs = parseIntEnv("ACP_GLM_STREAM_IDLE_TIMEOUT_MS", DEFAULT_STREAM_IDLE_TIMEOUT_MS);
 
-    this.client = new OpenAI({ apiKey, baseURL });
+    const transport = this.buildClient();
+    this.client = transport.client;
+    this.dispatcher = transport.dispatcher;
+  }
+
+  /**
+   * Build a new HTTP client with its own connection pool. Called at startup
+   * and after a transport failure so the next request cannot reuse a socket
+   * from the pool that just failed.
+   */
+  private buildClient(): { client: OpenAI; dispatcher: Dispatcher } {
+    const apiKey = resolveApiKey();
+    if (!apiKey) {
+      throw new Error(
+        "No API key found. Set the Z_AI_API_KEY environment variable, or run `glm-acp-agent --setup` to store one."
+      );
+    }
+    const dispatcher = new Agent();
+    try {
+      const client = new OpenAI({
+        apiKey,
+        baseURL: this.baseURL,
+        maxRetries: PROVIDER_MAX_RETRIES,
+        // Resolve the dispatcher on each attempt. The SDK retries through this
+        // same function, including after another session has replaced the pool.
+        fetch: (input, init) => this.fetchUsingLivePool(input, init),
+      });
+      this.pools.set(dispatcher, { inflight: 0, retired: false, closed: false });
+      return { client, dispatcher };
+    } catch (err) {
+      void this.destroyDispatcher(dispatcher);
+      throw err;
+    }
+  }
+
+  /**
+   * Route later requests to a new pool immediately. Fetches already on the
+   * previous pool finish there; the pool is closed when the last of them
+   * returns, so a body still being read is not aborted. One GlmClient is
+   * shared by every session, and destroy() would abort the healthy ones
+   * with `TypeError: terminated`. If a replacement cannot be built, the
+   * current client stays.
+   */
+  private discardTransport(): void {
+    const previousClient = this.client;
+    const previousDispatcher = this.dispatcher;
+    try {
+      const next = this.buildClient();
+      this.client = next.client;
+      this.dispatcher = next.dispatcher;
+      const previous = this.pools.get(previousDispatcher);
+      if (previous) previous.retired = true;
+      this.closePoolIfIdle(previousDispatcher);
+    } catch (err) {
+      this.client = previousClient;
+      this.dispatcher = previousDispatcher;
+      warn(
+        `could not replace the provider client after a connection failure; keeping the existing client: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }
+
+  /** A pool that never served a request can be torn down immediately. */
+  private destroyDispatcher(dispatcher: Dispatcher): Promise<void> {
+    return dispatcher.destroy(new Error("discarded provider connection")).catch((err: unknown) => {
+      warn(
+        `could not close the discarded provider connection: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    });
+  }
+
+  /**
+   * Count this attempt against the pool it will actually use. The OpenAI
+   * client sleeps between retries with no request on the wire; those later
+   * attempts must take the replacement pool instead of one already closed.
+   */
+  private fetchUsingLivePool(
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> {
+    const dispatcher = this.dispatcher;
+    const state = this.pools.get(dispatcher);
+    if (!state) return this.fetchWithDispatcher(dispatcher, input, init);
+    state.inflight += 1;
+    return this.fetchWithDispatcher(dispatcher, input, init).finally(() => {
+      state.inflight -= 1;
+      this.closePoolIfIdle(dispatcher);
+    });
+  }
+
+  /**
+   * Stop new requests on a pool and let the ones already running finish.
+   * Not awaited: the session that hit the failure must not wait for every
+   * other session still reading this pool. A pool that still has a fetch
+   * in progress stays open until that fetch returns.
+   */
+  private closePoolIfIdle(dispatcher: Dispatcher): void {
+    const state = this.pools.get(dispatcher);
+    if (!state || !state.retired || state.closed || state.inflight > 0) return;
+    state.closed = true;
+    this.pools.delete(dispatcher);
+    void dispatcher.close().catch((err: unknown) => {
+      warn(
+        `could not close the discarded provider connection: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    });
+  }
+
+  private async fetchWithDispatcher(
+    dispatcher: Dispatcher,
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> {
+    const attempt = readRetryCount(init) + 1;
+    try {
+      const response = await undiciFetch(
+        input as Parameters<typeof undiciFetch>[0],
+        { ...init, dispatcher } as Parameters<typeof undiciFetch>[1],
+      );
+      if (!response.ok && isSdkRetryableStatus(response.status)) {
+        warn(`provider request attempt ${attempt} failed: status=${response.status}`);
+      }
+      return response as unknown as Response;
+    } catch (err) {
+      const code = transportCauseCode(err);
+      warn(`provider request attempt ${attempt} failed: code=${code ?? "unknown"}`);
+      throw err;
+    }
   }
 
   /** The same resolved reservation used in the outgoing `max_tokens` field. */
@@ -345,6 +575,10 @@ export class GlmClient {
     // that to pass GLM-specific fields like `thinking` and `reasoning_effort`.
     const extraBody: Record<string, unknown> = { ...thinkingParams };
 
+    // One retry policy, on the client: connection errors and HTTP 408/409/429/5xx
+    // share `PROVIDER_MAX_RETRIES`. A body that has already started is outside
+    // that loop; a mid-stream socket reset discards the pool below and is not
+    // opened again.
     let stream: Awaited<ReturnType<typeof this.client.chat.completions.create>>;
     try {
       stream = await this.client.chat.completions.create(
@@ -362,6 +596,9 @@ export class GlmClient {
         { signal }
       );
     } catch (err) {
+      // Replace the client after the retry budget is spent, so a later prompt
+      // in this same process does not reuse the pool that just failed.
+      if (isRecoverableTransportError(err)) this.discardTransport();
       const status = (err as { status?: number })?.status;
       const body = (err as { error?: unknown })?.error;
       error(`streamChat request failed: status=${status}`, JSON.stringify(body) ?? String(err));
@@ -387,96 +624,101 @@ export class GlmClient {
     let lastFinishReason: string | undefined;
     let terminalChoiceSeen = false;
 
-    for await (const rawChunk of idleBoundedStream) {
-      const chunk = rawChunk as {
-        choices: Array<{ delta: unknown; finish_reason?: string | null }>;
-        usage?: unknown;
-      };
-      if (chunk.choices.length > 1) {
-        throw new IncompleteModelStreamError(
-          "Incomplete model stream: received multiple model choices for one completion."
-        );
-      }
-      if (terminalChoiceSeen && chunk.choices.length > 0) {
-        throw new IncompleteModelStreamError(
-          "Incomplete model stream: received a model frame after terminal completion."
-        );
-      }
-      const choice = chunk.choices[0];
+    try {
+      for await (const rawChunk of idleBoundedStream) {
+        const chunk = rawChunk as {
+          choices: Array<{ delta: unknown; finish_reason?: string | null }>;
+          usage?: unknown;
+        };
+        if (chunk.choices.length > 1) {
+          throw new IncompleteModelStreamError(
+            "Incomplete model stream: received multiple model choices for one completion."
+          );
+        }
+        if (terminalChoiceSeen && chunk.choices.length > 0) {
+          throw new IncompleteModelStreamError(
+            "Incomplete model stream: received a model frame after terminal completion."
+          );
+        }
+        const choice = chunk.choices[0];
 
-      if (choice) {
-        const delta = choice.delta as Record<string, unknown>;
+        if (choice) {
+          const delta = choice.delta as Record<string, unknown>;
 
-        // Reasoning / thinking tokens (GLM "thinking" mode).
-        const reasoning = delta["reasoning_content"];
-        if (typeof reasoning === "string" && reasoning.length > 0) {
-          yield { thinking: reasoning };
+          // Reasoning / thinking tokens (GLM "thinking" mode).
+          const reasoning = delta["reasoning_content"];
+          if (typeof reasoning === "string" && reasoning.length > 0) {
+            yield { thinking: reasoning };
+          }
+
+          // Regular assistant text.
+          const content = delta["content"];
+          if (typeof content === "string" && content.length > 0) {
+            yield { text: content };
+          }
+
+          // Tool call deltas.
+          const toolCallDeltas = delta["tool_calls"] as
+            | Array<{
+                index: number;
+                id?: string;
+                function?: { name?: string; arguments?: string };
+              }>
+            | undefined;
+
+          if (Array.isArray(toolCallDeltas)) {
+            for (const tc of toolCallDeltas) {
+              let pending = pendingToolCalls.get(tc.index);
+              if (!pending) {
+                pending = { id: "", name: "", arguments: "" };
+                pendingToolCalls.set(tc.index, pending);
+              }
+              if (tc.id) pending.id = tc.id;
+              if (tc.function?.name) pending.name = tc.function.name;
+              if (tc.function?.arguments) pending.arguments += tc.function.arguments;
+            }
+          }
+
+          if (choice.finish_reason) {
+            lastFinishReason = choice.finish_reason;
+            terminalChoiceSeen = true;
+          }
         }
 
-        // Regular assistant text.
-        const content = delta["content"];
-        if (typeof content === "string" && content.length > 0) {
-          yield { text: content };
-        }
-
-        // Tool call deltas.
-        const toolCallDeltas = delta["tool_calls"] as
-          | Array<{
-              index: number;
-              id?: string;
-              function?: { name?: string; arguments?: string };
-            }>
+        // The final chunk on most providers (GLM included when
+        // include_usage: true) ships only a `usage` object with no choices.
+        const rawUsage = (chunk as { usage?: unknown }).usage as
+          | {
+              prompt_tokens?: number;
+              completion_tokens?: number;
+              total_tokens?: number;
+              prompt_tokens_details?: { cached_tokens?: number };
+              completion_tokens_details?: { reasoning_tokens?: number };
+            }
+          | null
           | undefined;
 
-        if (Array.isArray(toolCallDeltas)) {
-          for (const tc of toolCallDeltas) {
-            let pending = pendingToolCalls.get(tc.index);
-            if (!pending) {
-              pending = { id: "", name: "", arguments: "" };
-              pendingToolCalls.set(tc.index, pending);
-            }
-            if (tc.id) pending.id = tc.id;
-            if (tc.function?.name) pending.name = tc.function.name;
-            if (tc.function?.arguments) pending.arguments += tc.function.arguments;
+        if (rawUsage) {
+          const usage: Usage = {
+            inputTokens: rawUsage.prompt_tokens ?? 0,
+            outputTokens: rawUsage.completion_tokens ?? 0,
+            totalTokens: rawUsage.total_tokens ?? 0,
+          };
+          if (typeof rawUsage.prompt_tokens_details?.cached_tokens === "number") {
+            usage.cachedReadTokens = rawUsage.prompt_tokens_details.cached_tokens;
           }
-        }
-
-        if (choice.finish_reason) {
-          lastFinishReason = choice.finish_reason;
-          terminalChoiceSeen = true;
+          if (
+            typeof rawUsage.completion_tokens_details?.reasoning_tokens === "number"
+          ) {
+            usage.thoughtTokens = rawUsage.completion_tokens_details.reasoning_tokens;
+          }
+          debug(`streamChat usage: input=${usage.inputTokens} output=${usage.outputTokens} total=${usage.totalTokens}`);
+          yield { usage };
         }
       }
-
-      // The final chunk on most providers (GLM included when
-      // include_usage: true) ships only a `usage` object with no choices.
-      const rawUsage = (chunk as { usage?: unknown }).usage as
-        | {
-            prompt_tokens?: number;
-            completion_tokens?: number;
-            total_tokens?: number;
-            prompt_tokens_details?: { cached_tokens?: number };
-            completion_tokens_details?: { reasoning_tokens?: number };
-          }
-        | null
-        | undefined;
-
-      if (rawUsage) {
-        const usage: Usage = {
-          inputTokens: rawUsage.prompt_tokens ?? 0,
-          outputTokens: rawUsage.completion_tokens ?? 0,
-          totalTokens: rawUsage.total_tokens ?? 0,
-        };
-        if (typeof rawUsage.prompt_tokens_details?.cached_tokens === "number") {
-          usage.cachedReadTokens = rawUsage.prompt_tokens_details.cached_tokens;
-        }
-        if (
-          typeof rawUsage.completion_tokens_details?.reasoning_tokens === "number"
-        ) {
-          usage.thoughtTokens = rawUsage.completion_tokens_details.reasoning_tokens;
-        }
-        debug(`streamChat usage: input=${usage.inputTokens} output=${usage.outputTokens} total=${usage.totalTokens}`);
-        yield { usage };
-      }
+    } catch (err) {
+      if (isRecoverableTransportError(err)) this.discardTransport();
+      throw err;
     }
 
     signal?.throwIfAborted();
