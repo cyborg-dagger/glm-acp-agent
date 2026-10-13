@@ -1280,7 +1280,14 @@ export class ToolExecutor {
 
     if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
-      const visionArgs: Record<string, unknown> = { image_source: imageSource };
+      // The Vision MCP subprocess opens the image from disk itself, so a local
+      // path is resolved and confined before any upload happens: an
+      // outside-workspace path is rejected here and the subprocess never runs.
+      // URL sources skip this check - they are approval-gated above instead.
+      const confinedPath = isLocalSource
+        ? await this.resolveConfinedReadPath(imageSource)
+        : imageSource;
+      const visionArgs: Record<string, unknown> = { image_source: confinedPath };
       if (prompt) visionArgs["prompt"] = prompt;
       const mcpResult = await this.visionClient.callTool("image_analysis", visionArgs, this.signal);
       const text = unwrapVisionText(mcpResult);

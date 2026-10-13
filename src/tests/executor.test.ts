@@ -1160,29 +1160,35 @@ test("session MCP notifications elide large content and aggregate small fields",
 });
 
 test("completed cards over 16 KiB keep a readable UTF-8 prefix while the model result stays full", async () => {
-  const conn = createConnectionStub();
-  // Multibyte tail proves the prefix cut is UTF-8-safe (no replacement chars).
-  const full = `${"y".repeat(20_000)}结尾`;
-  const vision = fakeVisionClient(async () => ({ content: [{ type: "text", text: full }] }));
-  const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
-  const result = await executor.execute(
-    "tc1",
-    "image_analysis",
-    JSON.stringify({ image_source: "/tmp/big.png" })
-  );
-  // The model-facing tool result keeps the complete text.
-  assert.equal(result.content, full);
-  const completed = conn.updates.find(
-    (u) =>
-      (u.update as { sessionUpdate?: string }).sessionUpdate === "tool_call_update" &&
-      Array.isArray((u.update as { content?: unknown[] }).content)
-  ) as { update: { status?: string; content: Array<{ content: { text: string } }> } };
-  assert.equal(completed.update.status, "completed");
-  const cardText = completed.update.content[0]?.content.text ?? "";
-  assert.ok(cardText.startsWith("y".repeat(16_384)));
-  assert.doesNotMatch(cardText, /\uFFFD/);
-  assert.match(cardText, /\[… 3622 bytes elided in preview; full result sent to model\]$/);
-  assert.ok(Buffer.byteLength(cardText, "utf8") <= 16_384 + 200);
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-image-elide-")));
+  try {
+    writeFileSync(join(dir, "big.png"), "fake png bytes", "utf8");
+    const conn = createConnectionStub();
+    // Multibyte tail proves the prefix cut is UTF-8-safe (no replacement chars).
+    const full = `${"y".repeat(20_000)}结尾`;
+    const vision = fakeVisionClient(async () => ({ content: [{ type: "text", text: full }] }));
+    const executor = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision, null, dir);
+    const result = await executor.execute(
+      "tc1",
+      "image_analysis",
+      JSON.stringify({ image_source: join(dir, "big.png") })
+    );
+    // The model-facing tool result keeps the complete text.
+    assert.equal(result.content, full);
+    const completed = conn.updates.find(
+      (u) =>
+        (u.update as { sessionUpdate?: string }).sessionUpdate === "tool_call_update" &&
+        Array.isArray((u.update as { content?: unknown[] }).content)
+    ) as { update: { status?: string; content: Array<{ content: { text: string } }> } };
+    assert.equal(completed.update.status, "completed");
+    const cardText = completed.update.content[0]?.content.text ?? "";
+    assert.ok(cardText.startsWith("y".repeat(16_384)));
+    assert.doesNotMatch(cardText, /\uFFFD/);
+    assert.match(cardText, /\[… 3622 bytes elided in preview; full result sent to model\]$/);
+    assert.ok(Buffer.byteLength(cardText, "utf8") <= 16_384 + 200);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("failed tool cards bound both invalid arguments and upstream error bodies", async () => {
@@ -3002,40 +3008,52 @@ function assertInitialImageAnnouncement(
 }
 
 test("image_analysis routes through the injected vision client and returns the text", async () => {
-  const conn = createConnectionStub();
-  const vision = fakeVisionClient(async (toolName, args) => {
-    assert.equal(toolName, "image_analysis");
-    assert.equal(args["image_source"], "/tmp/cat.png");
-    return { content: [{ type: "text", text: "A tabby cat." }] };
-  });
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
-  const result = await exec.execute(
-    "tc1",
-    "image_analysis",
-    JSON.stringify({ image_source: "/tmp/cat.png", prompt: "describe" })
-  );
-  assert.equal(result.content, "A tabby cat.");
-  const last = conn.updates.at(-1) as { update: { status?: string } };
-  assert.equal(last.update.status, "completed");
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-image-route-")));
+  try {
+    writeFileSync(join(dir, "cat.png"), "fake png bytes", "utf8");
+    const conn = createConnectionStub();
+    const vision = fakeVisionClient(async (toolName, args) => {
+      assert.equal(toolName, "image_analysis");
+      assert.equal(args["image_source"], join(dir, "cat.png"));
+      return { content: [{ type: "text", text: "A tabby cat." }] };
+    });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision, null, dir);
+    const result = await exec.execute(
+      "tc1",
+      "image_analysis",
+      JSON.stringify({ image_source: join(dir, "cat.png"), prompt: "describe" })
+    );
+    assert.equal(result.content, "A tabby cat.");
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "completed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("image_analysis surfaces vision errors as a failed tool result", async () => {
-  const conn = createConnectionStub();
-  const vision = fakeVisionClient(async () => {
-    throw new Error("Vision MCP image_analysis failed: quota exceeded");
-  });
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
-  const result = await exec.execute(
-    "tc1",
-    "image_analysis",
-    JSON.stringify({ image_source: "/tmp/x.png" })
-  );
-  assert.match(result.content, /quota exceeded/);
-  assertInitialImageAnnouncement(conn, "tc1", { image_source: "/tmp/x.png" });
-  assert.equal(conn.updates.length, 2);
-  const last = conn.updates.at(-1) as { update: { sessionUpdate?: string; status?: string } };
-  assert.equal(last.update.sessionUpdate, "tool_call_update");
-  assert.equal(last.update.status, "failed");
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-image-error-")));
+  try {
+    writeFileSync(join(dir, "x.png"), "fake png bytes", "utf8");
+    const conn = createConnectionStub();
+    const vision = fakeVisionClient(async () => {
+      throw new Error("Vision MCP image_analysis failed: quota exceeded");
+    });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision, null, dir);
+    const result = await exec.execute(
+      "tc1",
+      "image_analysis",
+      JSON.stringify({ image_source: join(dir, "x.png") })
+    );
+    assert.match(result.content, /quota exceeded/);
+    assertInitialImageAnnouncement(conn, "tc1", { image_source: join(dir, "x.png") });
+    assert.equal(conn.updates.length, 2);
+    const last = conn.updates.at(-1) as { update: { sessionUpdate?: string; status?: string } };
+    assert.equal(last.update.sessionUpdate, "tool_call_update");
+    assert.equal(last.update.status, "failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("image_analysis is unavailable when no vision client is configured", async () => {
@@ -3047,6 +3065,86 @@ test("image_analysis is unavailable when no vision client is configured", async 
     JSON.stringify({ image_source: "/tmp/x.png" })
   );
   assert.match(result.content, /vision[^.]*not configured/i);
+});
+
+// ---------------------------------------------------------------------------
+// image_analysis local-source confinement (mirrors the read_file battery)
+// ---------------------------------------------------------------------------
+
+test("image_analysis rejects a local image_source outside the workspace and makes no vision calls", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-image-confined-")));
+  const outsidePath = `${dir}-secret.png`;
+  try {
+    writeFileSync(outsidePath, "fake png bytes", "utf8");
+    const conn = createConnectionStub();
+    const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+    const vision = recordingVisionClient(visionCalls);
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision, null, dir);
+    for (const path of [outsidePath, join("..", basename(outsidePath))]) {
+      const result = await exec.execute(
+        "tc-image-outside",
+        "image_analysis",
+        JSON.stringify({ image_source: path, prompt: "describe" })
+      );
+      assert.match(result.content, /path must remain inside the session workspace/);
+      const last = conn.updates.at(-1) as { update: { status?: string } };
+      assert.equal(last.update.status, "failed");
+    }
+    assert.equal(visionCalls.length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outsidePath, { force: true });
+  }
+});
+
+test("image_analysis passes the resolved workspace path to vision for a local image_source", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-image-inside-")));
+  try {
+    writeFileSync(join(dir, "cat.png"), "fake png bytes", "utf8");
+    const conn = createConnectionStub();
+    const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+    const vision = recordingVisionClient(visionCalls);
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision, null, dir);
+    const result = await exec.execute(
+      "tc-image-inside",
+      "image_analysis",
+      JSON.stringify({ image_source: "cat.png", prompt: "describe" })
+    );
+    assert.equal(result.content, "A tabby cat.");
+    assert.deepEqual(
+      visionCalls.map((c) => ({ toolName: c.toolName, source: c.args["image_source"] })),
+      [{ toolName: "image_analysis", source: join(dir, "cat.png") }]
+    );
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "completed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("image_analysis rejects a workspace symlink pointing outside and makes no vision calls", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-image-symlink-")));
+  const outsidePath = `${dir}-outside.png`;
+  try {
+    writeFileSync(outsidePath, "fake png bytes", "utf8");
+    symlinkSync(outsidePath, join(dir, "escape.png"), "file");
+    const conn = createConnectionStub();
+    const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+    const vision = recordingVisionClient(visionCalls);
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision, null, dir);
+    const result = await exec.execute(
+      "tc-image-symlink",
+      "image_analysis",
+      JSON.stringify({ image_source: "escape.png", prompt: "describe" })
+    );
+    assert.match(result.content, /path must remain inside the session workspace/);
+    assert.equal(visionCalls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outsidePath, { force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -3354,30 +3452,36 @@ test("image_analysis makes no vision calls after the turn aborts while permissio
 });
 
 test("image_analysis does not prompt for local image sources", async () => {
-  const conn = createConnectionStub({ permission: "reject" });
-  const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
-  const vision = fakeVisionClient(async (toolName, args) => {
-    assertInitialImageAnnouncement(conn, "tc-image-local", { image_source: "/tmp/cat.png", prompt: "describe" });
-    assert.equal(conn.updates.length, 1, "local analysis is announced before Vision dispatch");
-    visionCalls.push({ toolName, args });
-    assert.equal(args["image_source"], "/tmp/cat.png");
-    return { content: [{ type: "text", text: "A tabby cat." }] };
-  });
-  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
-  const result = await exec.execute(
-    "tc-image-local",
-    "image_analysis",
-    JSON.stringify({ image_source: "/tmp/cat.png", prompt: "describe" })
-  );
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-image-noprompt-")));
+  try {
+    writeFileSync(join(dir, "cat.png"), "fake png bytes", "utf8");
+    const conn = createConnectionStub({ permission: "reject" });
+    const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+    const vision = fakeVisionClient(async (toolName, args) => {
+      assertInitialImageAnnouncement(conn, "tc-image-local", { image_source: join(dir, "cat.png"), prompt: "describe" });
+      assert.equal(conn.updates.length, 1, "local analysis is announced before Vision dispatch");
+      visionCalls.push({ toolName, args });
+      assert.equal(args["image_source"], join(dir, "cat.png"));
+      return { content: [{ type: "text", text: "A tabby cat." }] };
+    });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision, null, dir);
+    const result = await exec.execute(
+      "tc-image-local",
+      "image_analysis",
+      JSON.stringify({ image_source: join(dir, "cat.png"), prompt: "describe" })
+    );
 
-  assert.equal(result.content, "A tabby cat.");
-  assert.equal(conn.permissionRequests.length, 0);
-  assert.equal(visionCalls.length, 1);
-  assertInitialImageAnnouncement(conn, "tc-image-local", { image_source: "/tmp/cat.png", prompt: "describe" });
-  assert.equal(conn.updates.length, 2);
-  const last = conn.updates.at(-1) as { update: { sessionUpdate?: string; status?: string } };
-  assert.equal(last.update.sessionUpdate, "tool_call_update");
-  assert.equal(last.update.status, "completed");
+    assert.equal(result.content, "A tabby cat.");
+    assert.equal(conn.permissionRequests.length, 0);
+    assert.equal(visionCalls.length, 1);
+    assertInitialImageAnnouncement(conn, "tc-image-local", { image_source: join(dir, "cat.png"), prompt: "describe" });
+    assert.equal(conn.updates.length, 2);
+    const last = conn.updates.at(-1) as { update: { sessionUpdate?: string; status?: string } };
+    assert.equal(last.update.sessionUpdate, "tool_call_update");
+    assert.equal(last.update.status, "completed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("session MCP tool with ~10k-deep result completes with bounded preview markers", async () => {
