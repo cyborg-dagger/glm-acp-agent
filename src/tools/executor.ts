@@ -68,6 +68,8 @@ const PREVIEW_DEPTH_MARKER = "[nested]";
 const PREVIEW_WALK_BUDGET_BYTES = 262_144;
 /** Marker charged into objects/arrays when the walk budget is exhausted mid-container. */
 const PREVIEW_ELIDED_KEY = "[elided]";
+/** Message carried by read-path abort errors; matches Node's conventional abort text. */
+const ABORTED_MESSAGE = "The operation was aborted";
 
 /**
  * Skip approval only for clearly local paths. The Vision MCP owns source
@@ -81,6 +83,11 @@ function isLocalImagePath(source: string): boolean {
   }
   if (/^[\\\\/]{2}/.test(source)) return false;
   return /^[a-z]:[\\\\/]/i.test(source) || !/^[a-z][a-z0-9+.-]*:/i.test(source);
+}
+
+/** Fresh abort error per throw site so each gets its own stack trace. */
+function abortedError(): Error {
+  return new Error(ABORTED_MESSAGE);
 }
 
 /** Count non-overlapping literal matches; snippet must be non-empty. */
@@ -351,9 +358,9 @@ export class ToolExecutor {
     if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
       const absolutePath = await this.resolveConfinedReadPath(path);
-      if (this.signal?.aborted) throw new Error("The operation was aborted");
+      if (this.signal?.aborted) throw abortedError();
       const page = await this.readTextPage(absolutePath, offset, limit);
-      if (this.signal?.aborted) throw new Error("The operation was aborted");
+      if (this.signal?.aborted) throw abortedError();
       if (page.eof) {
         const content = `[end of file: offset ${offset} is beyond the end of ${path}]`;
         await this.connection.sessionUpdate({
@@ -608,7 +615,7 @@ export class ToolExecutor {
       // is misrepresented as a whole-buffer line count.
       const readEditorLines = async (line: number, pageLimit: number): Promise<string[]> => {
         const signal = this.signal;
-        if (signal?.aborted) throw new Error("The operation was aborted");
+        if (signal?.aborted) throw abortedError();
         const readPromise = this.connection.readTextFile({
           sessionId: this.sessionId, path, line, limit: pageLimit,
         } as never);
@@ -619,12 +626,12 @@ export class ToolExecutor {
           const response = await (signal ? Promise.race([
             readPromise,
             new Promise<never>((_resolve, reject) => {
-              abortHandler = () => reject(new Error("The operation was aborted"));
+              abortHandler = () => reject(abortedError());
               signal.addEventListener("abort", abortHandler, { once: true });
               if (signal.aborted) abortHandler();
             }),
           ]) : readPromise);
-          if (signal?.aborted) throw new Error("The operation was aborted");
+          if (signal?.aborted) throw abortedError();
           if (Buffer.byteLength(response.content, "utf8") > this.resourceLimits.fileReadBytes) {
             throw new Error(`editor buffer exceeds the ${this.resourceLimits.fileReadBytes}-byte read/edit limit`);
           }
