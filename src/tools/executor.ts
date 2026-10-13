@@ -824,7 +824,6 @@ export class ToolExecutor {
       );
     }
     const path = rawPath.trim();
-    const absolutePath = this.resolvePath(path);
 
     await this.announceToolCall({
       sessionId: this.sessionId,
@@ -841,6 +840,7 @@ export class ToolExecutor {
 
     if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
+      const absolutePath = await this.resolveConfinedReadPath(path);
       const directory = await opendir(absolutePath);
       const entries: Dirent[] = [];
       let entryLimitReached = false;

@@ -2320,6 +2320,77 @@ test("list_files caps an oversized empty-directory header and marks it truncated
   }
 });
 
+test("list_files rejects an absolute path outside the session workspace", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-list-confined-")));
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-list-outside-")));
+  writeFileSync(join(outside, "secret.txt"), "secret", "utf8");
+  try {
+    for (const caps of [{ fs: {} }, { fs: { readTextFile: true } }, FULL_CAPS]) {
+      const conn = createConnectionStub();
+      const exec = new ToolExecutor(conn as never, "s1", caps, undefined, null, null, dir);
+      const result = await exec.execute("tc1", "list_files", JSON.stringify({ path: outside }));
+      assert.match(result.content, /must remain inside the session workspace/);
+      assert.ok(!result.content.includes("secret.txt"), "must not enumerate the outside directory");
+      const completed = (conn.updates as Array<{ update: { status?: string } }>).filter(
+        (u) => u.update.status === "completed"
+      );
+      assert.equal(completed.length, 0);
+      const last = conn.updates.at(-1) as { update: { status?: string } };
+      assert.equal(last.update.status, "failed");
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("list_files rejects parent traversal that escapes the session workspace", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-list-traversal-")));
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-list-sibling-")));
+  writeFileSync(join(outside, "sibling-secret.txt"), "secret", "utf8");
+  try {
+    const conn = createConnectionStub();
+    const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir);
+    for (const path of ["..", join("..", basename(outside))]) {
+      const result = await exec.execute("tc1", "list_files", JSON.stringify({ path }));
+      assert.match(result.content, /must remain inside the session workspace/);
+      assert.ok(!result.content.includes("sibling-secret.txt"), "must not enumerate the escaped directory");
+      const completed = (conn.updates as Array<{ update: { status?: string } }>).filter(
+        (u) => u.update.status === "completed"
+      );
+      assert.equal(completed.length, 0);
+      const last = conn.updates.at(-1) as { update: { status?: string } };
+      assert.equal(last.update.status, "failed");
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("list_files rejects a symlink that escapes the session workspace", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-list-symlink-")));
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-list-symlink-outside-")));
+  writeFileSync(join(outside, "linked-secret.txt"), "secret", "utf8");
+  symlinkSync(outside, join(dir, "escape"), "dir");
+  try {
+    const conn = createConnectionStub();
+    const exec = new ToolExecutor(conn as never, "s1", { fs: {} }, undefined, null, null, dir);
+    const result = await exec.execute("tc1", "list_files", JSON.stringify({ path: "escape" }));
+    assert.match(result.content, /must remain inside the session workspace/);
+    assert.ok(!result.content.includes("linked-secret.txt"), "must not enumerate the linked directory");
+    const completed = (conn.updates as Array<{ update: { status?: string } }>).filter(
+      (u) => u.update.status === "completed"
+    );
+    assert.equal(completed.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // web_search / web_reader via Z.AI Coding Plan MCP
 // ---------------------------------------------------------------------------
