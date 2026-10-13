@@ -21,6 +21,7 @@ interface StubTerminal {
 
 function createConnectionStub(opts: {
   permission?: "allow" | "reject" | "cancelled" | "missing" | "unoffered" | "unknown" | "null" | "empty" | "nonstring";
+  permissionError?: boolean;
   readError?: boolean;
   writeError?: boolean;
   terminalOutput?: string;
@@ -81,6 +82,7 @@ function createConnectionStub(opts: {
     async requestPermission(params: unknown) {
       permissionRequests.push(params);
       if (opts.onPermission) opts.onPermission();
+      if (opts.permissionError) throw new Error("permission transport failed");
       switch (opts.permission ?? "allow") {
         case "allow":
           return { outcome: { outcome: "selected", optionId: "allow" } };
@@ -2162,6 +2164,22 @@ test("web_reader calls the Coding Plan MCP reader tool and formats reader_result
         assert.match(result.content, /^# Example/);
         assert.match(result.content, /URL: https:\/\/example\.com\//);
         assert.match(result.content, /Main body/);
+        assert.equal(conn.permissionRequests.length, 1);
+        assert.deepEqual(conn.permissionRequests[0], {
+          sessionId: "s1",
+          toolCall: {
+            toolCallId: "tc-web-reader",
+            title: "Read URL: https://example.com/",
+            kind: "fetch",
+            status: "pending",
+            locations: [{ path: "https://example.com/" }],
+            rawInput: { url: "https://example.com/", return_format: "markdown" },
+          },
+          options: [
+            { kind: "allow_once", name: "Allow", optionId: "allow" },
+            { kind: "reject_once", name: "Skip", optionId: "reject" },
+          ],
+        });
         assert.ok(calls.every((call) => call.url === "https://api.z.ai/api/mcp/web_reader/mcp"));
         assert.equal(calls[3]?.headers.get("Mcp-Name"), "webReader");
         assert.deepEqual(calls[3]?.body.params, {
@@ -2174,6 +2192,203 @@ test("web_reader calls the Coding Plan MCP reader tool and formats reader_result
     if (oldEnv === undefined) delete process.env["Z_AI_API_KEY"];
     else process.env["Z_AI_API_KEY"] = oldEnv;
   }
+});
+
+test("web_reader rejected by user makes no network requests", async () => {
+  await withMockedFetch([], async (calls) => {
+    const conn = createConnectionStub({ permission: "reject" });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    const result = await exec.execute(
+      "tc-web-reader-reject",
+      "web_reader",
+      JSON.stringify({ url: "https://example.com/" })
+    );
+
+    assert.equal(result.content, "URL read rejected by user.");
+    assert.equal(conn.permissionRequests.length, 1);
+    assert.equal(calls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  });
+});
+
+test("web_reader cancelled by user makes no network requests", async () => {
+  await withMockedFetch([], async (calls) => {
+    const conn = createConnectionStub({ permission: "cancelled" });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    const result = await exec.execute(
+      "tc-web-reader-cancelled",
+      "web_reader",
+      JSON.stringify({ url: "https://example.com/" })
+    );
+
+    assert.equal(result.content, "URL read cancelled by user.");
+    assert.equal(conn.permissionRequests.length, 1);
+    assert.equal(calls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  });
+});
+
+for (const permission of [
+  "missing", "unoffered", "unknown", "null", "empty", "nonstring",
+] as const) {
+  test(`web_reader rejects unexpected ${permission} permission outcomes without network requests`, async () => {
+    await withMockedFetch([], async (calls) => {
+      const conn = createConnectionStub({ permission });
+      const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+      const result = await exec.execute(
+        "tc-web-reader-invalid-permission",
+        "web_reader",
+        JSON.stringify({ url: "https://example.com/" })
+      );
+
+      assert.equal(result.content, "URL read rejected by user.");
+      assert.equal(conn.permissionRequests.length, 1);
+      assert.equal(calls.length, 0);
+      const last = conn.updates.at(-1) as { update: { status?: string } };
+      assert.equal(last.update.status, "failed");
+    });
+  });
+}
+
+test("web_reader permission transport errors make no network requests", async () => {
+  await withMockedFetch([], async (calls) => {
+    const conn = createConnectionStub({ permissionError: true });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
+    const result = await exec.execute(
+      "tc-web-reader-permission-error",
+      "web_reader",
+      JSON.stringify({ url: "https://example.com/" })
+    );
+
+    assert.match(result.content, /Error requesting permission: permission transport failed/);
+    assert.equal(conn.permissionRequests.length, 1);
+    assert.equal(calls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  });
+});
+
+test("web_reader follows session modes for permission requests", async () => {
+  const oldEnv = process.env["Z_AI_API_KEY"];
+  try {
+    for (const mode of ["default", "accept_edits", "bypass_permissions"] as const) {
+      // The MCP client caches by endpoint + API key; isolate each four-call fixture.
+      process.env["Z_AI_API_KEY"] = `from-env-web-reader-${mode}`;
+      await withMockedFetch(
+        [
+          request => jsonResponse({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: { protocolVersion: "2025-06-18", capabilities: {} },
+          }),
+          new Response(null, { status: 202 }),
+          request => jsonResponse({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: { tools: [{ name: "webReader" }] },
+          }),
+          request => jsonResponse({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    reader_result: {
+                      title: "Example",
+                      url: "https://example.com/",
+                      content: "Main body",
+                    },
+                  }),
+                },
+              ],
+            },
+          }),
+        ],
+        async (calls) => {
+          const conn = createConnectionStub();
+          const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, null, undefined, () => mode);
+          const result = await exec.execute(
+            "tc-web-reader-mode",
+            "web_reader",
+            JSON.stringify({ url: "https://example.com/", return_format: "markdown" })
+          );
+
+          assert.equal(conn.permissionRequests.length, mode === "bypass_permissions" ? 0 : 1);
+          assert.match(result.content, /^# Example/);
+          assert.equal(calls.length, 4);
+          assert.deepEqual(calls[3]?.body.params, {
+            name: "webReader",
+            arguments: { url: "https://example.com/", return_format: "markdown" },
+          });
+        }
+      );
+    }
+  } finally {
+    if (oldEnv === undefined) delete process.env["Z_AI_API_KEY"];
+    else process.env["Z_AI_API_KEY"] = oldEnv;
+  }
+});
+
+test("web_reader makes no network requests after the turn aborts while the permission prompt stays unanswered", async () => {
+  const abortController = new AbortController();
+  let permissionStarted!: () => void;
+  let resolvePermission!: () => void;
+  const started = new Promise<void>((resolve) => { permissionStarted = resolve; });
+  const conn = {
+    updates: [] as Array<Record<string, unknown>>,
+    async sessionUpdate(payload: Record<string, unknown>) { this.updates.push(payload); },
+    async requestPermission() {
+      permissionStarted();
+      return new Promise<{ outcome: { outcome: "selected"; optionId: "allow" } }>((resolve) => {
+        resolvePermission = () => resolve({ outcome: { outcome: "selected", optionId: "allow" } });
+      });
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, abortController.signal);
+  await withMockedFetch([], async (calls) => {
+    const pending = exec.execute(
+      "tc1",
+      "web_reader",
+      JSON.stringify({ url: "https://example.com/" })
+    );
+    await started;
+    abortController.abort();
+
+    // Cancellation must settle on its own while the prompt is still unanswered.
+    // A regression that waits for the permission answer trips this timeout
+    // instead of silently passing.
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        pending,
+        new Promise<never>((_, reject) => {
+          settleTimer = setTimeout(
+            () => reject(new Error("execute() did not settle after abort; cancellation waits for the pending permission")),
+            500
+          );
+        }),
+      ]);
+
+      assert.equal(result.content, "URL read cancelled by turn.");
+      assert.equal(calls.length, 0);
+      const last = conn.updates.at(-1) as { update: { status?: string } };
+      assert.equal(last.update.status, "failed");
+    } finally {
+      if (settleTimer !== undefined) clearTimeout(settleTimer);
+    }
+
+    // Answering the stale prompt afterwards is a no-op: no network request and
+    // no further status update may appear.
+    resolvePermission();
+    await pending;
+    assert.equal(calls.length, 0);
+    const finalUpdate = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(finalUpdate.update.status, "failed");
+  });
 });
 
 test("web_search reports Coding Plan 1113 MCP errors as actionable failed tool results", async () => {
@@ -2387,6 +2602,27 @@ function fakeVisionClient(impl: VisionMcpClient["callTool"]): VisionMcpClient {
   };
 }
 
+function assertInitialImageAnnouncement(
+  conn: { updates: Array<Record<string, unknown>> },
+  toolCallId: string,
+  args: Record<string, unknown>,
+  status: "pending" | "in_progress" = "in_progress",
+): void {
+  const source = String(args["image_source"]).trim();
+  assert.deepEqual(conn.updates[0], {
+    sessionId: "s1",
+    update: {
+      sessionUpdate: "tool_call",
+      toolCallId,
+      title: `Analyze image: ${source}`,
+      kind: "fetch",
+      status,
+      locations: [{ path: source }],
+      rawInput: args,
+    },
+  });
+}
+
 test("image_analysis routes through the injected vision client and returns the text", async () => {
   const conn = createConnectionStub();
   const vision = fakeVisionClient(async (toolName, args) => {
@@ -2417,7 +2653,10 @@ test("image_analysis surfaces vision errors as a failed tool result", async () =
     JSON.stringify({ image_source: "/tmp/x.png" })
   );
   assert.match(result.content, /quota exceeded/);
-  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assertInitialImageAnnouncement(conn, "tc1", { image_source: "/tmp/x.png" });
+  assert.equal(conn.updates.length, 2);
+  const last = conn.updates.at(-1) as { update: { sessionUpdate?: string; status?: string } };
+  assert.equal(last.update.sessionUpdate, "tool_call_update");
   assert.equal(last.update.status, "failed");
 });
 
@@ -2430,6 +2669,337 @@ test("image_analysis is unavailable when no vision client is configured", async 
     JSON.stringify({ image_source: "/tmp/x.png" })
   );
   assert.match(result.content, /vision[^.]*not configured/i);
+});
+
+// ---------------------------------------------------------------------------
+// image_analysis remote-source approval gate (mirrors the web_reader battery)
+// ---------------------------------------------------------------------------
+
+function recordingVisionClient(
+  visionCalls: Array<{ toolName: string; args: Record<string, unknown> }>
+): VisionMcpClient {
+  return fakeVisionClient(async (toolName, args) => {
+    visionCalls.push({ toolName, args });
+    return { content: [{ type: "text", text: "A tabby cat." }] };
+  });
+}
+
+/**
+ * Reject after `ms` unless the promise it is raced against settles first. The
+ * rejection is pre-handled so losing the race never surfaces as an unhandled
+ * rejection.
+ */
+function failAfter(ms: number, message: string): Promise<never> {
+  const failure = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error(message)), ms);
+  });
+  failure.catch(() => { /* handled by whoever wins the race */ });
+  return failure;
+}
+
+const imagePathBackslash = String.fromCharCode(92);
+const nonLocalImageSources = [
+  ["whitespace-padded HTTP source", " " + String.fromCharCode(9) + "https:attacker.example/x.png" + String.fromCharCode(10)],
+  ["HTTP URL without slashes", "https:attacker.example/x.png"],
+  ["HTTP URL with backslashes", ["http:", "", "attacker.example", "x.png"].join(imagePathBackslash)],
+  ["FTP scheme", "ftp://attacker.example/x.png"],
+  ["file scheme", "file:///outside-workspace.png"],
+  ["data scheme", "data:image/png;base64,AA=="],
+  ["custom scheme", "vision+remote:attacker.example/x.png"],
+  ["drive-relative scheme-like source", "C:cat.png"],
+  ["embedded tab", "ht" + String.fromCharCode(9) + "tps://attacker.example/x.png"],
+  ["embedded newline", "ht" + String.fromCharCode(10) + "tps://attacker.example/x.png"],
+  ["embedded carriage return", "ht" + String.fromCharCode(13) + "tps://attacker.example/x.png"],
+  ["leading NUL", String.fromCharCode(0) + "https://attacker.example/x.png"],
+  ["DEL in a path", "images/" + String.fromCharCode(127) + "cat.png"],
+  ["control in a Windows drive path", "C:/images/" + String.fromCharCode(9) + "cat.png"],
+  ["protocol-relative source", "//attacker.example/x.png"],
+  ["UNC source", imagePathBackslash.repeat(2) + "attacker.example" + imagePathBackslash + "x.png"],
+  ["mixed network-authority prefix", "/" + imagePathBackslash + "attacker.example/x.png"],
+] as const;
+
+for (const [label, source] of nonLocalImageSources) {
+  test(`image_analysis requires approval for ${label}`, async () => {
+    const args = { image_source: source, prompt: "describe" };
+    for (const mode of ["default", "accept_edits"] as const) {
+      const conn = createConnectionStub({ permission: "reject" });
+      const calls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+      const exec = new ToolExecutor(
+        conn as never, "s1", FULL_CAPS, undefined, recordingVisionClient(calls),
+        null, process.cwd(), () => mode,
+      );
+      const result = await exec.execute("tc-non-local", "image_analysis", JSON.stringify(args));
+      assert.equal(result.content, "Image analysis rejected by user.");
+      assert.equal(conn.permissionRequests.length, 1);
+      const request = conn.permissionRequests[0] as { toolCall: { rawInput: unknown; locations: unknown } };
+      assert.deepEqual(request.toolCall.rawInput, args);
+      assert.deepEqual(request.toolCall.locations, [{ path: source.trim() }]);
+      assert.equal(calls.length, 0);
+      assertInitialImageAnnouncement(conn, "tc-non-local", args, "pending");
+    }
+
+    const conn = createConnectionStub({ permission: "allow" });
+    const calls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, recordingVisionClient(calls));
+    const result = await exec.execute("tc-non-local-allowed", "image_analysis", JSON.stringify(args));
+    assert.equal(result.content, "A tabby cat.");
+    assert.equal(conn.permissionRequests.length, 1);
+    assert.deepEqual(calls, [{ toolName: "image_analysis", args: { ...args, image_source: source.trim() } }]);
+    assertInitialImageAnnouncement(conn, "tc-non-local-allowed", args, "pending");
+    assert.deepEqual(conn.updates.map(({ update }) => {
+      const event = update as { sessionUpdate: string; status: string };
+      return [event.sessionUpdate, event.status];
+    }), [["tool_call", "pending"], ["tool_call_update", "in_progress"], ["tool_call_update", "completed"]]);
+  });
+}
+
+for (const [label, source] of [
+  ["relative", "images/cat.png"],
+  ["absolute", "/workspace/images/cat.png"],
+  ["boundary whitespace", String.fromCharCode(9) + "images/cat.png" + String.fromCharCode(10)],
+  ["spaces", "images/my cat.png"],
+  ["Windows forward slashes", "C:/images/cat.png"],
+  ["Windows backslashes", ["C:", "images", "cat.png"].join(imagePathBackslash)],
+] as const) {
+  test(`image_analysis does not request approval for ${label} local path syntax`, async () => {
+    const conn = createConnectionStub({ permission: "reject" });
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, fakeVisionClient(async () => ({
+      content: [{ type: "text", text: "A tabby cat." }],
+    })));
+    const args = { image_source: source };
+    await exec.execute("tc-local-syntax", "image_analysis", JSON.stringify(args));
+    assert.equal(conn.permissionRequests.length, 0);
+    assertInitialImageAnnouncement(conn, "tc-local-syntax", args);
+  });
+}
+
+test("image_analysis rejected by user makes no vision calls for remote image sources", async () => {
+  const conn = createConnectionStub({ permission: "reject" });
+  const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+  const vision = recordingVisionClient(visionCalls);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
+  const url = "https://attacker.example/x.png?d=secret";
+  const result = await exec.execute(
+    "tc-image-url-reject",
+    "image_analysis",
+    JSON.stringify({ image_source: url, prompt: "describe" })
+  );
+
+  assert.equal(result.content, "Image analysis rejected by user.");
+  assert.equal(conn.permissionRequests.length, 1);
+  // The full, unelided arguments reach the approval prompt: the URL can carry
+  // sensitive data, so the user must approve exactly what would be sent.
+  assert.deepEqual(conn.permissionRequests[0], {
+    sessionId: "s1",
+    toolCall: {
+      toolCallId: "tc-image-url-reject",
+      title: `Analyze image: ${url}`,
+      kind: "fetch",
+      status: "pending",
+      locations: [{ path: url }],
+      rawInput: { image_source: url, prompt: "describe" },
+    },
+    options: [
+      { kind: "allow_once", name: "Allow", optionId: "allow" },
+      { kind: "reject_once", name: "Skip", optionId: "reject" },
+    ],
+  });
+  assert.equal(visionCalls.length, 0);
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "failed");
+});
+
+test("image_analysis cancelled by user makes no vision calls for remote image sources", async () => {
+  const conn = createConnectionStub({ permission: "cancelled" });
+  const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+  const vision = recordingVisionClient(visionCalls);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
+  const result = await exec.execute(
+    "tc-image-url-cancelled",
+    "image_analysis",
+    JSON.stringify({ image_source: "https://example.com/pic.png" })
+  );
+
+  assert.equal(result.content, "Image analysis cancelled by user.");
+  assert.equal(conn.permissionRequests.length, 1);
+  assert.equal(visionCalls.length, 0);
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "failed");
+});
+
+for (const permission of [
+  "missing", "unoffered", "unknown", "null", "empty", "nonstring",
+] as const) {
+  test(`image_analysis rejects unexpected ${permission} permission outcomes for remote image sources without vision calls`, async () => {
+    const conn = createConnectionStub({ permission });
+    const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+    const vision = recordingVisionClient(visionCalls);
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
+    const result = await exec.execute(
+      "tc-image-url-invalid-permission",
+      "image_analysis",
+      JSON.stringify({ image_source: "https://example.com/pic.png" })
+    );
+
+    assert.equal(result.content, "Image analysis rejected by user.");
+    assert.equal(conn.permissionRequests.length, 1);
+    assert.equal(visionCalls.length, 0);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "failed");
+  });
+}
+
+test("image_analysis permission transport errors make no vision calls for remote image sources", async () => {
+  const conn = createConnectionStub({ permissionError: true });
+  const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+  const vision = recordingVisionClient(visionCalls);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
+  const result = await exec.execute(
+    "tc-image-url-permission-error",
+    "image_analysis",
+    JSON.stringify({ image_source: "https://example.com/pic.png" })
+  );
+
+  assert.match(result.content, /Error requesting permission: permission transport failed/);
+  assert.equal(conn.permissionRequests.length, 1);
+  assert.equal(visionCalls.length, 0);
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "failed");
+});
+
+test("image_analysis requires approval for uppercase HTTP remote image sources", async () => {
+  const conn = createConnectionStub({ permission: "reject" });
+  const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+  const vision = recordingVisionClient(visionCalls);
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
+  const url = "HTTP://insecure.example/pic.jpg";
+  const result = await exec.execute(
+    "tc-image-url-uppercase-scheme",
+    "image_analysis",
+    JSON.stringify({ image_source: url })
+  );
+
+  assert.equal(result.content, "Image analysis rejected by user.");
+  assert.equal(conn.permissionRequests.length, 1);
+  assert.deepEqual(conn.permissionRequests[0], {
+    sessionId: "s1",
+    toolCall: {
+      toolCallId: "tc-image-url-uppercase-scheme",
+      title: `Analyze image: ${url}`,
+      kind: "fetch",
+      status: "pending",
+      locations: [{ path: url }],
+      rawInput: { image_source: url },
+    },
+    options: [
+      { kind: "allow_once", name: "Allow", optionId: "allow" },
+      { kind: "reject_once", name: "Skip", optionId: "reject" },
+    ],
+  });
+  assert.equal(visionCalls.length, 0);
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "failed");
+});
+
+test("image_analysis follows session modes for remote image sources", async () => {
+  const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+  const vision = recordingVisionClient(visionCalls);
+  for (const mode of ["default", "accept_edits", "bypass_permissions"] as const) {
+    visionCalls.length = 0;
+    const conn = createConnectionStub();
+    const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision, null, undefined, () => mode);
+    const result = await exec.execute(
+      "tc-image-url-mode",
+      "image_analysis",
+      JSON.stringify({ image_source: "https://example.com/pic.png", prompt: "describe" })
+    );
+
+    assert.equal(conn.permissionRequests.length, mode === "bypass_permissions" ? 0 : 1);
+    if (mode !== "bypass_permissions") {
+      const request = conn.permissionRequests[0] as { toolCall: { kind: string } };
+      // "fetch" is never auto-approved, even in accept_edits: only writes skip prompting.
+      assert.equal(request.toolCall.kind, "fetch");
+    }
+    assert.equal(result.content, "A tabby cat.");
+    assert.equal(visionCalls.length, 1);
+    const last = conn.updates.at(-1) as { update: { status?: string } };
+    assert.equal(last.update.status, "completed");
+  }
+});
+
+test("image_analysis makes no vision calls after the turn aborts while permission is pending", async () => {
+  const abortController = new AbortController();
+  let permissionStarted!: () => void;
+  let resolvePermission!: () => void;
+  const started = new Promise<void>((resolve) => { permissionStarted = resolve; });
+  const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+  const vision = recordingVisionClient(visionCalls);
+  const conn = {
+    updates: [] as Array<Record<string, unknown>>,
+    async sessionUpdate(payload: Record<string, unknown>) { this.updates.push(payload); },
+    async requestPermission() {
+      permissionStarted();
+      return new Promise<{ outcome: { outcome: "selected"; optionId: "allow" } }>((resolve) => {
+        resolvePermission = () => resolve({ outcome: { outcome: "selected", optionId: "allow" } });
+      });
+    },
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, abortController.signal, vision);
+  const pending = exec.execute(
+    "tc-image-url-abort",
+    "image_analysis",
+    JSON.stringify({ image_source: "https://example.com/pic.png" })
+  );
+  // Wait until the approval prompt is actually pending; a missing gate fails
+  // fast here instead of hanging the suite.
+  await Promise.race([
+    started,
+    failAfter(500, "image_analysis never requested permission for a remote image source (approval gate missing)"),
+  ]);
+  abortController.abort();
+  // The execute promise must settle from the abort alone; a regression that
+  // waits on the user hangs here instead of passing silently.
+  await Promise.race([
+    pending,
+    failAfter(500, "image_analysis did not settle after the turn aborted while permission was pending"),
+  ]);
+  // The user's late allow arrives only after the turn already aborted.
+  resolvePermission();
+  const result = await pending;
+
+  assert.equal(result.content, "Image analysis cancelled by turn.");
+  assert.equal(visionCalls.length, 0);
+  const completed = conn.updates.filter((u) => (u.update as { status?: string }).status === "completed");
+  assert.equal(completed.length, 0);
+  const last = conn.updates.at(-1) as { update: { status?: string } };
+  assert.equal(last.update.status, "failed");
+});
+
+test("image_analysis does not prompt for local image sources", async () => {
+  const conn = createConnectionStub({ permission: "reject" });
+  const visionCalls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+  const vision = fakeVisionClient(async (toolName, args) => {
+    assertInitialImageAnnouncement(conn, "tc-image-local", { image_source: "/tmp/cat.png", prompt: "describe" });
+    assert.equal(conn.updates.length, 1, "local analysis is announced before Vision dispatch");
+    visionCalls.push({ toolName, args });
+    assert.equal(args["image_source"], "/tmp/cat.png");
+    return { content: [{ type: "text", text: "A tabby cat." }] };
+  });
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision);
+  const result = await exec.execute(
+    "tc-image-local",
+    "image_analysis",
+    JSON.stringify({ image_source: "/tmp/cat.png", prompt: "describe" })
+  );
+
+  assert.equal(result.content, "A tabby cat.");
+  assert.equal(conn.permissionRequests.length, 0);
+  assert.equal(visionCalls.length, 1);
+  assertInitialImageAnnouncement(conn, "tc-image-local", { image_source: "/tmp/cat.png", prompt: "describe" });
+  assert.equal(conn.updates.length, 2);
+  const last = conn.updates.at(-1) as { update: { sessionUpdate?: string; status?: string } };
+  assert.equal(last.update.sessionUpdate, "tool_call_update");
+  assert.equal(last.update.status, "completed");
 });
 
 test("session MCP tool with ~10k-deep result completes with bounded preview markers", async () => {
