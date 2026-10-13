@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { getEventListeners } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -599,12 +601,14 @@ for (const caps of [{ fs: { readTextFile: true } }, FULL_CAPS]) {
     const started = deferredRead<void>();
     const conn = createConnectionStub({ clientFileContent: "late buffer contents" });
     const exec = new ToolExecutor(conn as never, "s1", caps, controller.signal, null, null, dir);
-    const paths = exec as unknown as { resolveConfinedReadPath(path: string): Promise<string> };
+    const paths = exec as unknown as {
+      resolveConfinedReadPath(path: string, options?: { clientRead: boolean }): Promise<string>;
+    };
     const resolvePath = paths.resolveConfinedReadPath.bind(exec);
-    paths.resolveConfinedReadPath = async path => {
+    paths.resolveConfinedReadPath = async (path, options) => {
       started.resolve();
       await held.promise;
-      return resolvePath(path);
+      return resolvePath(path, options);
     };
     const pending = exec.execute("read-abort-path", "read_file", JSON.stringify({ path: "buffer.txt" }));
     try {
@@ -2302,6 +2306,37 @@ test("list_files resolves relative paths against the session cwd", async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("list_files opens the canonical directory with read-capable clients", async (t) => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-list-canonical-")));
+  const target = join(dir, "target");
+  const alias = join(dir, "alias");
+  const openedPaths: string[] = [];
+  const originalOpendir = fsPromises.opendir;
+  try {
+    mkdirSync(target);
+    writeFileSync(join(target, "note.txt"), "data", "utf8");
+    symlinkSync(target, alias, process.platform === "win32" ? "junction" : "dir");
+    t.mock.method(fsPromises, "opendir", async (path: string) => {
+      openedPaths.push(path);
+      return originalOpendir(path);
+    });
+    syncBuiltinESMExports();
+    for (const caps of [{ fs: { readTextFile: true } }, FULL_CAPS]) {
+      const conn = createConnectionStub();
+      const exec = new ToolExecutor(conn as never, "s1", caps, undefined, null, null, dir);
+      const result = await exec.execute("tc-canonical-list", "list_files", JSON.stringify({ path: "alias" }));
+      assert.match(result.content, /note.txt/);
+      assert.equal(openedPaths.at(-1), realpathSync(target));
+      assert.equal(conn.readTextFileCalls.length, 0);
+    }
+    assert.equal(openedPaths.length, 2);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("list_files rejects empty path", async () => {
   const conn = createConnectionStub();
   const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS);
@@ -3125,6 +3160,59 @@ test("image_analysis passes the resolved workspace path to vision for a local im
     assert.equal(last.update.sessionUpdate, "tool_call_update");
     assert.equal(last.update.status, "completed");
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("image_analysis forwards the canonical file with read-capable clients", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-image-canonical-")));
+  const target = join(dir, "target.png");
+  const alias = join(dir, "alias.png");
+  try {
+    writeFileSync(target, "fake png bytes", "utf8");
+    symlinkSync(target, alias, "file");
+    for (const caps of [{ fs: { readTextFile: true } }, FULL_CAPS]) {
+      const conn = createConnectionStub();
+      const calls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+      const exec = new ToolExecutor(conn as never, "s1", caps, undefined, recordingVisionClient(calls), null, dir);
+      const args = { image_source: "alias.png" };
+      const result = await exec.execute("tc-canonical-image", "image_analysis", JSON.stringify(args));
+      assert.equal(result.content, "A tabby cat.");
+      assert.deepEqual(calls, [{ toolName: "image_analysis", args: { image_source: realpathSync(target) } }]);
+      assertInitialImageAnnouncement(conn, "tc-canonical-image", args);
+      assert.equal(conn.readTextFileCalls.length, 0);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agent-side reads reject missing leaves before enumeration or Vision dispatch", async (t) => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "glm-executor-agent-missing-")));
+  const openedPaths: string[] = [];
+  const calls: Array<{ toolName: string; args: Record<string, unknown> }> = [];
+  const originalOpendir = fsPromises.opendir;
+  try {
+    t.mock.method(fsPromises, "opendir", async (path: string) => {
+      openedPaths.push(path);
+      return originalOpendir(path);
+    });
+    syncBuiltinESMExports();
+    for (const caps of [{ fs: { readTextFile: true } }, FULL_CAPS]) {
+      const conn = createConnectionStub();
+      const exec = new ToolExecutor(conn as never, "s1", caps, undefined, recordingVisionClient(calls), null, dir);
+      for (const tool of ["list_files", "image_analysis"]) {
+        const args = tool === "list_files" ? { path: "missing" } : { image_source: "missing.png" };
+        const result = await exec.execute("tc-missing", tool, JSON.stringify(args));
+        assert.match(result.content, /ENOENT|no such file/i);
+        assert.equal(openedPaths.length, 0);
+        assert.equal(calls.length, 0);
+        assert.equal(conn.readTextFileCalls.length, 0);
+      }
+    }
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
     rmSync(dir, { recursive: true, force: true });
   }
 });

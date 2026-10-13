@@ -357,7 +357,9 @@ export class ToolExecutor {
 
     if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
-      const absolutePath = await this.resolveConfinedReadPath(path);
+      const absolutePath = await this.resolveConfinedReadPath(path, {
+        clientRead: this.clientCapabilities?.fs?.readTextFile === true,
+      });
       if (this.signal?.aborted) throw abortedError();
       const page = await this.readTextPage(absolutePath, offset, limit);
       if (this.signal?.aborted) throw abortedError();
@@ -1015,15 +1017,19 @@ export class ToolExecutor {
    *
    * The canonicalized target must sit inside the canonicalized workspace:
    * parent traversal and symlinks that resolve outside are rejected, while
-   * absolute paths that stay inside remain valid. When the read is routed
-   * through the ACP client the caller's absolute alias is kept so the editor
-   * can map its own buffer; local reads use the canonicalized path so the
+   * absolute paths that stay inside remain valid. Only an explicit client
+   * read preserves the caller's absolute alias and permits a missing editor
+   * buffer. Agent-side callers always require an existing canonical target,
+   * regardless of the client's capabilities. Local reads use that path so the
    * open lands on the same file the containment check validated. This
    * realpath preflight closes static symlink escapes; it is containment
    * hardening, not a race-proof sandbox - a concurrent swap between check
    * and open can still redirect a local read.
    */
-  private async resolveConfinedReadPath(path: string): Promise<string> {
+  private async resolveConfinedReadPath(
+    path: string,
+    { clientRead }: { clientRead: boolean } = { clientRead: false },
+  ): Promise<string> {
     const workspace = await realpath(this.sessionCwd);
     const absolutePath = this.resolvePath(path);
     let target: string;
@@ -1031,7 +1037,7 @@ export class ToolExecutor {
       target = await realpath(absolutePath);
     } catch (error) {
       if (
-        !this.clientCapabilities?.fs?.readTextFile ||
+        !clientRead ||
         (error as NodeJS.ErrnoException).code !== "ENOENT"
       ) {
         throw error;
@@ -1054,7 +1060,7 @@ export class ToolExecutor {
     ) {
       throw new Error("path must remain inside the session workspace");
     }
-    return this.clientCapabilities?.fs?.readTextFile ? absolutePath : target;
+    return clientRead ? absolutePath : target;
   }
 
   private async webSearch(
