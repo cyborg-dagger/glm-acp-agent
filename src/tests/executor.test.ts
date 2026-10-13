@@ -5,7 +5,7 @@ import { getEventListeners } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import fsPromises from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
-import { rm } from "node:fs/promises";
+import { realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2326,7 +2326,9 @@ test("list_files opens the canonical directory with read-capable clients", async
       const exec = new ToolExecutor(conn as never, "s1", caps, undefined, null, null, dir);
       const result = await exec.execute("tc-canonical-list", "list_files", JSON.stringify({ path: "alias" }));
       assert.match(result.content, /note.txt/);
-      assert.equal(openedPaths.at(-1), realpathSync(target));
+      // Match the production API: on Windows, async realpath expands 8.3
+      // aliases that realpathSync may retain in the temporary fixture path.
+      assert.equal(openedPaths.at(-1), await realpath(target));
       assert.equal(conn.readTextFileCalls.length, 0);
     }
     assert.equal(openedPaths.length, 2);
@@ -3049,7 +3051,7 @@ test("image_analysis routes through the injected vision client and returns the t
     const conn = createConnectionStub();
     const vision = fakeVisionClient(async (toolName, args) => {
       assert.equal(toolName, "image_analysis");
-      assert.equal(args["image_source"], join(dir, "cat.png"));
+      assert.equal(args["image_source"], await realpath(join(dir, "cat.png")));
       return { content: [{ type: "text", text: "A tabby cat." }] };
     });
     const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision, null, dir);
@@ -3152,7 +3154,7 @@ test("image_analysis passes the resolved workspace path to vision for a local im
     assert.equal(result.content, "A tabby cat.");
     assert.deepEqual(
       visionCalls.map((c) => ({ toolName: c.toolName, source: c.args["image_source"] })),
-      [{ toolName: "image_analysis", source: join(dir, "cat.png") }]
+      [{ toolName: "image_analysis", source: await realpath(join(dir, "cat.png")) }]
     );
     assertInitialImageAnnouncement(conn, "tc-image-inside", { image_source: "cat.png", prompt: "describe" });
     assert.equal(conn.updates.length, 2);
@@ -3178,7 +3180,7 @@ test("image_analysis forwards the canonical file with read-capable clients", asy
       const args = { image_source: "alias.png" };
       const result = await exec.execute("tc-canonical-image", "image_analysis", JSON.stringify(args));
       assert.equal(result.content, "A tabby cat.");
-      assert.deepEqual(calls, [{ toolName: "image_analysis", args: { image_source: realpathSync(target) } }]);
+      assert.deepEqual(calls, [{ toolName: "image_analysis", args: { image_source: await realpath(target) } }]);
       assertInitialImageAnnouncement(conn, "tc-canonical-image", args);
       assert.equal(conn.readTextFileCalls.length, 0);
     }
@@ -3559,7 +3561,7 @@ test("image_analysis does not prompt for local image sources", async () => {
       assertInitialImageAnnouncement(conn, "tc-image-local", { image_source: join(dir, "cat.png"), prompt: "describe" });
       assert.equal(conn.updates.length, 1, "local analysis is announced before Vision dispatch");
       visionCalls.push({ toolName, args });
-      assert.equal(args["image_source"], join(dir, "cat.png"));
+      assert.equal(args["image_source"], await realpath(join(dir, "cat.png")));
       return { content: [{ type: "text", text: "A tabby cat." }] };
     });
     const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, vision, null, dir);
