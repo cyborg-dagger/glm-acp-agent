@@ -69,6 +69,14 @@ const PREVIEW_WALK_BUDGET_BYTES = 262_144;
 /** Marker charged into objects/arrays when the walk budget is exhausted mid-container. */
 const PREVIEW_ELIDED_KEY = "[elided]";
 
+/**
+ * Whether an image_source is a remote http(s) URL — the only form that makes
+ * the Vision MCP perform network egress (and thus needs the fetch gate).
+ */
+function isRemoteHttpUrl(source: string): boolean {
+  return /^https?:\/\//i.test(source);
+}
+
 /** Count non-overlapping literal matches; snippet must be non-empty. */
 function countNonOverlappingMatches(text: string, snippet: string): number {
   let count = 0;
@@ -1145,18 +1153,52 @@ export class ToolExecutor {
       );
     }
 
-    await this.announceToolCall({
-      sessionId: this.sessionId,
-      update: {
-        sessionUpdate: "tool_call",
+    // A remote URL makes the Vision MCP perform network egress, so URL fetches
+    // are gated exactly like web_reader: approval before any traffic. Local
+    // paths skip the gate (confining local reads is a separate concern).
+    if (isRemoteHttpUrl(imageSource)) {
+      // Step 1: announce the analysis as pending; approval follows before traffic.
+      await this.announceToolCall({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId,
+          title: elideStringForPreview(`Analyze image: ${imageSource}`),
+          kind: "fetch",
+          status: "pending",
+          locations: imageSource.length <= LOCATION_STRING_LIMIT ? [{ path: imageSource }] : [],
+          rawInput: elideForPreview(args),
+        },
+      });
+
+      // Step 2: ask before any fetch traffic. The permission payload is the
+      // full arguments - the URL can carry sensitive data in its path or query,
+      // so the user must approve exactly what will be sent to the Vision MCP.
+      const permissionResult = await this.maybeRequestPermission({
         toolCallId,
-        title: elideStringForPreview(`Analyze image: ${imageSource}`),
         kind: "fetch",
-        status: "in_progress",
-        locations: imageSource.length <= LOCATION_STRING_LIMIT ? [{ path: imageSource }] : [],
-        rawInput: elideForPreview(args),
-      },
-    });
+        rawInput: args,
+        title: `Analyze image: ${imageSource}`,
+        locations: [{ path: imageSource }],
+      });
+
+      // Fail closed: every outcome that is not an explicit allow (including any
+      // future variant) stops here instead of reaching the network below.
+      if (permissionResult.type !== "allow") {
+        return this.permissionDenialResult(toolCallId, "Image analysis", permissionResult);
+      }
+
+      // Step 3: announce in_progress; an interrupted announcement proves the
+      // vision request below never started.
+      await this.announceToolCall({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "in_progress",
+        },
+      });
+    }
 
     if (this.signal?.aborted) throw new ToolCallCancelledBeforeExecutionError();
     try {
@@ -1325,7 +1367,7 @@ export class ToolExecutor {
    */
   private async permissionDenialResult(
     toolCallId: string,
-    action: "Write" | "Edit" | "Command" | "URL read",
+    action: "Write" | "Edit" | "Command" | "URL read" | "Image analysis",
     permissionResult: Exclude<PermissionDecision, { type: "allow" }>
   ): Promise<ToolResult> {
     switch (permissionResult.type) {
